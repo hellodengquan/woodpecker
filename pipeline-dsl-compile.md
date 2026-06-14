@@ -1419,7 +1419,7 @@ getSecretValue := func(name string) (string, error) {
    - 当前事件必须在允许列表中
    - Pull Request 相关事件统一归一化为 `EventPull` 再匹配
 
-#### 10.3.3 Secret 递归注入算法
+#### 9.3.3 Secret 递归注入算法
 
 **代码位置**：`pipeline/frontend/yaml/compiler/settings/params.go`
 
@@ -1468,7 +1468,7 @@ type Step struct {
 
 填充时机：`ParamsToEnv` 中每次调用 `getSecretValue` 成功后，将 `sanitizedParamKey → secretValue` 加入 mapping。
 
-### 10.4 编译期 vs 运行期变量边界
+### 9.4 编译期 vs 运行期变量边界
 
 | 特性 | 编译期确定 | 运行期确定 |
 |------|-----------|-----------|
@@ -1543,7 +1543,7 @@ if !c.local {
 
 `CI_WORKSPACE` 环境变量指向完整工作目录路径。
 
-#### 11.1.3 共享卷的生命周期
+#### 10.1.3 共享卷的生命周期
 
 ```
 SetupWorkflow()          步骤执行期          DestroyWorkflow()
@@ -1746,7 +1746,7 @@ WF1   WF2   WF3   ...  WFN
 
 ### 11.2 Matrix 的两种定义方式
 
-#### 12.2.1 笛卡尔积模式（自动展开）
+#### 11.2.1 笛卡尔积模式（自动展开）
 
 **代码位置**：`pipeline/frontend/yaml/matrix/matrix.go:70-112`
 
@@ -1812,7 +1812,7 @@ const (
 
 > **注意**：超出限制时不会报错，只是静默截断。这是为了防止恶意或意外的超大矩阵导致系统过载。
 
-### 12.4 Matrix 轴如何成为独立 Workflow
+### 11.4 Matrix 轴如何成为独立 Workflow
 
 **代码位置**：`pipeline/frontend/builder/builder.go:67-86`
 
@@ -1869,7 +1869,7 @@ depends_on:
   - test
 ```
 
-#### 12.5.2 方式二：Matrix 展开
+#### 11.5.2 方式二：Matrix 展开
 
 单个文件内通过 matrix 展开为多个并行执行的 workflow 变体。
 
@@ -1987,7 +1987,7 @@ func filterMissingDependencies(items []*Item) []*Item {
 4. 循环直到没有新变化
 5. 最终所有保留的依赖都标记为必需（`optional=false`）
 
-### 12.8 Matrix + Fan-Out 的组合使用
+### 11.8 Matrix + Fan-Out 的组合使用
 
 实际项目中经常组合使用：
 
@@ -2899,9 +2899,696 @@ When.Match(metadata, global, env)
 
 ---
 
-## 十五、附录：核心文件全清单
+## 十五、流水线间依赖与触发链
 
-### 15.1 编译与前端模块
+Woodpecker 的"流水线间依赖"并非跨 Pipeline 实例的编排，而是在**单次 Pipeline 执行内部**，多个 Workflow 之间通过 `depends_on` 和 `runs_on` 字段声明执行顺序与条件依赖。
+
+### 15.1 depends_on 的编译与入队
+
+#### 15.1.1 YAML 层面的声明
+
+```yaml
+workflow:
+  build:
+    # ...
+  deploy:
+    depends_on: [build]
+    runs_on: [success]   # 默认值
+  notify:
+    depends_on: [deploy]
+    runs_on: [failure]
+```
+
+编译器在 `compiler.go` 的 `compile()` 方法中将 `depends_on` 收集到 `Container.DependsOn` 列表，将 `runs_on` 收集到 `Container.RunsOn` 列表。
+
+#### 15.1.2 Builder 层的依赖提取
+
+`PipelineBuilder.Build()` 编译每个 Workflow 后，从编译结果中提取 `item.DependsOn` 和 `item.RunsOn`：
+
+```go
+// pipeline/frontend/builder/builder.go
+type Item struct {
+    Workflow  *backend.Workflow
+    Config    *backend.Config
+    Labels    map[string]string
+    DependsOn *constraint.DependsOn
+    RunsOn    []string
+}
+```
+
+#### 15.1.3 队列入队时的依赖解析
+
+`queuePipeline()` 将每个 Item 转换为 `model.Task`，并通过 `getTaskDependencies()` 将 Workflow 名称映射为 Task ID：
+
+```go
+// server/pipeline/queue.go
+func queuePipeline(ctx context.Context, repo *model.Repo, activePipeline *model.Pipeline, pipelineItems []*builder.Item) error {
+    var tasks []*model.Task
+    for _, item := range pipelineItems {
+        task := &model.Task{
+            ID:           fmt.Sprint(item.Workflow.ID),
+            Dependencies: getTaskDependencies(item.DependsOn.Names(), pipelineItems),
+            RunOn:        item.RunsOn,
+            DepStatus:    make(map[string]model.StatusValue),
+        }
+        // ...
+    }
+    return server.Config.Services.Scheduler.PushAtOnce(ctx, tasks)
+}
+
+func getTaskDependencies(dependsOn []string, items []*builder.Item) (taskIDs []string) {
+    for _, dep := range dependsOn {
+        for _, pipelineItem := range items {
+            if pipelineItem.Workflow.Name == dep {
+                taskIDs = append(taskIDs, fmt.Sprint(pipelineItem.Workflow.ID))
+            }
+        }
+    }
+    return taskIDs
+}
+```
+
+**关键转换**：`depends_on` 的值是 Workflow **名称**（字符串），而 Task 的 `Dependencies` 字段存储的是被依赖 Workflow 的 **Task ID**（即 `fmt.Sprint(workflow.ID)`）。这意味着名称解析发生在入队时刻，之后全部基于 ID 引用。
+
+### 15.2 FIFO 队列中的依赖调度
+
+#### 15.2.1 三个状态列表
+
+```
+┌─────────────┐   依赖满足    ┌────────────┐   Worker 匹配   ┌────────────┐
+│  waitingOnDeps │ ──────────→ │  pending   │ ─────────────→ │  running   │
+└─────────────┘              └────────────┘              └────────────┘
+       ↑                          │                          │
+       │     依赖未满足            │    租约超时                │  完成/失败
+       └──────────────────────────┘    重新入队                │
+                                                            ↓
+                                                       从 running 移除
+```
+
+#### 15.2.2 依赖评估流程
+
+FIFO 队列的 `process()` 主循环每 100ms 执行一次，其中 `filterWaiting()` 负责评估等待中的任务是否所有依赖都已完成：
+
+```go
+// server/queue/fifo.go
+func (q *fifo) filterWaiting() {
+    for _, task := range q.waitingOnDeps {
+        depsComplete := true
+        for depID, depStatus := range task.DepStatus {
+            if depStatus == "" {
+                depsComplete = false
+                break
+            }
+        }
+        if depsComplete {
+            // 移至 pending 列表
+        }
+    }
+}
+```
+
+#### 15.2.3 ShouldRun 判断 — runs_on 语义
+
+当所有依赖完成后，`Task.ShouldRun()` 根据依赖的实际状态和声明的 `runs_on` 条件决定该 Task 是否真正执行：
+
+```go
+// server/model/task.go
+func (t *Task) ShouldRun() bool {
+    if t.runsOnFailure() && t.runsOnSuccess() {
+        return true  // 无论依赖成功失败都执行
+    }
+    if !t.runsOnFailure() && t.runsOnSuccess() {
+        // 默认行为：所有依赖必须成功
+        for _, status := range t.DepStatus {
+            if status != StatusSuccess { return false }
+        }
+        return true
+    }
+    if t.runsOnFailure() && !t.runsOnSuccess() {
+        // 仅在依赖失败时执行（如通知步骤）
+        for _, status := range t.DepStatus {
+            if status == StatusSuccess { return false }
+        }
+        return true
+    }
+    return false
+}
+
+func (t *Task) runsOnFailure() bool {
+    return slices.Contains(t.RunOn, string(StatusFailure))
+}
+
+func (t *Task) runsOnSuccess() bool {
+    if len(t.RunOn) == 0 { return true }  // 默认 runs_on: [success]
+    return slices.Contains(t.RunOn, string(StatusSuccess))
+}
+```
+
+**runs_on 四种组合**：
+
+| runs_on 声明 | runsOnSuccess | runsOnFailure | 行为 |
+|---|---|---|---|
+| （未声明，默认） | true | false | 所有依赖必须成功 |
+| `[success]` | true | false | 所有依赖必须成功 |
+| `[failure]` | false | true | 至少一个依赖失败 |
+| `[success, failure]` | true | true | 无条件执行 |
+
+### 15.3 依赖状态回写机制
+
+当 Workflow 执行完成时，Agent 通过 RPC 调用 `Done()` 上报状态。服务端在更新 Workflow 状态后，会查找所有依赖该 Workflow 的 Task，将它们的 `DepStatus` 字段更新：
+
+```go
+// server/queue/fifo.go — Done() 中的简化逻辑
+func (q *fifo) Done(c context.Context, id string, exitStatus model.StatusValue) error {
+    // ... 从 running 移除 task ...
+    
+    // 回写依赖状态
+    for _, waitingTask := range q.waitingOnDeps {
+        if _, exists := waitingTask.DepStatus[id]; exists {
+            waitingTask.DepStatus[id] = exitStatus
+        }
+    }
+    // 触发 filterWaiting 重新评估
+}
+```
+
+### 15.4 触发链的完整生命周期
+
+```
+Pipeline 创建
+    │
+    ▼
+queuePipeline() ── 将所有 Workflow 转为 Task 入队
+    │                  ├── 无依赖 → pending
+    │                  └── 有依赖 → waitingOnDeps
+    ▼
+process() 循环（每 100ms）
+    │
+    ├── filterWaiting()
+    │       └── 检查 DepStatus 是否全部填充 → 移至 pending
+    │
+    ├── assignToWorker()
+    │       └── 标签匹配 → 分配 Agent → 移至 running
+    │
+    └── Agent 执行完成 → Done()
+            ├── 更新 DepStatus
+            └── 触发下一轮 filterWaiting
+                    │
+                    ▼
+            ShouldRun() 判断
+                ├── true  → 分配 Agent 执行
+                └── false → 标记 Skipped，继续级联
+```
+
+### 15.5 跨 Pipeline 触发 — Woodpecker 的局限
+
+Woodpecker **不支持**跨 Pipeline 实例的依赖触发（如"Pipeline A 成功后触发 Pipeline B"）。可选的替代方案：
+
+1. **Forge 层面**：Pipeline A 完成后通过 `woodpecker-cli` 或 HTTP API 手动触发 Pipeline B
+2. **Cron 轮询**：Pipeline B 定时检查外部状态
+3. **自定义步骤**：在 Pipeline A 末尾添加步骤，调用 `POST /api/repos/{repo_id}/pipelines` 触发另一个仓库的流水线
+4. **Forge Webhook 反射**：Pipeline A 推送代码到另一仓库，触发其 Webhook
+
+---
+
+## 十六、外部 Webhook 触发参数注入
+
+Woodpecker 的 Pipeline 触发来源可分为三大类：Forge Webhook、Cron 定时、手动触发。每种触发方式注入的参数不同，它们共同决定了 Pipeline 的元数据和编译期变量环境。
+
+### 16.1 触发源与事件类型
+
+```go
+// server/model/const.go
+const (
+    EventPush         WebhookEvent = "push"
+    EventPull         WebhookEvent = "pull_request"
+    EventPullClosed   WebhookEvent = "pull_request_closed"
+    EventPullMetadata WebhookEvent = "pull_request_metadata"
+    EventTag          WebhookEvent = "tag"
+    EventRelease      WebhookEvent = "release"
+    EventDeploy       WebhookEvent = "deployment"
+    EventCron         WebhookEvent = "cron"
+    EventManual       WebhookEvent = "manual"
+)
+```
+
+### 16.2 Forge Webhook 参数注入链路
+
+#### 16.2.1 入口：PostHook API
+
+```
+Forge Webhook → POST /api/hook → PostHook()
+```
+
+`PostHook()` 完成以下步骤：
+
+1. **Token 校验**：解析 Hook Token 获取 repo
+2. **Forge 解析**：调用 `_forge.Hook(c, c.Request)` 解析 Webhook 负载
+3. **Repo 校验**：验证 Token 中的 repo 与 Forge 返回的 repo 一致
+4. **创建 Pipeline**：调用 `pipeline.Create()` 启动完整编译流程
+
+#### 16.2.2 Forge.Hook() — 各 Forge 的参数提取
+
+以 GitHub 为例，`parseHook()` 根据事件类型分发到不同解析函数：
+
+| 事件类型 | 解析函数 | 注入的核心字段 |
+|---------|---------|--------------|
+| `PushEvent` | `parsePushHook()` | Event=push, Commit, Ref, Branch, Message, Author |
+| `DeploymentEvent` | `parseDeployHook()` | Event=deploy, DeployTo, DeployTask, Commit, Ref |
+| `PullRequestEvent` | `parsePullHook()` | Event=pull/pull_closed/pull_metadata, Ref=refs/pull/{n}/head, Refspec, PullRequestLabels, FromFork |
+| `ReleaseEvent` | `parseReleaseHook()` | Event=release, Ref=refs/tags/{tag}, IsPrerelease |
+
+**Deploy 事件的特殊参数注入**：
+
+```go
+// server/forge/github/parse.go
+func parseDeployHook(hook *github.DeploymentEvent) (*model.Repo, *model.Pipeline) {
+    pipeline := &model.Pipeline{
+        Event:      model.EventDeploy,
+        Commit:     hook.GetDeployment().GetSHA(),
+        DeployTo:   hook.GetDeployment().GetEnvironment(),  // ← 部署目标环境
+        DeployTask: hook.GetDeployment().GetTask(),          // ← 部署任务类型
+        // ...
+    }
+}
+```
+
+**Pull Request 事件的元数据注入**：
+
+```go
+func parsePullHook(hook *github.PullRequestEvent, merge bool) (*github.PullRequest, *model.Repo, *model.Pipeline, error) {
+    pipeline := &model.Pipeline{
+        Event:                event,
+        EventReason:          []string{eventAction},          // ← opened/synchronize/closed 等
+        PullRequestLabels:    convertLabels(hook.GetPullRequest().Labels),  // ← PR 标签
+        PullRequestMilestone: hook.GetPullRequest().GetMilestone().GetTitle(),
+        FromFork:             fromFork,
+        // ...
+    }
+}
+```
+
+#### 16.2.3 Pipeline 模型的完整字段映射
+
+从 Forge Webhook 解析到 `model.Pipeline` 后，以下字段被注入到编译期元数据：
+
+| Pipeline 字段 | 来源 | 编译期环境变量 |
+|---|---|---|
+| `Event` | Forge 事件类型 | `CI_PIPELINE_EVENT` |
+| `EventReason` | PR action | `CI_PIPELINE_EVENT_REASON` |
+| `Commit` | 提交 SHA | `CI_COMMIT_SHA` |
+| `Ref` | Git 引用 | `CI_COMMIT_REF` |
+| `Branch` | 分支名 | `CI_COMMIT_BRANCH` |
+| `Message` | 提交信息 | `CI_COMMIT_MESSAGE` |
+| `Author` | 提交者 | `CI_COMMIT_AUTHOR` |
+| `DeployTo` | 部署环境 | `CI_PIPELINE_DEPLOY_TO` |
+| `DeployTask` | 部署任务 | `CI_PIPELINE_DEPLOY_TASK` |
+| `PullRequestLabels` | PR 标签 | `CI_COMMIT_PULL_REQUEST_LABELS` |
+| `FromFork` | 是否来自 Fork | `CI_COMMIT_PULL_REQUEST_FORK` |
+| `IsPrerelease` | 是否预发布 | `CI_COMMIT_PRERELEASE` |
+| `ChangedFiles` | 变更文件列表 | `CI_COMMIT_CHANGED_FILES` |
+| `ForgeURL` | Forge 链接 | `CI_PIPELINE_FORGE_URL` |
+| `RerunCount` | 重试次数 | `CI_PIPELINE_RERUN_COUNT` |
+
+### 16.3 手动触发 — API 参数注入
+
+#### 16.3.1 创建新 Pipeline
+
+```http
+POST /api/repos/{repo_id}/pipelines
+Content-Type: application/json
+
+{
+  "branch": "main",
+  "variables": {
+    "DEPLOY_ENV": "staging",
+    "VERSION": "1.2.3"
+  }
+}
+```
+
+`CreatePipeline()` API 将 `variables` 映射为 `PipelineOptions.Variables`，最终通过 `createTmpPipeline()` 设置到 `Pipeline.AdditionalVariables`：
+
+```go
+// server/api/pipeline.go
+func createTmpPipeline(event model.WebhookEvent, commit *model.Commit, user *model.User, opts *model.PipelineOptions) *model.Pipeline {
+    return &model.Pipeline{
+        Event:               model.EventManual,
+        Commit:              commit.SHA,
+        Branch:              opts.Branch,
+        Ref:                 opts.Branch,
+        AdditionalVariables: opts.Variables,  // ← 用户自定义变量
+        // ...
+    }
+}
+```
+
+#### 16.3.2 Restart 时追加参数
+
+```http
+POST /api/repos/{repo_id}/pipelines/{pipeline_number}?event=deployment&deploy_to=production&KEY=VALUE
+```
+
+`PostPipeline()` API 从查询参数中提取变量，排除 `fork`、`event`、`deploy_to` 等保留字后，将剩余参数作为环境变量传递给 `pipeline.Restart()`：
+
+```go
+// server/api/pipeline.go
+func PostPipeline(c *gin.Context) {
+    // ...
+    pl.DeployTask = c.DefaultQuery("deploy_task", pl.DeployTask)
+    
+    if event, ok := c.GetQuery("event"); ok {
+        pl.Event = model.WebhookEvent(event)
+        pl.DeployTo = c.DefaultQuery("deploy_to", pl.DeployTo)
+    }
+
+    envs := map[string]string{}
+    for key, val := range c.Request.URL.Query() {
+        switch key {
+        case "fork", "event", "deploy_to":
+            continue
+        default:
+            envs[key] = val[0]  // ← 所有非保留查询参数变为环境变量
+        }
+    }
+    
+    pipeline.Restart(c, _store, pl, user, repo, envs)
+}
+```
+
+### 16.4 Cron 定时触发参数注入
+
+```go
+// server/cron/cron.go
+func CreatePipeline(ctx context.Context, store store.Store, cron *model.Cron) (*model.Repo, *model.Pipeline, error) {
+    // ...
+    return repo, &model.Pipeline{
+        Event:               model.EventCron,
+        Commit:              commit.SHA,
+        Ref:                 "refs/heads/" + cron.Branch,
+        Branch:              cron.Branch,
+        Timestamp:           cron.NextExec,
+        Cron:                cron.Name,               // ← Cron 任务名称
+        ForgeURL:            commit.ForgeURL,
+        AdditionalVariables: cron.Variables,           // ← Cron 自定义变量
+    }, nil
+}
+```
+
+Cron 触发会设置 `Event=cron`，同时注入 `Cron` 名称和 Cron 配置的 `Variables`。
+
+### 16.5 AdditionalVariables 在编译期的注入路径
+
+无论哪种触发方式，`Pipeline.AdditionalVariables` 最终都通过以下路径进入编译期环境：
+
+```go
+// server/pipeline/items.go — parsePipeline()
+if envs == nil {
+    envs = map[string]string{}
+}
+
+environmentService := server.Config.Services.Manager.EnvironmentService()
+if environmentService != nil {
+    globals, _ := environmentService.EnvironList(repo)
+    for _, global := range globals {
+        envs[global.Name] = global.Value
+    }
+}
+
+maps.Copy(envs, currentPipeline.AdditionalVariables)  // ← 合并 AdditionalVariables
+
+b := builder.PipelineBuilder{
+    Envs: envs,  // ← 传入编译器
+    // ...
+}
+```
+
+**变量优先级**（从低到高）：
+1. 全局环境变量（`EnvironmentService.EnvironList()`）
+2. `AdditionalVariables`（覆盖全局变量）
+3. `when` 评估中的 `env` 参数（运行时注入）
+4. `from_secret` 解析后的值（最终优先级）
+
+### 16.6 参数注入全流程图
+
+```
+Forge Webhook ──→ Hook() 解析 ──→ model.Pipeline{Event, Commit, DeployTo, ...}
+Cron 定时    ──→ Cron 模型   ──→ model.Pipeline{Event:cron, Cron, Variables}
+手动 API     ──→ PostHook/CreatePipeline ──→ model.Pipeline{Event:manual, AdditionalVariables}
+                                            │
+                                            ▼
+                                    pipeline.Create()
+                                            │
+                                            ▼
+                                    parsePipeline()
+                                            │
+                                      maps.Copy(envs, AdditionalVariables)
+                                            │
+                                            ▼
+                                    PipelineBuilder{Envs: envs}
+                                            │
+                                            ▼
+                                    compiler.WithEnvs(envs) → EnvVarSubst()
+                                            │
+                                            ▼
+                                    when.Match(metadata, env)  ← 元数据 + 变量
+```
+
+---
+
+## 十七、流水线产物保留策略
+
+Woodpecker 的"产物保留"涉及三个层面：Pipeline 配置数据持久化、日志存储与清理、Pipeline 记录的删除与级联清理。当前版本**没有内置的自动保留策略（TTL/Retention）**，所有清理操作需手动触发。
+
+### 17.1 Pipeline 配置数据的持久化与去重
+
+#### 17.1.1 Config 的 SHA-256 去重存储
+
+每次 Pipeline 创建时，YAML 配置文件通过 `findOrPersistPipelineConfig()` 持久化：
+
+```go
+// server/pipeline/config.go
+func findOrPersistPipelineConfig(store store.Store, currentPipeline *model.Pipeline, forgeYamlConfig *forge_types.FileMeta) (*model.Config, error) {
+    return store.ConfigPersist(&model.Config{
+        RepoID: currentPipeline.RepoID,
+        Name:   builder.SanitizePath(forgeYamlConfig.Name),
+        Data:   forgeYamlConfig.Data,
+    })
+}
+```
+
+```go
+// server/store/datastore/config.go
+func (s storage) ConfigPersist(conf *model.Config) (*model.Config, error) {
+    conf.Hash = fmt.Sprintf("%x", sha256.Sum256(conf.Data))  // ← SHA-256 哈希
+
+    existingConfig, err := s.configFindIdentical(sess, conf.RepoID, conf.Hash, conf.Name)
+    if existingConfig != nil {
+        return existingConfig, nil  // ← 相同内容复用已有记录
+    }
+    // 新配置才写入
+    s.configCreate(sess, conf)
+}
+```
+
+**去重策略**：同一仓库内，`RepoID + Hash + Name` 三元组唯一。相同内容不会重复存储。
+
+#### 17.1.2 Pipeline 与 Config 的关联
+
+通过 `pipeline_configs` 中间表实现多对多关联：
+
+```
+┌──────────┐     ┌───────────────────┐     ┌──────────┐
+│ Pipeline │────→│ pipeline_configs  │←────│  Config  │
+│ (id)     │     │ (pipeline_id,     │     │ (id,     │
+│          │     │  config_id)       │     │  hash,   │
+└──────────┘     └───────────────────┘     │  data)   │
+                                            └──────────┘
+```
+
+一个 Pipeline 可关联多个 Config（多文件配置），一个 Config 可被多个 Pipeline 复用（去重）。
+
+### 17.2 日志存储后端
+
+Woodpecker 支持三种日志存储后端，通过 `WOODPECKER_LOG_STORE` 配置：
+
+| 存储方式 | 配置值 | 说明 |
+|---------|-------|------|
+| 数据库 | `database`（默认） | 日志条目存储在 `log_entries` 表 |
+| 文件系统 | `file` | JSON Lines 格式存储，路径由 `WOODPECKER_LOG_STORE_FILE_PATH` 指定 |
+| 外部插件 | `addon` | 通过 RPC 调用外部可执行文件处理日志 |
+
+#### 17.2.1 数据库存储
+
+```go
+// server/store/datastore/log.go
+func (s storage) LogAppend(_ *model.Step, logEntries []*model.LogEntry) error {
+    for i := 0; i < len(logEntries); i += pgBatchSize {
+        chunk := logEntries[i : i+min(pgBatchSize, len(logEntries[i:]))]
+        s.engine.Insert(chunk)  // ← 批量插入，每批最多 1000 条
+    }
+}
+
+func (s storage) LogDelete(step *model.Step) error {
+    _, err := s.engine.Where("step_id = ?", step.ID).Delete(new(model.LogEntry))
+    return err
+}
+```
+
+#### 17.2.2 文件存储
+
+```go
+// server/services/log/file/file.go
+func (l logStore) filePath(id int64) string {
+    return filepath.Join(l.base, fmt.Sprintf("%d.json", id))  // ← {step_id}.json
+}
+
+func (l logStore) LogAppend(step *model.Step, logEntries []*model.LogEntry) error {
+    file, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+    // 每条 LogEntry 序列化为一行 JSON
+    for _, logEntry := range logEntries {
+        jsonLine, _ := json.Marshal(logEntry)
+        bytes = append(bytes, jsonLine...)
+        bytes = append(bytes, '\n')
+    }
+    file.Write(bytes)
+}
+
+func (l logStore) LogDelete(step *model.Step) error {
+    return os.Remove(l.filePath(step.ID))  // ← 直接删除文件
+}
+```
+
+#### 17.2.3 日志行数限制
+
+服务端通过 `WOODPECKER_MAX_PIPELINE_LOG_LINE_COUNT`（默认 5000）限制返回的日志行数。这是**读取限制**而非存储限制——日志本身不做自动截断。
+
+### 17.3 Pipeline 删除与级联清理
+
+#### 17.3.1 API 层删除
+
+```http
+DELETE /api/repos/{repo_id}/pipelines/{pipeline_number}
+```
+
+删除前校验：只能删除非运行状态的 Pipeline（`pending`/`running`/`blocked` 状态不允许删除）。
+
+#### 17.3.2 级联删除逻辑
+
+```go
+// server/store/datastore/pipeline.go
+func (s storage) deletePipeline(sess *xorm.Session, pipelineID int64) error {
+    // 1. 删除所有 Workflow 及其 Step
+    if err := s.workflowsDelete(sess, pipelineID); err != nil {
+        return err
+    }
+
+    // 2. 查找关联的 Config ID
+    var confIDs []int64
+    sess.Table(new(model.PipelineConfig)).Select("config_id").
+        Where("pipeline_id = ?", pipelineID).Find(&confIDs)
+
+    // 3. 清理不再被其他 Pipeline 引用的 Config
+    for _, confID := range confIDs {
+        exist, _ := sess.Where(
+            builder.Eq{"config_id": confID}.And(builder.Neq{"pipeline_id": pipelineID}),
+        ).Exist(new(model.PipelineConfig))
+        if !exist {
+            // 该 Config 仅被当前 Pipeline 使用，安全删除
+            sess.Where(builder.Eq{"id": confID}).Delete(new(model.Config))
+        }
+    }
+
+    // 4. 删除 Pipeline-Config 关联
+    sess.Where("pipeline_id = ?", pipelineID).Delete(new(model.PipelineConfig))
+
+    // 5. 删除 Pipeline 记录
+    return sess.ID(pipelineID).Delete(new(model.Pipeline))
+}
+```
+
+**Config 的引用计数清理**：删除 Pipeline 时不会直接删除其 Config，而是检查该 Config 是否还被其他 Pipeline 引用。只有在无引用时才删除——这是配置去重机制的清理端。
+
+#### 17.3.3 日志删除 API
+
+```http
+DELETE /api/repos/{repo_id}/logs/{pipeline_number}          ← 删除整个 Pipeline 的日志
+DELETE /api/repos/{repo_id}/logs/{pipeline_number}/{step_id} ← 删除单个 Step 的日志
+```
+
+```go
+// server/api/pipeline.go
+func DeletePipelineLogs(c *gin.Context) {
+    steps, _ := _store.StepList(pl.ID)
+    for _, step := range steps {
+        server.Config.Services.LogStore.LogDelete(step)  // ← 逐 Step 删除日志
+    }
+}
+```
+
+注意：日志删除保留 Pipeline 元数据（Workflow、Step 记录仍在数据库中），仅清除日志内容。
+
+### 17.4 当前保留策略的局限与运维实践
+
+#### 17.4.1 没有自动清理机制
+
+Woodpecker 当前**不提供**以下自动化功能：
+
+- ❌ Pipeline 自动过期清理（TTL）
+- ❌ 基于数量上限的滚动清理（如只保留最近 N 个 Pipeline）
+- ❌ 日志自动归档/压缩
+- ❌ Config 自动清理（即使已无 Pipeline 引用，Config 也会在 Pipeline 删除时才检查）
+
+#### 17.4.2 运维实践建议
+
+| 场景 | 推荐做法 |
+|------|---------|
+| 数据库膨胀 | 定期通过 API 或脚本批量删除旧 Pipeline |
+| 日志膨胀 | 使用文件存储后端 + 外部日志轮转（logrotate） |
+| Config 堆积 | Pipeline 删除时自动级联清理 Config，确保旧 Pipeline 被清理即可 |
+| 合规性要求 | 对敏感 Pipeline 使用 `DeletePipelineLogs` 只清日志保留元数据 |
+
+#### 17.4.3 数据量监控
+
+`GetPipelineCount()` 可获取系统级 Pipeline 总数，用于运维监控：
+
+```go
+// server/store/datastore/pipeline.go
+func (s storage) GetPipelineCount() (int64, error) {
+    return s.engine.Count(new(model.Pipeline))
+}
+```
+
+### 17.5 产物保留总览图
+
+```
+Pipeline 创建
+    │
+    ├── ConfigPersist() ──→ configs 表（SHA-256 去重）
+    ├── PipelineConfigCreate() ──→ pipeline_configs 表（多对多关联）
+    └── WorkflowsCreate() ──→ workflows + steps 表
+
+Pipeline 运行
+    │
+    └── LogAppend() ──→ log_entries 表 / {step_id}.json 文件 / 外部插件
+
+Pipeline 删除
+    │
+    ├── workflowsDelete() ──→ 删除 workflows + steps + logs
+    ├── PipelineConfig 关联清理 ──→ 删除 pipeline_configs 行
+    ├── Config 引用计数检查 ──→ 无引用则删除 config 行
+    └── Pipeline 记录删除 ──→ 删除 pipeline 行
+
+日志独立删除
+    │
+    └── LogDelete(step) ──→ 删除日志数据，保留 Step 元数据
+```
+
+---
+
+## 十八、附录：核心文件全清单
+
+### 18.1 编译与前端模块
 
 | 文件路径 | 职责 | 相关章节 |
 |---------|------|---------|
@@ -2926,7 +3613,7 @@ When.Match(metadata, global, env)
 | `pipeline/frontend/yaml/constraint/list.go` | List 类型：Include/Exclude + Glob 匹配 | 第 14 章 |
 | `pipeline/frontend/yaml/constraint/path.go` | Path 类型：变更文件过滤 | 第 14 章 |
 | `pipeline/frontend/yaml/constraint/map.go` | Map 类型：Matrix 维度过滤 | 第 14 章 |
-| `pipeline/frontend/yaml/constraint/depends_on.go` | DependsOn 依赖类型 | 第 4、11 章 |
+| `pipeline/frontend/yaml/constraint/depends_on.go` | DependsOn 依赖类型 | 第 4、11、15 章 |
 | `pipeline/frontend/builder/builder.go` | PipelineBuilder、多文件/Matrix 编排主流程 | 第 2、11 章 |
 | `pipeline/frontend/builder/types.go` | Item / Workflow / YamlFile 类型定义 | 第 1、11 章 |
 | `pipeline/frontend/builder/utils.go` | 依赖过滤、路径清洗工具 | 第 2、11 章 |
@@ -2934,7 +3621,7 @@ When.Match(metadata, global, env)
 | `pipeline/frontend/metadata/environment.go` | CI 元数据环境变量生成 | 第 9 章 |
 | `pipeline/frontend/metadata/drone_compatibility.go` | Drone CI 环境变量兼容层 | 第 8 章 |
 
-### 15.2 后端与运行时模块
+### 18.2 后端与运行时模块
 
 | 文件路径 | 职责 | 相关章节 |
 |---------|------|---------|
@@ -2949,7 +3636,7 @@ When.Match(metadata, global, env)
 | `pipeline/runtime/step.go` | 步骤执行、OnSuccess/OnFailure 跳过、运行时环境变量 | 第 9、13 章 |
 | `pipeline/runtime/runtime.go` | Runtime 工作流执行器 | 第 9 章 |
 
-### 15.3 服务端调度与 Agent 模块
+### 18.3 服务端调度与 Agent 模块
 
 | 文件路径 | 职责 | 相关章节 |
 |---------|------|---------|
@@ -2958,15 +3645,15 @@ When.Match(metadata, global, env)
 | `server/scheduler/scheduler.go` | Scheduler（Queue + PubSub 组合） | 第 12 章 |
 | `server/rpc/filter.go` | Agent-Task 标签匹配算法与评分 | 第 12 章 |
 | `server/rpc/server.go` | RPC 服务端：Next/Wait/Init/Extend/Done | 第 12 章 |
-| `server/model/task.go` | Task 模型：依赖、运行状态、ShouldRun 判断 | 第 12、13 章 |
+| `server/model/task.go` | Task 模型：依赖、运行状态、ShouldRun 判断 | 第 12、13、15 章 |
 | `agent/runner.go` | Agent Runner：拉取任务、续约、Runtime 启动 | 第 12、13 章 |
 
-### 15.4 服务端 Pipeline 生命周期
+### 18.4 服务端 Pipeline 生命周期
 
 | 文件路径 | 职责 | 相关章节 |
 |---------|------|---------|
-| `server/pipeline/items.go` | 服务端入口：组装 PipelineBuilder | 第 2 章 |
-| `server/pipeline/config.go` | 配置持久化入口 | 第 7 章 |
+| `server/pipeline/items.go` | 服务端入口：组装 PipelineBuilder、AdditionalVariables 合并 | 第 2、16 章 |
+| `server/pipeline/config.go` | 配置持久化入口、findOrPersistPipelineConfig | 第 7、17 章 |
 | `server/pipeline/create.go` | Pipeline 创建与错误处理主流程 | 第 6、7 章 |
 | `server/pipeline/pipeline_status.go` | 错误状态更新（UpdateToStatusError） | 第 6 章 |
 | `server/pipeline/restart.go` | Pipeline Restart：人工 Retry 链路 | 第 13 章 |
@@ -2976,9 +3663,36 @@ When.Match(metadata, global, env)
 | `server/services/config/forge.go` | Forge 配置获取与重启复用 | 第 7 章 |
 | `server/services/config/http.go` | HTTP 配置扩展与 204 回退机制 | 第 7 章 |
 | `server/services/config/combined.go` | 配置服务链式组合 | 第 7 章 |
-| `server/store/datastore/config.go` | 配置 SHA-256 哈希去重存储 | 第 7 章 |
+| `server/store/datastore/config.go` | 配置 SHA-256 哈希去重存储 | 第 7、17 章 |
 
-### 15.5 CLI 与共享模块
+### 18.5 Webhook 触发与参数注入模块
+
+| 文件路径 | 职责 | 相关章节 |
+|---------|------|---------|
+| `server/api/hook.go` | Webhook 入口：PostHook 处理 | 第 16 章 |
+| `server/api/pipeline.go` | 手动触发：CreatePipeline、Restart 参数注入 | 第 16 章 |
+| `server/forge/forge.go` | Forge 接口：Hook() 方法定义 | 第 16 章 |
+| `server/forge/github/parse.go` | GitHub Webhook 解析：Push/Deploy/PR/Release | 第 16 章 |
+| `server/forge/github/convert.go` | GitHub 数据模型转换 | 第 16 章 |
+| `server/cron/cron.go` | Cron 定时触发：调度与 Pipeline 创建 | 第 16 章 |
+| `server/model/cron.go` | Cron 模型与变量定义 | 第 16 章 |
+| `server/model/pipeline.go` | Pipeline 模型：AdditionalVariables、DeployTo 等 | 第 16 章 |
+| `server/model/const.go` | WebhookEvent 枚举与 StatusValue 定义 | 第 16 章 |
+| `server/pipeline/queue.go` | 队列入队：depends_on 名称→ID 解析 | 第 15 章 |
+| `server/pipeline/metadata/metadata.go` | 服务端元数据组装：Pipeline→Metadata 映射 | 第 16 章 |
+
+### 18.6 产物保留与数据存储模块
+
+| 文件路径 | 职责 | 相关章节 |
+|---------|------|---------|
+| `server/store/datastore/pipeline.go` | Pipeline CRUD、级联删除、GetPipelineCount | 第 17 章 |
+| `server/store/datastore/log.go` | 数据库日志存储：LogAppend/LogDelete | 第 17 章 |
+| `server/services/log/service.go` | Log Service 接口定义 | 第 17 章 |
+| `server/services/log/file/file.go` | 文件日志存储：JSON Lines 格式 | 第 17 章 |
+| `server/store/datastore/config.go` | Config 持久化与 SHA-256 去重 | 第 7、17 章 |
+| `cmd/server/flags.go` | 日志存储后端配置（WOODPECKER_LOG_STORE） | 第 17 章 |
+
+### 18.7 CLI 与共享模块
 
 | 文件路径 | 职责 | 相关章节 |
 |---------|------|---------|
