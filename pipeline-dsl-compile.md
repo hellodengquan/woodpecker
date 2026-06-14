@@ -1316,26 +1316,743 @@ Schema 校验当前仅产生**警告**（`IsWarning: true`），不阻塞编译�
 
 ---
 
-## 九、补充文件清单
+## 十、动态变量与 Secret 注入的编译期处理
 
-| 文件路径 | 补充内容相关 |
-|---------|------------|
-| `pipeline/errors/pipeline.go` | PipelineError 类型体系与 5 种错误分类 |
-| `pipeline/errors/linter.go` | 错误聚合、阻断判断、结构化 Data 提取 |
-| `pipeline/errors/runtime.go` | 运行时错误类型（ExitError、OomError） |
-| `pipeline/frontend/yaml/linter/error.go` | Linter 错误创建（File + Field 定位） |
-| `pipeline/frontend/yaml/compiler/errors.go` | 编译器 4 种细粒度错误类型 |
-| `pipeline/frontend/yaml/linter/schema/schema.go` | JSON Schema 校验实现 |
-| `pipeline/frontend/yaml/linter/schema/schema.json` | DSL Schema 权威定义 |
-| `server/store/datastore/config.go` | 配置 SHA-256 哈希去重存储 |
-| `server/pipeline/config.go` | 配置持久化入口 |
-| `server/pipeline/pipeline_status.go` | 错误状态更新（UpdateToStatusError） |
-| `server/pipeline/create.go` | Pipeline 创建与错误处理主流程 |
-| `server/services/config/forge.go` | Forge 配置获取与重启复用 |
-| `server/services/config/http.go` | HTTP 配置扩展与 204 回退机制 |
-| `server/services/config/combined.go` | 配置服务链式组合 |
-| `pipeline/frontend/metadata/drone_compatibility.go` | Drone CI 环境变量兼容层 |
-| `pipeline/frontend/yaml/types/container_list.go` | 步骤列表双语法兼容（Map/Sequence） |
-| `pipeline/frontend/yaml/types/workflow.go` | `runs_on` 废弃字段定义 |
-| `pipeline/frontend/yaml/constraint/constraint.go` | `when` 条件约束实现 |
-| `shared/constant/constant.go` | 默认配置路径、克隆插件常量 |
+### 10.1 环境变量分层注入模型
+
+Woodpecker 的环境变量注入分为 **编译期** 和 **运行期** 两个阶段，三层来源：
+
+```
+编译期 (Compile-time)
+    ├── 层 1：CI 元数据环境变量（Metadata.Environ()）
+    │       - CI_REPO, CI_PIPELINE_NUMBER, CI_COMMIT_SHA 等
+    │       - 来自当前触发事件的静态信息
+    │
+    ├── 层 2：Matrix 轴变量（Axis）
+    │       - GO_VERSION, DATABASE 等矩阵维度变量
+    │       - 每个矩阵轴独立一组
+    │
+    └── 层 3：用户自定义环境变量（container.Environment）
+            - YAML 中 environment 段定义的变量
+            - 支持 from_secret 语法注入密钥
+
+运行期 (Runtime)
+    └── 层 4：运行时补充变量
+            - CI_PIPELINE_STATUS（success/failure）
+            - CI_PIPELINE_STARTED（运行起始时间戳）
+            - CI_STEP_NAME, CI_STEP_TYPE, CI_STEP_STARTED
+            - 步骤级别的动态信息
+```
+
+### 10.2 编译期变量替换 — EnvVarSubst
+
+**代码位置**：`pipeline/frontend/metadata/substitution.go:24-31`
+
+发生在 YAML 解析之前，对整段 YAML 文本做变量插值：
+
+```go
+func EnvVarSubst(data string, envs map[string]string) (string, error) {
+    tmpl, err := envsubst.Parse(data)
+    if err != nil {
+        return "", &pipeline_errors.PipelineError{...}
+    }
+    return tmpl.Execute(envs)
+}
+```
+
+**替换时机**：`PipelineBuilder.genItemForWorkflow()` → `yaml.ParseString()` 之前。
+
+**支持的语法**（来自 `github.com/drone/envsubst`）：
+- `${VAR}` / `$VAR` — 直接替换
+- `${VAR:-default}` — 变量为空时使用默认值
+- `${VAR:=default}` — 变量为空时使用默认值**并赋值**
+- `${VAR:?error}` — 变量为空时报错
+- 等等（共 15+ 种 bash 风格语法）
+
+**特殊处理**：含换行符的值会被自动加引号转义，避免破坏 YAML 结构。
+
+### 10.3 Secret 注入机制 — from_secret
+
+#### 10.3.1 注入路径
+
+Secret 注入发生在 **编译期** 的 `createProcess()` 阶段，有两条独立的注入通道：
+
+```go
+// settings → PLUGIN_* 前缀环境变量
+settings.ParamsToEnv(container.Settings, environment, "PLUGIN_", true, getSecretValue, secretMapping)
+
+// environment → 无前缀环境变量
+settings.ParamsToEnv(container.Environment, environment, "", false, getSecretValue, secretMapping)
+```
+
+两条通道都通过 `getSecretValue` 回调函数访问密钥池。
+
+#### 10.3.2 Secret 查找与权限校验
+
+**代码位置**：`pipeline/frontend/yaml/compiler/compiler.go:42-79`
+
+`getSecretValue` 闭包实现了两层权限校验：
+
+```go
+getSecretValue := func(name string) (string, error) {
+    name = strings.ToLower(name)
+    secret, ok := c.secrets[name]   // 从编译期密钥池查找
+    if !ok {
+        return "", fmt.Errorf("secret %q not found", name)
+    }
+
+    event := c.metadata.Curr.Event
+    err := secret.Available(event, container)  // 权限校验
+    if err != nil {
+        return "", err
+    }
+    return secret.Value, nil
+}
+```
+
+`Secret.Available()` 校验顺序（`compiler.go:49-64`）：
+
+1. **Plugin 限制**：如果设置了 `AllowedPlugins`
+   - 步骤必须是 plugin 类型（`container.IsPlugin()`）
+   - 步骤镜像必须匹配白名单（`MatchImageDynamic`）
+2. **事件限制**：如果设置了 `Events`
+   - 当前事件必须在允许列表中
+   - Pull Request 相关事件统一归一化为 `EventPull` 再匹配
+
+#### 10.3.3 Secret 递归注入算法
+
+**代码位置**：`pipeline/frontend/yaml/compiler/settings/params.go`
+
+`from_secret` 语法支持**递归注入**，即可以出现在任意深度的嵌套结构中：
+
+```yaml
+steps:
+  deploy:
+    settings:
+      ssh:
+        host: example.com
+        key:
+          from_secret: ssh_key   # 深层嵌套中的 from_secret
+        port: 22
+```
+
+算法流程（`injectSecretRecursive`）：
+
+```
+sanitizeParamValue(v)
+  ├── 基本类型（bool/string/int/float）→ 直接字符串化
+  ├── map[string]any
+  │     ├── 检查是否为 {from_secret: "xxx"} 结构
+  │     │     └── 是 → 调用 getSecretValue() 返回密钥值
+  │     └── 否 → 递归处理每个 value → 最终 YAML→JSON 序列化
+  └── slice/array
+        ├── 全为简单类型 → strings.Join 逗号分隔
+        └── 含复杂类型 → 递归每个元素 → YAML→JSON 序列化
+```
+
+#### 10.3.4 SecretMapping — 密钥使用追踪
+
+**代码位置**：`pipeline/backend/types/step.go:30`
+
+```go
+type Step struct {
+    SecretMapping map[string]string `json:"secret_mapping,omitempty"`
+    ...
+}
+```
+
+用途：
+1. **日志脱敏**：运行时根据 `SecretMapping` 中的值对日志进行掩码替换
+2. **审计追踪**：记录哪些环境变量实际来源于密钥，以及密钥名与环境变量名的对应关系
+3. **密钥统计**：可以通过 mapping 统计每个 pipeline 使用了多少密钥
+
+填充时机：`ParamsToEnv` 中每次调用 `getSecretValue` 成功后，将 `sanitizedParamKey → secretValue` 加入 mapping。
+
+### 10.4 编译期 vs 运行期变量边界
+
+| 特性 | 编译期确定 | 运行期确定 |
+|------|-----------|-----------|
+| CI 元数据（提交/分支/仓库） | ✅ | - |
+| Matrix 轴变量 | ✅ | - |
+| 用户 environment 变量 | ✅ | - |
+| Settings（PLUGIN_*） | ✅ | - |
+| Secret 值 | ✅ | - |
+| 流水线状态（success/failure） | - | ✅ |
+| 步骤开始时间戳 | - | ✅ |
+| 步骤名称/类型 | - | ✅ |
+
+> **重要**：Woodpecker **不支持步骤间传递环境变量**。每个步骤的环境变量在编译期确定（加运行时少量补充），步骤 A 设置的环境变量不会传递给步骤 B。如果需要步骤间数据传递，必须通过**共享工作区卷**写文件实现。
+
+### 10.5 动态变量的替代方案
+
+由于编译期变量都是静态确定的，Woodpecker 没有原生的"动态变量"机制。常见替代方案：
+
+1. **共享卷文件**：步骤 A 写入 `$CI_WORKSPACE/.env`，步骤 B `source` 读取
+2. **插件输出**：某些插件会输出文件到工作区供后续步骤使用
+3. **配置扩展服务**：通过 HTTP 配置扩展服务动态生成/修改 YAML
+4. **Matrix 矩阵**：在编译期就展开为多个独立 workflow，属于编译时展开而非运行时动态
+
+---
+
+## 十一、流水线步骤间数据传递 — 共享卷与插件协议
+
+### 11.1 共享工作区卷 — 数据传递的核心机制
+
+Woodpecker 的步骤间数据传递完全依赖**共享数据卷**，这是编译期就规划好的基础设施。
+
+#### 11.1.1 卷的创建与命名
+
+**代码位置**：`pipeline/frontend/yaml/compiler/compiler.go:124,140`
+
+```go
+// 全局共享卷名
+config.Volume = fmt.Sprintf("%s_default", c.prefix)
+```
+
+命名规则：`<前缀>_default`
+- 前缀由 `WithPrefix()` 设置（`compiler/option.go:139-143`）
+- 服务端通常设为 `wp-<pipeline_id>` 或类似唯一标识
+- 目的：多个并发流水线之间的资源隔离
+
+#### 11.1.2 卷的挂载路径
+
+每个步骤都自动挂载共享卷：
+
+```go
+// convert.go:52-56,80-83
+workspaceBase := c.workspaceBase
+if container.IsPlugin() {
+    workspaceBase = pluginWorkspaceBase  // "/woodpecker"
+}
+workspaceVolume := fmt.Sprintf("%s_default:%s", c.prefix, workspaceBase)
+
+// 非本地模式下自动挂载
+if !c.local {
+    volumes = append(volumes, workspaceVolume)
+}
+```
+
+**普通步骤**：工作区基目录 = 用户配置的 `workspace.base`（默认 `/woodpecker`）
+**插件步骤**：工作区基目录固定为 `/woodpecker`（防止污染插件入口点）
+
+工作目录计算：
+```
+普通步骤：<workspace.base>/<workspace.path>/<container.directory>
+插件步骤：/woodpecker/<workspace.path>/<container.directory>
+```
+
+`CI_WORKSPACE` 环境变量指向完整工作目录路径。
+
+#### 11.1.3 共享卷的生命周期
+
+```
+SetupWorkflow()          步骤执行期          DestroyWorkflow()
+      │                       │                       │
+      ▼                       ▼                       ▼
+  创建卷               所有步骤读写              删除卷
+  （Docker volume /    （同一挂载点）          （连同所有数据）
+   Kubernetes PVC /
+   本地目录）
+```
+
+整个 workflow 内所有步骤共享同一个卷，workflow 结束后卷被销毁。
+
+### 11.2 Artifact 传递 — 基于文件系统的约定
+
+Woodpecker **没有内建的 Artifact 系统**（没有 artifact DSL 关键字）。Artifact 传递完全通过共享工作区卷的文件系统约定实现。
+
+#### 11.2.1 常见模式
+
+```yaml
+steps:
+  build:
+    image: golang
+    commands:
+      - go build -o output/myapp .   # 构建产物写入工作区
+
+  test:
+    image: golang
+    commands:
+      - ./output/myapp --test        # 后续步骤直接读取
+
+  deploy:
+    image: woodpeckerci/plugin-s3
+    settings:
+      source: output/myapp          # 插件读取工作区文件上传
+      target: /release/
+```
+
+**关键要点**：
+- 所有步骤在同一工作目录下操作
+- 前序步骤写入的文件，后序步骤可以直接读取
+- 插件也是通过挂载共享卷来访问工作区文件
+- 没有"上传 artifact"/"下载 artifact"的显式概念
+
+#### 11.2.2 跨 Workflow 传递
+
+跨 workflow 的 artifact 传递**不支持**（每个 workflow 有独立的共享卷）。
+如果需要跨 workflow 传递数据，通常的做法：
+- 使用外部存储（S3/对象存储）作为中转站
+- 合并到同一个 workflow 中
+- 使用 `depends_on` 保证执行顺序但数据仍不共享
+
+### 11.3 Cache 机制 — StepTypeCache 与插件实现
+
+#### 11.3.1 StepTypeCache 类型定义
+
+**代码位置**：`pipeline/backend/types/step.go:58`
+
+```go
+const (
+    StepTypeClone    StepType = "clone"
+    StepTypeService  StepType = "service"
+    StepTypePlugin   StepType = "plugin"
+    StepTypeCommands StepType = "commands"
+    StepTypeCache    StepType = "cache"    // Cache 步骤类型
+)
+```
+
+#### 11.3.2 编译器中的 Cache 处理
+
+**重要发现**：在 `pipeline/frontend/yaml/compiler/compiler.go` 中，**没有任何步骤被标记为 `StepTypeCache`**。
+
+Cache 步骤类型仅存在于：
+- 后端类型定义（`backend/types/step.go`）
+- 后端实现（`kubernetes/pod.go` 等，用于命名前缀区分）
+- API 模型（`server/model/step.go`、`woodpecker-go/woodpecker/const.go`）
+
+YAML DSL 中没有 `cache:` 段，编译器也不会生成 `StepTypeCache` 类型的步骤。
+
+#### 11.3.3 Cache 的实际实现方式
+
+Woodpecker 的缓存功能通过**插件**实现，而非 DSL 内置：
+
+```yaml
+steps:
+  restore-cache:
+    image: woodpeckerci/plugin-cache-s3
+    settings:
+      endpoint: s3.amazonaws.com
+      bucket: my-cache
+      restore: true          # 恢复模式
+      key: "{{ .Checksum }}"
+      mount:
+        - node_modules
+
+  build:
+    image: node
+    commands:
+      - npm install
+
+  save-cache:
+    image: woodpeckerci/plugin-cache-s3
+    settings:
+      endpoint: s3.amazonaws.com
+      bucket: my-cache
+      rebuild: true          # 重建模式
+      key: "{{ .Checksum }}"
+      mount:
+        - node_modules
+```
+
+Cache 插件协议：
+1. **恢复阶段**（restore）：从外部存储下载缓存 → 解压到工作区指定路径
+2. **构建阶段**：正常步骤读写工作区
+3. **保存阶段**（rebuild）：将指定路径打包 → 上传到外部存储
+
+缓存的判断逻辑在插件内部实现（如基于文件 checksum 生成 key，命中则恢复），与编译器无关。
+
+### 11.4 插件协议 — Settings 与 PLUGIN_* 环境变量
+
+插件（Plugin）是 Woodpecker 扩展能力的核心机制，其内部协议基于环境变量约定。
+
+#### 11.4.1 插件类型判定
+
+**代码位置**：`pipeline/frontend/yaml/types/container.go:60-64`
+
+```go
+func (c *Container) IsPlugin() bool {
+    return len(c.Commands) == 0 &&
+           len(c.Entrypoint) == 0 &&
+           len(c.Environment) == 0
+}
+```
+
+三个条件同时满足才被视为插件：
+- 没有自定义 `commands`
+- 没有自定义 `entrypoint`
+- 没有自定义 `environment` 段
+
+#### 11.4.2 Settings → PLUGIN_* 转换规则
+
+| YAML settings | 环境变量（PLUGIN_ 前缀 + 大写 + 点/横杠转下划线） |
+|--------------|--------------------------------------------------|
+| `source: output/` | `PLUGIN_SOURCE=output/` |
+| `bucket-name: my-bucket` | `PLUGIN_BUCKET_NAME=my-bucket` |
+| `ssh.port: 22` | `PLUGIN_SSH_PORT=22` |
+| `tags: [v1, v2]` | `PLUGIN_TAGS=v1,v2` |
+| `config: {a: 1, b: 2}` | `PLUGIN_CONFIG={"a":1,"b":2}`（JSON 序列化） |
+| `password: {from_secret: pwd}` | `PLUGIN_PASSWORD=<实际密钥值>` |
+
+**嵌套处理逻辑**：
+- **简单值**（bool/string/int/float）→ 直接字符串化
+- **简单数组** → 逗号拼接（`a,b,c`）
+- **复杂 map/嵌套数组** → YAML 序列化再转 JSON
+- **`from_secret` 映射** → 递归替换为实际密钥值
+
+#### 11.4.3 特权插件自动升级
+
+**代码位置**：`pipeline/frontend/yaml/compiler/convert.go:127-129`
+
+```go
+if utils.MatchImageDynamic(container.Image, c.escalated...) && container.IsPlugin() {
+    privileged = true
+}
+```
+
+匹配 `escalated`（特权插件白名单）的插件自动获得 `--privileged` 权限。
+白名单通过 `WithEscalated()` Option 注入（`compiler/option.go:55-58`）。
+
+### 11.5 步骤间数据传递总结
+
+| 传递方式 | 范围 | 机制 | 速度 | 持久化 |
+|---------|------|------|------|--------|
+| **共享工作区卷** | 同 Workflow 内 | 本地文件系统 | 快 | 临时（Workflow 结束销毁） |
+| **Cache 插件** | 跨 Pipeline | 外部存储（S3等） | 中（网络传输） | 持久（按 key 保留） |
+| **环境变量** | 单步骤内 | 进程环境 | 极快 | 不传递 |
+| **Service 网络** | 同 Stage 内 | Docker/K8s 网络 | 快 | 临时 |
+| **HTTP 扩展** | 编译期 | 配置生成服务 | N/A | 一次性 |
+
+---
+
+## 十二、Matrix Build 与 Fan-Out 扩展机制
+
+### 12.1 Matrix 构建的本质 — 编译期展开
+
+Woodpecker 的 Matrix（矩阵构建）不是运行时动态扩展，而是**编译期全量展开**为多个独立的 Workflow。
+
+```
+一份 YAML + Matrix 定义
+        │
+        ▼ 编译期展开
+  ┌─────┼─────┐
+  ▼     ▼     ▼
+轴1   轴2   轴3   ... 轴N
+  │     │     │          │
+  ▼     ▼     ▼          ▼
+WF1   WF2   WF3   ...  WFN
+（每个都是完整独立的 workflow）
+```
+
+### 12.2 Matrix 的两种定义方式
+
+#### 12.2.1 笛卡尔积模式（自动展开）
+
+**代码位置**：`pipeline/frontend/yaml/matrix/matrix.go:70-112`
+
+```yaml
+matrix:
+  GO_VERSION:
+    - "1.21"
+    - "1.22"
+  DATABASE:
+    - mysql
+    - postgres
+```
+
+计算结果：2 × 2 = **4 个矩阵轴**
+
+排列算法（`calc()` 函数）：
+```go
+func calc(matrix Matrix) []Axis {
+    // 1. 计算总排列数 perm = Π len(v)  for each k,v
+    // 2. 提取所有维度标签 tags
+    // 3. 对 p in [0, perm):
+    //    - 对每个维度 tag：
+    //      decrease = perm / len(elems)
+    //      elem_idx = p / decrease % len(elems)
+    //      axis[tag] = elems[elem_idx]
+    //    - 加入 axisList
+}
+```
+
+特点：每个维度索引独立计算，保证所有组合都出现且仅出现一次。
+
+#### 12.2.2 Include 列表模式（手动指定）
+
+**代码位置**：`pipeline/frontend/yaml/matrix/matrix.go:124-134`
+
+```yaml
+matrix:
+  include:
+    - GO_VERSION: "1.21"
+      DATABASE: mysql
+    - GO_VERSION: "1.22"
+      DATABASE: postgres
+```
+
+直接使用用户指定的组合，不做笛卡尔积计算。
+
+解析优先级：先尝试 `parseList()`，成功且非空则直接返回；否则回退到 `parse()` + `calc()` 笛卡尔积模式。
+
+### 12.3 Matrix 的限制与保护
+
+**代码位置**：`pipeline/frontend/yaml/matrix/matrix.go:26-28`
+
+```go
+const (
+    limitTags = 10   // 最多 10 个矩阵维度
+    limitAxis = 25   // 最多 25 个排列组合
+)
+```
+
+限制逻辑：
+- 维度限制（`limitTags`）：`calc()` 中内层循环到第 10 个维度后 `break`，多余维度被忽略
+- 组合限制（`limitAxis`）：`calc()` 中生成到第 25 个轴后 `break`，停止生成
+
+> **注意**：超出限制时不会报错，只是静默截断。这是为了防止恶意或意外的超大矩阵导致系统过载。
+
+### 12.4 Matrix 轴如何成为独立 Workflow
+
+**代码位置**：`pipeline/frontend/builder/builder.go:67-86`
+
+```go
+for _, y := range b.Yamls {
+    axes, err := matrix.ParseString(string(y.Data))
+    if len(axes) == 0 {
+        axes = append(axes, matrix.Axis{})  // 无 matrix 也有一个空轴
+    }
+
+    for i, axis := range axes {
+        workflow := &Workflow{
+            PID:     pidSequence,  // 全局递增 PID
+            Environ: axis,         // 轴变量作为 workflow 级环境变量
+            Name:    SanitizePath(y.Name),
+            AxisID:  i + 1,        // 轴编号（多轴时设置）
+        }
+        // 每个轴独立编译
+        item, err := b.genItemForWorkflow(workflow, axis, string(y.Data))
+        items = append(items, item)
+        pidSequence++
+    }
+}
+```
+
+关键特性：
+1. **独立 PID**：每个矩阵轴分配独立的全局进程号
+2. **独立环境**：轴变量注入 workflow 环境，参与 `EnvVarSubst` 和 `When.Match`
+3. **独立编译**：每个轴调用一次 `genItemForWorkflow()`，产出独立的 `*Item`
+4. **独立执行**：运行时每个 workflow 独立调度，可并行执行
+
+### 12.5 Fan-Out 模式 — 多 Workflow 并行
+
+Woodpecker 没有专门的 "fan-out" 关键字，但可以通过以下方式实现类似效果。
+
+#### 12.5.1 方式一：多文件 Workflow
+
+在 `.woodpecker/` 目录下放多个 YAML 文件：
+
+```
+.woodpecker/
+├── build.yml     → workflow "build"
+├── test.yml      → workflow "test"
+├── lint.yml      → workflow "lint"
+└── deploy.yml    → workflow "deploy"
+```
+
+每个文件独立编译为一个 workflow，默认并行执行。通过 `depends_on` 控制依赖关系：
+
+```yaml
+# deploy.yml
+depends_on:
+  - build
+  - test
+```
+
+#### 12.5.2 方式二：Matrix 展开
+
+单个文件内通过 matrix 展开为多个并行执行的 workflow 变体。
+
+```yaml
+matrix:
+  GO_VERSION: ["1.20", "1.21", "1.22", "1.23"]
+
+steps:
+  build:
+    image: golang:${GO_VERSION}
+    commands: [go build]
+```
+
+展开为 4 个并行 workflow，每个使用不同的 Go 版本。
+
+#### 12.5.3 方式三：DAG 步骤并行
+
+在单个 workflow 内，通过 `depends_on` 实现步骤级别的 fan-out/fan-in：
+
+```yaml
+steps:
+  setup:
+    image: alpine
+    commands: [./setup.sh]
+
+  test-unit:
+    image: golang
+    commands: [go test ./unit/...]
+    depends_on: [setup]      # fan-out
+
+  test-integration:
+    image: golang
+    commands: [go test ./integration/...]
+    depends_on: [setup]      # fan-out
+
+  test-e2e:
+    image: golang
+    commands: [go test ./e2e/...]
+    depends_on: [setup]      # fan-out
+
+  deploy:
+    image: alpine
+    commands: [./deploy.sh]
+    depends_on:              # fan-in
+      - test-unit
+      - test-integration
+      - test-e2e
+```
+
+DAG 编译结果：
+```
+Stage 1: setup
+Stage 2: test-unit | test-integration | test-e2e  (并行)
+Stage 3: deploy
+```
+
+### 12.6 三种扩展方式对比
+
+| 特性 | Matrix 构建 | 多文件 Workflow | DAG 步骤并行 |
+|------|-----------|----------------|-------------|
+| **展开时机** | 编译期 | 编译期 | 编译期 |
+| **粒度** | Workflow 级 | Workflow 级 | Step 级 |
+| **隔离性** | 高（独立容器/卷） | 高（独立容器/卷） | 低（共享工作区卷） |
+| **并行度** | 取决于 agent 容量 | 取决于 agent 容量 | 单 agent 内并行 |
+| **变量共享** | 仅 Matrix 轴变量 | 无共享 | 共享所有环境/文件 |
+| **依赖控制** | 无（同文件矩阵轴相互独立） | `depends_on`（跨文件） | `depends_on`（同文件） |
+| **适用场景** | 版本矩阵测试 | 异构任务分解 | 单构建多测试 |
+
+### 12.7 Workflow 间依赖处理
+
+**代码位置**：`pipeline/frontend/builder/utils.go:35-74`
+
+多文件 workflow 之间的依赖通过 `depends_on` 声明，在编译完成后统一处理：
+
+```go
+func filterMissingDependencies(items []*Item) []*Item {
+    // 循环直到稳定
+    for {
+        changed := false
+        for i, item := range items {
+            for _, dep := range item.DependsOn {
+                if dependencyExists(dep, items) {
+                    continue
+                }
+                if dep.Optional {
+                    // 可选依赖：从列表中移除
+                    item.DependsOn.Remove(dep.Name)
+                    changed = true
+                } else {
+                    // 必需依赖：删除整个 workflow
+                    items = append(items[:i], items[i+1:]...)
+                    changed = true
+                    break
+                }
+            }
+        }
+        if !changed {
+            break
+        }
+    }
+    // 最后将所有幸存的依赖标记为非可选
+    for _, item := range items {
+        for _, dep := range item.DependsOn {
+            dep.Optional = false
+        }
+    }
+    return items
+}
+```
+
+处理逻辑：
+1. 检查每个 workflow 的每个依赖是否存在
+2. 必需依赖不存在 → 整个 workflow 被移除（连锁反应）
+3. 可选依赖不存在 → 仅移除该依赖声明
+4. 循环直到没有新变化
+5. 最终所有保留的依赖都标记为必需（`optional=false`）
+
+### 12.8 Matrix + Fan-Out 的组合使用
+
+实际项目中经常组合使用：
+
+```
+.woodpecker/
+├── test.yml          # matrix: {go: [1.21, 1.22], os: [linux, darwin]} → 4 个 workflow
+├── build.yml         # 1 个 workflow
+└── deploy.yml        # depends_on: [build, test] → 等所有 test 矩阵轴完成
+```
+
+执行顺序：
+```
+build (1个) ──┐
+             ├──► deploy (1个)
+test (4个)  ──┘
+```
+
+即：deploy workflow 会等待 build 完成 + 所有 4 个 test 矩阵轴都完成。
+
+---
+
+## 十三、附录：核心文件全清单
+
+| 文件路径 | 职责 | 相关章节 |
+|---------|------|---------|
+| `pipeline/frontend/yaml/parse.go` | YAML 文本 → Workflow 结构体 | 第 2、3 章 |
+| `pipeline/frontend/yaml/types/workflow.go` | Workflow YAML 类型定义 | 第 3、8 章 |
+| `pipeline/frontend/yaml/types/container.go` | Container YAML 类型定义、IsPlugin() | 第 3、11 章 |
+| `pipeline/frontend/yaml/types/container_list.go` | 步骤列表双语法兼容（Map/Sequence） | 第 8 章 |
+| `pipeline/frontend/yaml/types/volume.go` | Volume 挂载类型定义 | 第 11 章 |
+| `pipeline/frontend/yaml/compiler/compiler.go` | Compiler 核心、阶段注入、Secret 权限校验 | 第 2、4、10 章 |
+| `pipeline/frontend/yaml/compiler/convert.go` | Container → Step 转换 | 第 2、4 章 |
+| `pipeline/frontend/yaml/compiler/dag.go` | DAG 拓扑排序、步骤级并行 | 第 4、12 章 |
+| `pipeline/frontend/yaml/compiler/option.go` | Compiler Functional Options | 第 4 章 |
+| `pipeline/frontend/yaml/compiler/errors.go` | 编译器 4 种细粒度错误类型 | 第 6 章 |
+| `pipeline/frontend/yaml/compiler/settings/params.go` | Settings→Env 转换、from_secret 递归注入 | 第 4、10 章 |
+| `pipeline/frontend/yaml/linter/linter.go` | 静态语法与策略校验 | 第 3、6 章 |
+| `pipeline/frontend/yaml/linter/error.go` | Linter 错误创建（File + Field 定位） | 第 6 章 |
+| `pipeline/frontend/yaml/linter/option.go` | Linter 配置选项 | 第 6 章 |
+| `pipeline/frontend/yaml/linter/schema/schema.go` | JSON Schema 校验实现 | 第 6 章 |
+| `pipeline/frontend/yaml/linter/schema/schema.json` | DSL Schema 权威定义 | 第 6、8 章 |
+| `pipeline/frontend/yaml/matrix/matrix.go` | Matrix 解析、笛卡尔积计算、限制保护 | 第 2、12 章 |
+| `pipeline/frontend/yaml/constraint/constraint.go` | `when` 条件约束实现 | 第 8 章 |
+| `pipeline/frontend/builder/builder.go` | PipelineBuilder、多文件/Matrix 编排主流程 | 第 2、12 章 |
+| `pipeline/frontend/builder/types.go` | Item / Workflow / YamlFile 类型定义 | 第 1、12 章 |
+| `pipeline/frontend/builder/utils.go` | 依赖过滤、路径清洗工具 | 第 2、12 章 |
+| `pipeline/frontend/metadata/substitution.go` | 环境变量替换（EnvVarSubst） | 第 3、10 章 |
+| `pipeline/frontend/metadata/environment.go` | CI 元数据环境变量生成 | 第 10 章 |
+| `pipeline/frontend/metadata/drone_compatibility.go` | Drone CI 环境变量兼容层 | 第 8 章 |
+| `pipeline/backend/types/config.go` | 后端 Config IR | 第 1、11 章 |
+| `pipeline/backend/types/stage.go` | 后端 Stage IR | 第 1 章 |
+| `pipeline/backend/types/step.go` | 后端 Step IR、StepType 枚举、SecretMapping | 第 1、10、11 章 |
+| `pipeline/backend/types/backend.go` | Backend 接口定义 | 第 11 章 |
+| `pipeline/errors/pipeline.go` | PipelineError 类型体系与 5 种错误分类 | 第 6 章 |
+| `pipeline/errors/linter.go` | 错误聚合、阻断判断、结构化 Data 提取 | 第 6 章 |
+| `pipeline/errors/runtime.go` | 运行时错误类型（ExitError、OomError） | 第 6 章 |
+| `pipeline/runtime/step.go` | 步骤执行、运行时环境变量补充（setStepEnv） | 第 10 章 |
+| `pipeline/runtime/runtime.go` | Runtime 工作流执行器 | 第 10 章 |
+| `server/pipeline/items.go` | 服务端入口：组装 PipelineBuilder | 第 2 章 |
+| `server/pipeline/config.go` | 配置持久化入口 | 第 7 章 |
+| `server/pipeline/create.go` | Pipeline 创建与错误处理主流程 | 第 6、7 章 |
+| `server/pipeline/pipeline_status.go` | 错误状态更新（UpdateToStatusError） | 第 6 章 |
+| `server/services/config/forge.go` | Forge 配置获取与重启复用 | 第 7 章 |
+| `server/services/config/http.go` | HTTP 配置扩展与 204 回退机制 | 第 7 章 |
+| `server/services/config/combined.go` | 配置服务链式组合 | 第 7 章 |
+| `server/store/datastore/config.go` | 配置 SHA-256 哈希去重存储 | 第 7 章 |
+| `cli/exec/exec.go` | CLI 本地执行入口 | 第 2 章 |
+| `shared/constant/constant.go` | 默认配置路径、克隆插件常量 | 第 8 章 |
