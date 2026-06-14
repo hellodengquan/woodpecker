@@ -1776,4 +1776,734 @@ q.Unlock()
 | 最佳匹配选择 | `server/queue/fifo.go:314-336` | 遍历并选择最高分 worker |
 | 调度循环 | `server/queue/fifo.go:257-287` | 每 100ms 执行一次完整调度 |
 
+---
+
+## 15. Agent 标签与 Capability 匹配机制详解
+
+本章节深入解析 Agent 的标签系统、Capability（容量）如何与任务调度交互、以及标签匹配的完整生命周期。
+
+### 15.1 标签系统的三层结构
+
+Agent 的最终标签由 **三层叠加** 而成，每层都有不同的来源和优先级：
+
+```
+Agent 最终 Labels (用于调度匹配)
+    │
+    ├── 第1层: 用户自定义标签 (customLabels)
+    │   来源: WOODPECKER_AGENT_LABELS
+    │   示例: gpu=true, size=large, team=backend
+    │
+    ├── 第2层: 隐式系统标签 (注入到 customLabels)
+    │   ├── platform   ← RegisterAgent.info.platform
+    │   ├── backend    ← RegisterAgent.info.backend
+    │   └── (如果为空则不注入)
+    │
+    └── 第3层: 服务端强制标签 (Server-side enforced)
+        ├── woodpecker.org.cn/repo  ← 任务侧注入，Agent 侧不匹配
+        └── woodpecker.org.cn/org   ← Agent.GetServerLabels()
+            ├── 系统Agent: org = "*" (通配)
+            └── 组织Agent: org = "123" (精确)
+```
+
+**标签注入代码** (`server/rpc/rpc.go:79-88`)：
+```go
+// 第2层: 注入隐式标签
+if info.Platform != "" {
+    agent.CustomLabels["platform"] = info.Platform
+}
+if info.Backend != "" {
+    agent.CustomLabels["backend"] = info.Backend
+}
+// 第3层: 服务端强制标签
+serverLabels, _ := agent.GetServerLabels()
+for k, v := range serverLabels {
+    agent.CustomLabels[k] = v
+}
+```
+
+### 15.2 Capability 与 Worker 的映射关系
+
+Capability 决定了 Agent 能同时执行多少个工作流，也决定了会注册多少个 Worker 到调度队列。
+
+**映射关系**：
+```
+Agent capacity = 3
+    │
+    ├── Runner 1 (goroutine) → Next(filter) → worker_1 {filter, channel}
+    ├── Runner 2 (goroutine) → Next(filter) → worker_2 {filter, channel}
+    └── Runner 3 (goroutine) → Next(filter) → worker_3 {filter, channel}
+```
+
+**关键特性**：
+1. **每个 Runner 独立调用 Next**：每个 Runner 都发起一个阻塞的 `Next()` RPC 调用
+2. **每个 Next 对应一个 Worker**：Server 端每收到一个 Next 请求，就在 workers 集合中注册一个 worker
+3. **所有 Worker 共享相同的 Filter**：同一 Agent 的所有 capacity 标签完全相同
+4. **Worker 是临时的**：任务分配后 worker 从集合中删除，Runner 完成任务后再次调用 Next 重新注册
+
+**多 Runner 启动代码** (`cmd/agent/core/agent.go:174-181`)：
+```go
+for i := 0; i < capacity; i++ {
+    serviceWaitingGroup.Go(func() error {
+        return r.Run(runnerCtx)
+    })
+}
+```
+
+### 15.3 Worker 注册的完整生命周期
+
+```
+Agent                                      Server (Queue)
+  │                                            │
+  │  1. Next(filter) ────────────────────────▶│  scheduler.Poll()
+  │   (阻塞)                                   │
+  │                                            │  workers.add(worker{filter, channel})
+  │                                            │
+  │  ◀──── 2. 任务分配 (Task) ────────────────│  匹配成功，worker.channel <- task
+  │                                            │  workers.delete(worker)
+  │                                            │
+  │  3. [执行工作流... 可能几分钟到几小时]      │
+  │                                            │
+  │  4. Done(workflowID) ────────────────────▶│  scheduler.Done()
+  │                                            │  running.delete(taskID)
+  │                                            │
+  │  5. Next(filter) ────────────────────────▶│  重新注册 worker
+  │      (再次阻塞等待)                         │
+```
+
+**队列层实现** (`server/queue/fifo.go:87-111`)：
+```go
+func (q *fifo) Poll(ctx context.Context, f FilterFn) (*model.Task, error) {
+    worker := &worker{
+        channel:  make(chan *model.Task, 1),  // 缓冲 1，非阻塞发送
+        filter:   f,
+        agentID:  agentID,
+        done:     make(chan struct{}),
+    }
+
+    q.Lock()
+    q.workers[worker] = true  // 注册到 workers 集合
+    q.Unlock()
+
+    select {
+    case task := <-worker.channel:
+        return task, nil    // 收到任务，返回
+    case <-ctx.Done():
+        q.Lock()
+        delete(q.workers, worker)  // context 取消，移除 worker
+        q.Unlock()
+        return nil, ctx.Err()
+    }
+}
+```
+
+### 15.4 标签匹配的详细流程
+
+`createFilterFunc` 返回的 filter 函数是调度的核心，执行以下 **四步检查**：
+
+```
+任务 Task {Labels} + Agent Filter {Labels}
+        │
+        ▼
+  Step 1: 反向标签检查 (requiredLabelsMissing)
+    对 Agent 的每个 "!key=value" 标签:
+      → 检查 Task 是否有 key=value
+      → 缺少任何一个 → 不匹配 ✗
+        │
+        ▼ 通过
+  Step 2: 内部标签过滤
+    从 Task.Labels 中删除 woodpecker.org.cn/ 前缀的标签
+        │
+        ▼ 通过
+  Step 3: 任务标签全匹配
+    对 Task 剩余的每个标签 (key=value):
+      → 在 Agent.Labels 中查找 key
+      → 找不到 → 找 "!key" (反向匹配)
+      → 都找不到 → 不匹配 ✗
+      → 找到后比较 value:
+          = "*" → 匹配，+1 分
+          = taskValue → 匹配，+10 分
+          = 其他 → 不匹配 ✗
+        │
+        ▼ 通过
+  Step 4: 返回 (true, score)
+```
+
+### 15.5 匹配边界场景分析
+
+#### 场景 1：空标签任务 vs 多标签 Agent
+
+```
+Task labels: {} (空)
+Agent labels: {platform: "linux/amd64", gpu: "true"}
+
+匹配结果: ✓ (true, 0 分)
+```
+> **原因**：Step 3 只遍历 **任务的标签**，任务没有标签就不需要匹配任何东西。空标签任务可以分配给任何 Agent。
+
+#### 场景 2：任务有标签但 Agent 没有对应标签
+
+```
+Task labels: {gpu: "true"}
+Agent labels: {platform: "linux/amd64"}
+
+匹配结果: ✗ (false, 0)
+```
+> **原因**：任务要求 `gpu=true`，但 Agent 没有 `gpu` 标签，也没有 `!gpu` 反向标签，所以不匹配。
+
+#### 场景 3：Agent 有额外标签
+
+```
+Task labels: {platform: "linux/amd64"}
+Agent labels: {platform: "linux/amd64", gpu: "true", size: "large"}
+
+匹配结果: ✓ (true, 10 分)
+```
+> **原因**：Agent 的额外标签（`gpu`, `size`）不影响匹配——只有任务的标签需要被满足。Agent 有多余的能力是完全没问题的。
+
+#### 场景 4：通配符 vs 精确匹配的优先级
+
+```
+Task labels: {platform: "linux/amd64", size: "large"}
+
+Agent1 labels: {platform: "linux/amd64", size: "*"}
+  → 10 + 1 = 11 分
+
+Agent2 labels: {platform: "*", size: "large"}
+  → 1 + 10 = 11 分
+
+Agent3 labels: {platform: "linux/amd64", size: "large"}
+  → 10 + 10 = 20 分 ✓ 最高分
+```
+
+> **注意**：Agent1 和 Agent2 分数相同时，谁先被遍历到谁就获得任务（因为 `assignToWorker` 找到第一个最高分就返回）。
+
+### 15.6 Capability 与并发的关系
+
+**Capability 是逻辑并发数**，不等于物理资源限制：
+
+| 层面 | 限制因素 | 说明 |
+|------|---------|------|
+| **调度层** | Capability | 队列最多给 Agent 分配 N 个任务 |
+| **执行层** | Backend 资源 | 实际运行受 CPU/内存/Docker 限制 |
+| **网络层** | gRPC 并发 Stream 数 | HTTP/2 默认 MaxStreams=100 |
+| **日志层** | logs channel 容量 | 每个工作流独立的日志缓冲 |
+
+**常见配置建议**：
+- Docker 后端：capacity ≈ CPU 核心数
+- Kubernetes 后端：capacity 可以很大（由 K8s 调度资源）
+- Local 后端：capacity = 1（避免资源竞争）
+
+### 15.7 NoSchedule 标志
+
+Agent 可以被标记为 `NoSchedule=true`，此时不再分配新任务：
+
+**触发时机**：
+- 管理员通过 UI/API 设置（用于 Agent 下线维护）
+- 系统自动设置（如检测到 Agent 异常）
+
+**行为** (`server/rpc/rpc.go:73-76`)：
+```go
+if agent.NoSchedule {
+    return nil, fmt.Errorf("agent has NoSchedule flag, will not receive tasks")
+}
+```
+
+> 已经分配的任务会继续执行完成，只是不再分配新任务。
+
+---
+
+## 16. 任务执行超时与强制终止协议链路
+
+本章节详解工作流超时的完整链路、强制终止的多种触发方式、以及各层之间的超时优先级。
+
+### 16.1 超时体系的三层结构
+
+Woodpecker 有 **三层独立的超时机制**，各自作用于不同层面：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│  第3层: Workflow.Timeout (业务超时)                            │
+│  单位: 分钟                                                    │
+│  来源: Repo 设置 → 默认值 → 最大值限制                         │
+│  作用: Agent 端 context.WithTimeout，超时后取消执行             │
+│  触发: Done RPC 上报 finished=true, error="context deadline"  │
+└───────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+┌───────────────────────────────────────────────────────────────┐
+│  第2层: TaskTimeout (租约超时)                                 │
+│  单位: 1 分钟 (constant.TaskTimeout)                           │
+│  来源: 硬编码常量                                              │
+│  作用: Server 端队列检测 Agent 是否存活                         │
+│  触发: resubmitExpiredPipelines 重新入队                       │
+└───────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+┌───────────────────────────────────────────────────────────────┐
+│  第1层: Step 超时 (单步超时)                                   │
+│  单位: 秒 (pipeline YAML 配置)                                 │
+│  来源: .woodpecker.yaml 中 step.timeout                        │
+│  作用: 单个 Step 的执行超时                                    │
+│  触发: Step 退出码非 0 + error 消息                            │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 16.2 Workflow.Timeout 的来源与计算
+
+**超时值的三层决策链**（从高到低优先级）：
+
+1. **Repo 级配置** (`repo.Timeout`)
+   - 用户在仓库设置中配置
+   - 单位：分钟
+   - 0 表示使用默认值
+
+2. **全局默认值** (`Config.Pipeline.DefaultTimeout`)
+   - Server 启动参数 `--default-pipeline-timeout`
+   - 单位：分钟
+
+3. **全局最大值限制** (`Config.Pipeline.MaxTimeout`)
+   - Server 启动参数 `--max-pipeline-timeout`
+   - 超过此值的配置会被截断（普通用户）
+   - Admin 用户可以超过
+
+**计算逻辑** (`server/api/repo.go:113-116`)：
+```go
+if repo.Timeout == 0 {
+    repo.Timeout = server.Config.Pipeline.DefaultTimeout
+} else if repo.Timeout > server.Config.Pipeline.MaxTimeout {
+    repo.Timeout = server.Config.Pipeline.MaxTimeout
+}
+```
+
+### 16.3 Workflow 超时的完整协议链路
+
+```
+Agent                                          Server
+  │                                               │
+  │  1. Next() ─────────────────────────────────▶│
+  │                                               │
+  │  ◀──── Workflow {Timeout: 60} ──────────────│  从 DB 读取 repo.Timeout
+  │       (分钟)                                  │
+  │                                               │
+  │  2. Agent 创建 workflowCtx:                   │
+  │     context.WithTimeout(60 * time.Minute)    │
+  │                                               │
+  │  3. Init() ─────────────────────────────────▶│  标记 running
+  │                                               │
+  │  [执行工作流...]                              │
+  │                                               │
+  │  4. 60 分钟后:                                │
+  │     workflowCtx.Done()                        │
+  │     ↳ context.DeadlineExceeded                │
+  │                                               │
+  │  5. pipeline runtime 停止执行                 │
+  │     ↳ 所有 Step 被 cancel                     │
+  │                                               │
+  │  6. Done(workflowID, state) ────────────────▶│
+  │     {                                         │
+  │       Finished: now,                          │
+  │       Error: "context deadline exceeded",     │
+  │       Canceled: false                         │
+  │     }                                         │
+  │                                               │
+  │                                               │  7. DB: workflow → failure
+  │                                               │  8. PubSub 通知
+  │                                               │  9. 更新 forge 状态
+```
+
+**Agent 端超时创建代码** (`agent/runner.go:79-104`)：
+```go
+// Compute workflow timeout
+timeout := time.Hour  // 默认 1 小时
+if minutes := workflow.Timeout; minutes != 0 {
+    timeout = time.Duration(minutes) * time.Minute
+}
+
+// Workflow execution context
+workflowCtx, _ := context.WithTimeout(ctxMeta, timeout)
+workflowCtx, cancelWorkflowCtx := context.WithCancelCause(workflowCtx)
+```
+
+### 16.4 强制终止的四种触发方式
+
+工作流可以被 **四种不同机制** 终止，每种都有不同的协议路径：
+
+| 触发方式 | 发起方 | 协议链路 | 状态表现 |
+|---------|--------|---------|---------|
+| **业务超时** | Agent 本地 | `context.WithTimeout` 到期 → `Done(error=deadline)` | `Error: "context deadline exceeded"`, `Canceled: false` |
+| **UI/API 取消** | Server 端 | `queue.Error(ErrCancel)` → `Wait` 返回 `canceled=true` → Agent 取消执行 → `Done(canceled=true)` | `Canceled: true`, `Error: "canceled"` |
+| **Agent 崩溃** | Server 检测 | 心跳/Extend 停止 → `deadline` 过期 → `resubmitExpiredPipelines` → 重新入队 | 任务重新分配给其他 Agent |
+| **SIGTERM 信号** | Agent 进程 | `utils.WithContextSigtermCallback` → `cancelWorkflowCtx(ErrCancel)` → `Done(canceled=true)` | `Canceled: true`, `Error: "canceled"` |
+
+### 16.5 UI/API 取消的完整协议链路
+
+这是最复杂的终止路径，涉及队列、Wait RPC、Agent 执行三层协作：
+
+```
+用户/API → 点击取消
+    │
+    ▼
+Server API 层
+    │
+    ├── pipeline.CancelWorkflow(workflowID)
+    │     ├── DB: workflow → status = "canceled"
+    │     └── scheduler.Error(workflowID, ErrCancel)
+    │           │
+    │           ▼
+    │     queue.Error()
+    │         ├── entry.error = ErrCancel
+    │         └── close(entry.done)  ← 关键操作
+    │
+    ▼
+Wait RPC 阻塞在 entry.done 上的所有 goroutine 被释放
+    │
+    ├── Agent1 Wait() 收到 done
+    │     └── err = ErrCancel → canceled=true
+    │
+    └── Agent2 Wait() 收到 done
+          └── (如果是同一个 workflow 的并行 step)
+    │
+    ▼
+Agent 端 Wait 协程返回
+    │
+    ├── cancelWorkflowCtx(pipeline_errors.ErrCancel)
+    │     ↓
+    ├── workflowCtx.Done()
+    │     ↓
+    ├── pipeline runtime 停止所有 Step
+    │     ├── 运行中的 Step 收到 Kill 信号
+    │     └── 未开始的 Step 标记为 Skipped
+    │
+    └── Done(workflowID, state)
+          ├── Canceled: true
+          ├── Error: "canceled"
+          └── Finished: now
+    │
+    ▼
+Server 端 Done()
+    ├── scheduler.Done()  ← 幂等，entry 已删除
+    ├── DB: workflow → killed
+    ├── 更新 forge 状态
+    └── PubSub 通知
+```
+
+**队列层取消实现** (`server/queue/fifo.go:133-160`)：
+```go
+func (q *fifo) Error(taskID string, err error) error {
+    q.Lock()
+    defer q.Unlock()
+
+    taskState, ok := q.running[taskID]
+    if !ok {
+        // 任务不在 running，可能在 pending
+        // 从 pending 中移除
+        for e := q.pending.Front(); e != nil; e = e.Next() {
+            if t, _ := e.Value.(*model.Task); t.ID == taskID {
+                q.pending.Remove(e)
+                return nil
+            }
+        }
+        return nil
+    }
+
+    taskState.error = err
+    close(taskState.done)  // 释放所有 Wait 阻塞
+    return nil
+}
+```
+
+### 16.6 Agent 崩溃后的任务恢复
+
+当 Agent 崩溃或网络断开时，任务不会丢失，会被重新调度：
+
+```
+Agent 崩溃 → Extend/心跳停止
+    │
+    ▼
+Server 队列 process() 循环中:
+  resubmitExpiredPipelines()
+    │
+    ├── 遍历 running map
+    ├── if now.After(taskState.deadline)
+    │     ├── taskState.error = ErrTaskExpired
+    │     ├── pending.PushFront(task)  ← 重新入队（队首）
+    │     ├── delete(running, taskID)
+    │     └── close(taskState.done)     ← 释放 Wait
+    │
+    ▼
+下一轮 assignToWorker()
+  → 任务分配给另一个健康的 Agent
+```
+
+**注意**：
+- 重新入队的任务放在 **队首**（`PushFront`），优先重新执行
+- 任务会从头开始执行，不会从断点恢复
+- 崩溃前的日志和状态仍然保留在 DB 中（如果已上报）
+
+### 16.7 多级超时的优先级
+
+当多种超时同时存在时，**先到期的先生效**：
+
+| 场景 | 先到期 | 结果 |
+|------|--------|------|
+| Workflow.Timeout = 30min, TaskTimeout = 1min | TaskTimeout (1min) 如果 Agent 不续期 | 任务被重新入队，不会被标记为超时失败 |
+| Workflow.Timeout = 30min, Step 超时 = 10min | Step 超时 (10min) | 该 Step 失败，Workflow 继续或失败取决于配置 |
+| UI 取消 + Workflow 超时 | 谁先发生谁生效 | 取消的状态是 `killed`，超时是 `failure` |
+
+### 16.8 超时相关的关键常量
+
+| 常量 | 值 | 位置 | 作用 |
+|------|----|------|------|
+| `TaskTimeout` | 1 分钟 | `shared/constant/constant.go:41` | 队列租约超时 |
+| `shutdownTimeout` | 5 秒 | `agent/runner.go:36` | Done 上报的兜底超时 |
+| 默认 Workflow Timeout | 可配置 | server flag `--default-pipeline-timeout` | 工作流默认超时 |
+| 最大 Workflow Timeout | 可配置 | server flag `--max-pipeline-timeout` | 普通用户上限 |
+
+---
+
+## 17. Agent 监控与统计指标体系
+
+本章节详解 Agent 端本地监控接口、Server 端 Prometheus 指标收集、以及两者之间的数据流向。
+
+### 17.1 监控体系总览
+
+Woodpecker 的监控分为 **Agent 侧本地监控** 和 **Server 侧全局监控** 两层，Agent 指标不会主动上报到 Server。
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   Agent (每个)      │          │   Server            │
+│                     │          │                     │
+│  /healthz ────────────  HTTP   │  /metrics           │
+│  /varz    ────────────  本地    │  (Prometheus)       │
+│  /version ────────────  抓取    │    ├── 队列指标      │
+│                     │          │    ├── 存储指标      │
+│  State (内存)       │          │    └── 流水线指标    │
+└─────────────────────┘          └─────────────────────┘
+          ▲                                  ▲
+          │                                  │
+          │ Prometheus / VictoriaMetrics      │ Prometheus
+          │ (外部监控系统主动拉取)              │ (外部监控系统主动拉取)
+```
+
+### 17.2 Agent 端本地监控接口
+
+Agent 内置了轻量级 HTTP 监控服务器，遵循 Dockerflow 规范。
+
+**启用条件**：`WOODPECKER_HEALTHCHECK=true`（默认开启）
+
+**监听地址**：`WOODPECKER_HEALTHCHECK_ADDR`（默认 `:3000`）
+
+#### 17.2.1 /healthz — 健康检查
+
+**返回状态码**：
+- `200 OK`：Agent 健康
+- `500 Internal Server Error`：Agent 不健康
+
+**健康判断逻辑** (`agent/state.go:62-73`)：
+```go
+func (s *State) Healthy() bool {
+    s.Lock()
+    defer s.Unlock()
+    now := time.Now()
+    buf := time.Hour // 1小时缓冲
+    for _, item := range s.Metadata {
+        if now.After(item.Started.Add(item.Timeout).Add(buf)) {
+            return false  // 有工作流超时 + 1小时还没结束
+        }
+    }
+    return true
+}
+```
+
+> **判断标准**：任何运行中的工作流，如果 `开始时间 + 配置超时 + 1小时缓冲` < 当前时间，则认为 Agent 不健康。这是一个很宽松的标准，主要用于检测 Agent 卡死。
+
+#### 17.2.2 /varz — 运行状态详情
+
+返回 JSON 格式的详细运行状态：
+
+```json
+{
+  "polling_count": 2,      // 正在轮询（等待任务）的 Runner 数
+  "running_count": 1,      // 正在执行的工作流数
+  "running": {
+    "wf-12345": {
+      "id": "wf-12345",
+      "repository": "org/repo",
+      "pipeline_number": "42",
+      "pipeline_started": "2024-01-15T10:30:00Z",
+      "pipeline_timeout": 3600000000000  // 纳秒
+    }
+  }
+}
+```
+
+**State 数据结构** (`agent/state.go:25-38`)：
+```go
+type State struct {
+    sync.Mutex
+    Polling    int             // 轮询中的 Runner 数
+    Running    int             // 运行中的工作流数
+    Metadata   map[string]Info // 每个运行中工作流的详情
+}
+```
+
+#### 17.2.3 /version — 版本信息
+
+```json
+{
+  "version": "v2.5.0",
+  "source": "https://github.com/woodpecker-ci/woodpecker"
+}
+```
+
+### 17.3 State 计数器的生命周期
+
+State 计数器在工作流的不同阶段更新：
+
+```
+Runner 启动
+    │
+    ├── 初始: Polling = capacity, Running = 0
+    │
+    ├── Next() 阻塞等待 → Polling 不变
+    │
+    ├── 收到任务 → r.counter.Add()
+    │     ├── Polling--
+    │     ├── Running++
+    │     └── Metadata[id] = Info{...}
+    │
+    ├── [执行工作流...]
+    │
+    └── 工作流结束 → r.counter.Done()
+          ├── Polling++
+          ├── Running--
+          └── delete(Metadata, id)
+```
+
+**关键代码**：
+- Add: `agent/state.go:40-52`
+- Done: `agent/state.go:54-60`
+- 初始化: `cmd/agent/core/health.go:79-81`
+
+### 17.4 Server 端 Prometheus 指标
+
+Server 提供标准 Prometheus 指标端点，地址为 `/metrics`（需配置 `--metrics-server-addr` 独立端口）。
+
+**指标分类**：
+
+| 类别 | 指标名 | 类型 | 标签 | 说明 |
+|------|--------|------|------|------|
+| **队列指标** | `woodpecker_pending_steps` | Gauge | - | 等待执行的任务数 |
+| | `woodpecker_waiting_steps` | Gauge | - | 等待依赖的任务数 |
+| | `woodpecker_running_steps` | Gauge | - | 正在运行的任务数 |
+| | `woodpecker_worker_count` | Gauge | - | 在线 Worker 数 |
+| **流水线指标** | `woodpecker_pipeline_time` | GaugeVec | repo, branch, status, pipeline | 流水线执行时间 |
+| | `woodpecker_pipeline_count` | CounterVec | repo, branch, status, pipeline | 流水线完成计数 |
+| **存储指标** | `woodpecker_pipeline_total_count` | Gauge | - | 流水线总数 |
+| | `woodpecker_user_count` | Gauge | - | 用户总数 |
+| | `woodpecker_repo_count` | Gauge | - | 仓库总数 |
+
+### 17.5 队列指标收集器
+
+队列指标通过独立的 goroutine 定期采集：
+
+**采集周期**：`queueInfoRefreshInterval`（代码中未显式定义，默认值需查证）
+
+**采集逻辑** (`cmd/server/metrics_server.go:67-84`)：
+```go
+go func() {
+    for {
+        stats := server.Config.Services.Scheduler.Info(ctx)
+        pendingSteps.Set(float64(stats.Stats.Pending))
+        waitingSteps.Set(float64(stats.Stats.WaitingOnDeps))
+        runningSteps.Set(float64(stats.Stats.Running))
+        workers.Set(float64(stats.Stats.Workers))
+
+        select {
+        case <-ctx.Done():
+            return
+        case <-time.After(queueInfoRefreshInterval):
+        }
+    }
+}()
+```
+
+**队列 Info 结构** (`server/queue/fifo.go:202-226`)：
+```go
+type InfoT struct {
+    Stats         struct {
+        Workers      int  // 在线 Worker 数
+        Pending      int  // 等待执行的任务数
+        WaitingOnDeps int // 等待依赖的任务数
+        Running      int  // 正在运行的任务数
+    }
+    Pending      []*model.Task  // 等待中的任务列表
+    WaitingOnDeps []*model.Task
+    Running      []*model.Task
+    Paused       bool
+}
+```
+
+### 17.6 流水线指标埋点
+
+流水线完成时（Done RPC 中），会更新时序指标：
+
+**指标定义** (`server/rpc/server.go:49-58`)：
+```go
+pipelineTime := factory.NewGaugeVec(prometheus.GaugeOpts{
+    Namespace: "woodpecker",
+    Name:      "pipeline_time",
+    Help:      "Pipeline time.",
+}, []string{"repo", "branch", "status", "pipeline"})
+
+pipelineCount := factory.NewCounterVec(prometheus.CounterOpts{
+    Namespace: "woodpecker",
+    Name:      "pipeline_count",
+    Help:      "Pipeline count.",
+}, []string{"repo", "branch", "status", "pipeline"})
+```
+
+**更新时机**：`Done()` RPC 处理完成后，工作流状态落库时更新。
+
+### 17.7 存储指标收集器
+
+存储指标定期从 DB 中统计：
+
+**采集周期**：`storeInfoRefreshInterval`
+
+**采集指标** (`cmd/server/metrics_server.go:85-107`)：
+- 仓库总数 (`repo_count`)
+- 用户总数 (`user_count`)
+- 流水线总数 (`pipeline_total_count`)
+
+### 17.8 监控部署最佳实践
+
+#### Agent 监控
+
+- **每个 Agent 单独抓取**：Prometheus 配置 `static_configs` 指向每个 Agent 的 `:3000`
+- **或使用服务发现**：在 K8s 环境中通过 service discovery 自动发现 Agent Pod
+- **告警规则**：`healthz != 200` 持续 5 分钟 → 告警
+
+#### Server 监控
+
+- **独立 metrics 端口**：使用 `--metrics-server-addr` 单独暴露，不与业务端口混用
+- **认证保护**：配置 `--prometheus-auth-token` 防止未授权访问
+- **关键告警**：
+  - `woodpecker_pending_steps` 持续增长 → Agent 不足
+  - `woodpecker_worker_count` 突降 → 大量 Agent 掉线
+  - `woodpecker_running_steps` 长时间无变化 → 队列卡死
+
+### 17.9 监控数据流向总结
+
+| 数据流 | 方向 | 协议 | 频率 |
+|-------|------|------|------|
+| Agent 状态 → Agent HTTP | 本地 | HTTP | 按需（请求时计算） |
+| 队列状态 → Prometheus 指标 | Server 内部 | 内存读取 | 定期刷新 |
+| DB 统计 → Prometheus 指标 | Server 内部 | SQL 查询 | 定期刷新 |
+| 流水线完成 → 指标更新 | 事件驱动 | 内存写入 | 每次 Done RPC |
+| Agent → Server 指标上报 | ❌ 不存在 | - | - |
+
+> **重要**：Agent 端的运行状态 **不会主动上报** 到 Server。Server 只能通过 `LastContact` 间接推断 Agent 是否存活，无法知道 Agent 当前跑了多少个工作流、负载如何。如果需要集中监控所有 Agent 的状态，需要外部 Prometheus 分别抓取每个 Agent 的 `/varz` 端点。
+
+
 
