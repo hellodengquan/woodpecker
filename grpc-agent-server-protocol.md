@@ -979,3 +979,801 @@ gRPC 接收
 | Server → Web | 状态流 | `pubsub/memory/pub.go:58` go (*s)(message) | `server/api/stream.go:56-128` EventStreamSSE | SSE over HTTP/1.1 or HTTP/2 |
 | Server → Web | 日志流 | `logging/log.go:99-105` sub.receiver <- entries | `server/api/stream.go:140-281` LogStreamSSE | SSE over HTTP/1.1 or HTTP/2 |
 
+---
+
+## 12. gRPC TLS 认证与 mTLS 链路
+
+本章节详解 gRPC 连接的 TLS 加密机制、证书配置、以及当前是否支持 mTLS（双向 TLS）。
+
+### 12.1 TLS 连接分层架构
+
+Woodpecker 的 TLS 配置分为 **两层独立的 TLS 端点**，各自服务不同的流量：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                            Agent                                  │
+│                                                                   │
+│  ┌─ AuthConn (TLS) ─┐   ┌─ MainConn (TLS) ─┐                      │
+│  │  port: 9000      │   │  port: 9000       │                      │
+│  │  仅认证 RPC      │   │  所有业务 RPC      │                      │
+│  └────────┬─────────┘   └────────┬──────────┘                      │
+│           │                       │                                 │
+│           └───────────┬───────────┘                                 │
+│                       │                                             │
+│          TLS over HTTP/2 (同一 TCP 连接，端口复用)                  │
+└───────────────────────┼─────────────────────────────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────────────────────────┐
+│                          Server (gRPC)                             │
+│  port: 9000                                                         │
+│  ┌──────────────────────────────────────────────────┐              │
+│  │  gRPC Server (是否启用 TLS 取决于 Agent 配置)     │              │
+│  │  - 无内置 TLS：依赖反向代理/负载均衡终止 TLS      │              │
+│  └──────────────────────────────────────────────────┘              │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 Agent 端 TLS 配置
+
+Agent 端的 TLS 行为完全由启动参数控制。
+
+**核心配置参数** (`cmd/agent/core/flags.go:44-54`)：
+
+| 参数 | 环境变量 | 默认值 | 作用 |
+|-----|----------|--------|------|
+| `--grpc-secure` | `WOODPECKER_GRPC_SECURE` | `false` | 是否使用 TLS 加密连接 |
+| `--grpc-skip-insecure` | `WOODPECKER_GRPC_VERIFY` | `true` | 是否验证 Server 证书 |
+
+> ⚠️ **命名注意**：Flag 名 `grpc-skip-insecure` 与环境变量 `WOODPECKER_GRPC_VERIFY` 语义相反——Flag 设为 `true` 表示"跳过不安全"（即验证证书），而环境变量设为 `true` 也表示"验证"。
+
+**TLS 连接建立代码** (`agent/rpc/dial.go:69-76`)：
+```go
+var transport grpc.DialOption
+if cfg.Secure {
+    transport = grpc.WithTransportCredentials(grpc_credentials.NewTLS(
+        &tls.Config{InsecureSkipVerify: cfg.SkipTLSVerify},
+    ))
+} else {
+    transport = grpc.WithTransportCredentials(insecure.NewCredentials())
+}
+```
+
+### 12.3 Server 端 TLS 配置
+
+**重要发现**：**gRPC Server 本身不支持 TLS 终止**，必须依赖反向代理（如 Nginx、Traefik）做 TLS 终止。
+
+**证据**：`cmd/server/grpc_server.go:30-45` 中 `runGrpcServer` 直接使用 `net.Listen("tcp", ...)` 创建普通 TCP listener，没有任何 TLS 包装：
+```go
+lis, err := net.Listen("tcp", c.String("grpc-addr"))
+// ...
+return server_rpc.Serve(ctx, server_rpc.ServeConfig{
+    Listener:         lis,  // 普通 TCP listener，无 TLS
+    // ...
+})
+```
+
+对比 **HTTP Server** 的 TLS 配置（`cmd/server/server.go:180-211`）：
+```go
+// HTTP Server 有完整的 TLS 支持
+tlsServer := &http.Server{
+    Addr:    server.Config.Server.PortTLS,
+    Handler: handler,
+    TLSConfig: &tls.Config{
+        NextProtos: []string{"h2", "http/1.1"},
+    },
+}
+err := tlsServer.ListenAndServeTLS(
+    c.String("server-cert"),  // 证书路径
+    c.String("server-key"),   // 私钥路径
+)
+```
+
+### 12.4 TLS 部署拓扑
+
+由于 gRPC Server 本身不终止 TLS，实际生产部署必须采用以下架构：
+
+```
+Agent (TLS client)
+      │
+      │ TLS over HTTP/2
+      ▼
+反向代理 / 负载均衡 (TLS 终止)
+  ├── 证书: server-cert + server-key
+  ├── 协议: HTTP/2 (必需，gRPC 依赖 HTTP/2)
+  └── 端口: 9000 (或其他)
+      │
+      │ 明文 HTTP/2 到后端
+      ▼
+Woodpecker gRPC Server (:9000)
+  ├── 无 TLS
+  └── 依赖反向代理提供加密
+```
+
+**关键要求**：反向代理必须支持 **HTTP/2 直通**（HTTP/2 Passthrough），因为 gRPC 协议底层依赖 HTTP/2 的多路复用、流控等特性，不能降级到 HTTP/1.1。
+
+### 12.5 mTLS（双向 TLS）支持现状
+
+**结论**：**当前代码不支持 mTLS**，即 Server 端不会请求也不会验证 Agent 的客户端证书。
+
+**证据链**：
+1. `server/rpc/serve.go` 中创建 gRPC Server 时，没有配置 `grpc.Creds()` 选项（仅有 `KeepaliveEnforcementPolicy`）
+2. `agent/rpc/dial.go` 中创建 TLS Config 时，没有设置 `Certificates` 字段（仅可能设置 `InsecureSkipVerify`）
+3. `cmd/server/grpc_server.go` 中没有任何 mTLS 相关的 flag（如 `--grpc-client-ca`、`--grpc-require-client-cert`）
+4. 所有认证逻辑通过 **JWT token** 实现，而非客户端证书
+
+**Agent 端 TLS Config 内容** (`agent/rpc/dial.go:71-72`)：
+```go
+&tls.Config{
+    InsecureSkipVerify: cfg.SkipTLSVerify,  // 仅此一项
+    // 缺失: Certificates []tls.Certificate
+    // 缺失: RootCAs *x509.CertPool
+    // 缺失: ServerName string
+}
+```
+
+### 12.6 证书错误处理
+
+虽然不支持 mTLS，但 Agent 端有完整的证书验证错误处理链。
+
+**错误识别** (`shared/httputil/http_error.go:111-126`)：
+```go
+var certErr *x509.CertificateInvalidError
+if errors.As(err, &certErr) {
+    return fmt.Errorf("TLS certificate invalid: ...")
+}
+var unknownAuthErr *x509.UnknownAuthorityError
+if errors.As(err, &unknownAuthErr) {
+    return fmt.Errorf("TLS certificate verification failed: ...")
+}
+var hostErr *x509.HostnameError
+if errors.As(err, &hostErr) {
+    return fmt.Errorf("TLS hostname mismatch: ...")
+}
+```
+
+### 12.7 TLS 安全配置建议
+
+| 场景 | 推荐配置 | 说明 |
+|------|---------|------|
+| **生产环境** | `WOODPECKER_GRPC_SECURE=true`, `WOODPECKER_GRPC_VERIFY=true` | 强制 TLS + 证书验证 |
+| **开发环境** | `WOODPECKER_GRPC_SECURE=false` | 明文连接，方便调试 |
+| **自签名证书** | `WOODPECKER_GRPC_SECURE=true`, `WOODPECKER_GRPC_VERIFY=false` | 跳过证书验证（不推荐） |
+| **mTLS 需求** | 需在反向代理层实现 | Woodpecker 本身不支持，由 Nginx/Traefik 处理客户端证书验证 |
+
+---
+
+## 13. Agent 注册与心跳协议字段详解
+
+本章节详细拆解 `RegisterAgent` 和 `ReportHealth` 两个 RPC 的所有协议字段、数据结构、以及字段在业务逻辑中的具体作用。
+
+### 13.1 协议定义回顾
+
+**proto 定义** (`rpc/proto/woodpecker.proto:118-149`)：
+```protobuf
+message ReportHealthRequest {
+  string status = 1;
+}
+
+message AgentInfo {
+  string platform = 1;
+  int32  capacity = 2;
+  string backend  = 3;
+  string version  = 4;
+  map<string, string> customLabels = 5;
+}
+
+message RegisterAgentRequest {
+  AgentInfo info = 1;
+}
+
+message RegisterAgentResponse {
+  int64 agent_id = 1;
+}
+```
+
+**内部 Go 类型** (`rpc/types.go:59-66`)：
+```go
+type AgentInfo struct {
+    Version      string            `json:"version"`
+    Platform     string            `json:"platform"`
+    Backend      string            `json:"backend"`
+    Capacity     int               `json:"capacity"`
+    CustomLabels map[string]string `json:"custom_labels"`
+}
+```
+
+### 13.2 Agent 数据模型（Server 端存储）
+
+Server 端存储的 Agent 模型 (`server/model/agent.go:26-43`) 比 proto 定义更丰富：
+
+| 字段 | 类型 | 来源 | 说明 |
+|------|------|------|------|
+| `ID` | `int64` | DB autoincr | 主键，Agent 唯一标识 |
+| `Created` | `int64` | xorm created | 创建时间戳 |
+| `Updated` | `int64` | xorm updated | 更新时间戳 |
+| `Name` | `string` | Hostname 或生成 | Agent 名称，默认 `WOODPECKER_HOSTNAME` |
+| `OwnerID` | `int64` | Auth 时设置 | 所有者 ID，系统 agent 为 -1 |
+| `Token` | `string` | Auth 时设置 | Agent token，系统 agent 用 master token |
+| `LastContact` | `int64` | ReportHealth 更新 | 最后心跳时间戳 |
+| `LastWork` | `int64` | Init/Done 更新 | 最后一次工作时间（自动扩缩容用） |
+| `Platform` | `string` | RegisterAgent.info.platform | 操作系统平台（linux/amd64 等） |
+| `Backend` | `string` | RegisterAgent.info.backend | 执行后端（docker/kubernetes/local 等） |
+| `Capacity` | `int32` | RegisterAgent.info.capacity | 并行工作流数量 |
+| `Version` | `string` | RegisterAgent.info.version | Agent 版本号 |
+| `NoSchedule` | `bool` | 默认 false | 是否禁止调度新任务 |
+| `CustomLabels` | `map[string]string` | RegisterAgent.info.customLabels | 用户自定义标签 |
+| `OrgID` | `int64` | Auth 时设置 | 组织 ID，系统 agent 为 -1 |
+
+### 13.3 RegisterAgent 字段详细说明
+
+#### 13.3.1 platform — 平台标识
+
+**来源**：`pipeline/backend` 自动检测
+**典型值**：
+- `linux/amd64`
+- `linux/arm64`
+- `darwin/arm64`
+- `windows/amd64`
+
+**作用**：
+1. 作为 **隐式标签** 参与任务匹配（`server/rpc/rpc.go:79-88`）
+2. 实际存储在 `CustomLabels["platform"]` 中
+
+**代码证据** (`server/rpc/rpc.go:82-86`)：
+```go
+if info.Platform != "" {
+    labels["platform"] = info.Platform
+}
+```
+
+#### 13.3.2 capacity — 并行容量
+
+**来源**：`WOODPECKER_MAX_WORKFLOWS` flag，默认 1
+**作用**：
+1. 决定 Agent 启动多少个 Runner 协程 (`cmd/agent/core/agent.go:174-181`)
+2. 每个 Runner 发起一个 `Next()` 长轮询
+3. 所以 capacity = 同时可执行的工作流数
+
+**多 Runner 启动代码** (`cmd/agent/core/agent.go:174-181`)：
+```go
+for i := 0; i < capacity; i++ {
+    serviceWaitingGroup.Go(func() error {
+        return r.Run(runnerCtx)
+    })
+}
+```
+
+#### 13.3.3 backend — 执行后端
+
+**来源**：`WOODPECKER_BACKEND` flag，默认 `auto-detect`
+**典型值**：`docker`, `kubernetes`, `local`, `ssh`
+**作用**：
+1. 作为隐式标签 `CustomLabels["backend"]` 参与任务匹配
+2. UI 展示 Agent 能力
+
+#### 13.3.4 version — Agent 版本
+
+**来源**：编译时注入的 version 变量
+**作用**：
+1. 与 Server 版本比较，确保兼容
+2. 存储用于排障
+
+#### 13.3.5 customLabels — 自定义标签
+
+**来源**：`WOODPECKER_AGENT_LABELS` flag，支持多值
+**格式**：`key=value` 或 `key=*`（通配符）或 `!key=value`（反向匹配）
+**作用**：任务调度的核心匹配依据
+
+**特殊标签前缀** (`server/rpc/filter.go:37-40`)：
+```go
+// ignore internal labels for filtering
+for k := range labels {
+    if strings.HasPrefix(k, pipeline.InternalLabelPrefix) {
+        delete(labels, k)
+    }
+}
+```
+> `pipeline.InternalLabelPrefix = "woodpecker.org.cn/"` 开头的标签是系统内部标签，不参与匹配。
+
+### 13.4 RegisterAgent 业务逻辑流程
+
+```
+Agent                                          Server
+  │                                               │
+  │  RegisterAgent(AgentInfo) ───────────────────▶│
+  │   {platform, capacity, backend,               │
+  │    version, customLabels}                     │
+  │                                               │
+  │                                               │  1. getAgentFromContext() 解析 agentID
+  │                                               │  2. store.AgentFind(agentID) 加载
+  │                                               │  3. 用 AgentInfo 更新字段:
+  │                                               │     - Platform
+  │                                               │     - Backend
+  │                                               │     - Capacity
+  │                                               │     - Version
+  │                                               │     - CustomLabels (合并 platform/backend)
+  │                                               │  4. 计算服务端强制标签:
+  │                                               │     - OrgID 标签 (如 org=123 或 org=*)
+  │                                               │  5. store.AgentUpdate() 保存
+  │                                               │
+  │  ◀────────── RegisterAgentResponse ────────────│
+  │     {agent_id}                                │
+```
+
+**关键代码** (`server/rpc/rpc.go:477-501`)：
+```go
+agent, err := s.getAgentFromContext(ctx)
+// ...
+agent.Platform = info.Platform
+agent.Backend = info.Backend
+agent.Capacity = int32(info.Capacity)
+agent.Version = info.Version
+agent.CustomLabels = info.CustomLabels
+if agent.CustomLabels == nil {
+    agent.CustomLabels = map[string]string{}
+}
+// 注入隐式标签
+if info.Platform != "" {
+    agent.CustomLabels["platform"] = info.Platform
+}
+if info.Backend != "" {
+    agent.CustomLabels["backend"] = info.Backend
+}
+// 注入服务端强制标签
+serverLabels, _ := agent.GetServerLabels()
+for k, v := range serverLabels {
+    agent.CustomLabels[k] = v
+}
+s.store.AgentUpdate(agent)
+```
+
+### 13.5 ReportHealth 心跳字段详解
+
+#### 13.5.1 status 字段
+
+**proto 定义**：`string status = 1`
+**实际发送值** (`cmd/agent/core/agent.go:263`)：
+```go
+if err := r.grpcClient.ReportHealth(ctx, &rpc.ReportHealthRequest{
+    Status: "I am alive!",  // 硬编码常量
+}); err != nil {
+```
+
+> 💡 **注意**：`status` 字段目前是固定值 `"I am alive!"`，没有实际语义。设计上预留为未来扩展（如 Agent 负载、资源使用率等），但当前未使用。
+
+#### 13.5.2 心跳间隔
+
+**默认值**：10 秒（`cmd/agent/core/agent.go:30`）
+```go
+reportHealthInterval = 10 * time.Second
+```
+
+**代码** (`cmd/agent/core/agent.go:245-264`)：
+```go
+serviceWaitingGroup.Go(func() error {
+    ticker := time.NewTicker(reportHealthInterval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        case <-ticker.C:
+            if err := r.grpcClient.ReportHealth(ctx, &rpc.ReportHealthRequest{
+                Status: "I am alive!",
+            }); err != nil {
+                log.Error().Err(err).Msg("could not send healthcheck")
+            }
+        }
+    }
+})
+```
+
+### 13.6 ReportHealth 业务逻辑
+
+```
+Agent (每 10s)                                Server
+  │                                               │
+  │  ReportHealth("I am alive!") ────────────────▶│
+  │                                               │
+  │                                               │  1. getAgentFromContext()
+  │                                               │  2. store.AgentFind(agentID)
+  │                                               │  3. agent.LastContact = time.Now().Unix()
+  │                                               │  4. store.AgentUpdate()
+  │                                               │
+  │  ◀──────────── Empty ─────────────────────────│
+```
+
+**关键代码** (`server/rpc/rpc.go:520-534`)：
+```go
+agent, err := s.getAgentFromContext(ctx)
+// ...
+agent.LastContact = time.Now().Unix()
+return s.store.AgentUpdate(agent)
+```
+
+### 13.7 心跳超时检测机制
+
+Server 端并**没有主动检测**心跳超时的逻辑。心跳超时是**被动检测**的：
+
+1. `LastContact` 字段仅作为信息展示（UI 上 Agent 状态）
+2. 实际超时检测发生在 **队列调度循环** 中（`server/queue/fifo.go:338-348`）
+3. `resubmitExpiredPipelines()` 通过 `taskState.deadline` 判断 agent 是否死亡
+
+```go
+func (q *fifo) resubmitExpiredPipelines() {
+    for taskID, taskState := range q.running {
+        if time.Now().After(taskState.deadline) {
+            // 重新入队，任务会分配给其他可用 Agent
+            q.pending.PushFront(taskState.item)
+            delete(q.running, taskID)
+            close(taskState.done)
+        }
+    }
+}
+```
+
+### 13.8 心跳与续期的区别
+
+| 机制 | ReportHealth 心跳 | Extend 续期 |
+|------|------------------|------------|
+| **粒度** | Agent 级别 | Workflow 级别 |
+| **间隔** | 固定 10s | TaskTimeout/3（动态） |
+| **更新字段** | `LastContact` | `deadline` |
+| **作用** | UI 展示 + 信息收集 | 防止任务被重新调度 |
+| **失败影响** | 仅打日志，不影响运行 | 超过 TaskTimeout 后任务被重新入队 |
+| **代码位置** | `cmd/agent/core/agent.go:245-264` | `agent/runner.go:134-148` |
+
+### 13.9 UnregisterAgent 协议
+
+**proto 定义**：无请求字段，无响应字段
+**调用时机**：Agent 优雅退出时（仅对系统 agent 有效）
+
+**业务逻辑** (`server/rpc/rpc.go:504-518`)：
+1. 校验 agent 是 **系统 agent**（`IsSystemAgent()` = true）
+2. 非系统 agent 直接返回，不删除（因为它们可能通过 UI/API 创建）
+3. `store.AgentDelete(agentID)` 从 DB 删除记录
+
+---
+
+## 14. 多 Agent 任务分配调度算法
+
+本章节详解当有多个 Agent 在线时，Server 如何决定将任务分配给哪个 Agent。
+
+### 14.1 调度整体架构
+
+调度发生在队列的 `process()` 循环中，每 100ms 执行一次：
+
+```
+每 100ms process() 循环
+    │
+    ├── 1. resubmitExpiredPipelines()  ← 超时任务重新入队
+    ├── 2. filterWaiting()              ← 依赖检查，ready 的入 pending
+    └── 3. assignToWorker() 循环        ← 核心调度算法
+             │
+             └── 对每个 pending task:
+                  └── 遍历所有在线 worker:
+                       ├── filter(task) → (matched, score)
+                       └── 选择 score 最高的 worker
+```
+
+### 14.2 任务入队时的标签注入
+
+任务在进入队列前会被注入多个层级的标签，这些标签是调度匹配的基础：
+
+```
+Task Labels (最终用于匹配)
+    │
+    ├── 1. Pipeline YAML 中定义的 labels
+    │       (如: size=large, gpu=true)
+    │
+    ├── 2. Repo 信息标签 (ApplyLabelsFromRepo)
+    │       ├── woodpecker.org.cn/repo = org/repo
+    │       └── woodpecker.org.cn/org  = 123
+    │
+    └── 3. 系统内部标签 (InternalLabelPrefix)
+            ├── woodpecker.org.cn/...
+            └── (调度前会被 filter 过滤掉)
+```
+
+**标签注入代码** (`server/model/task.go:48-58`)：
+```go
+func (t *Task) ApplyLabelsFromRepo(r *Repo) error {
+    if t.Labels == nil {
+        t.Labels = make(map[string]string)
+    }
+    t.Labels[pipeline.LabelFilterRepo] = r.FullName
+    t.Labels[pipeline.LabelFilterOrg] = fmt.Sprintf("%d", r.OrgID)
+    return nil
+}
+```
+
+### 14.3 Worker 注册与 Filter 构建
+
+每个 Agent 的每个 capacity 会注册一个 worker，每个 worker 携带一个 `Filter`：
+
+```
+Agent capacity = 3
+    │
+    ├── Runner 1 → Next(filter) → worker {filter, channel}
+    ├── Runner 2 → Next(filter) → worker {filter, channel}
+    └── Runner 3 → Next(filter) → worker {filter, channel}
+```
+
+**Filter 构建流程** (`server/rpc/rpc.go:71-88`)：
+```go
+labels := map[string]string{}
+// 1. 从 Agent.CustomLabels 复制
+for k, v := range agent.CustomLabels {
+    labels[k] = v
+}
+// 2. 服务端强制标签
+serverLabels, _ := agent.GetServerLabels()
+for k, v := range serverLabels {
+    labels[k] = v
+}
+// 3. NoSchedule 标志
+if agent.NoSchedule {
+    return nil, fmt.Errorf("agent has NoSchedule flag, will not receive tasks")
+}
+return &rpc.Filter{Labels: labels}, nil
+```
+
+**服务端强制标签** (`server/model/agent.go:63-74`)：
+```go
+func (a *Agent) GetServerLabels() (map[string]string, error) {
+    filters := make(map[string]string)
+    if a.OrgID != IDNotSet {
+        filters[pipeline.LabelFilterOrg] = fmt.Sprintf("%d", a.OrgID)
+    } else {
+        filters[pipeline.LabelFilterOrg] = "*"
+    }
+    return filters, nil
+}
+```
+> 系统 Agent 的 `OrgID = -1`，所以 `org = "*"`（通配符），可以匹配任何组织的任务。
+
+### 14.4 核心调度算法：filter + 打分
+
+调度的核心在 `createFilterFunc` (`server/rpc/filter.go:27-74`)，返回 `(matched bool, score int)`。
+
+#### 14.4.1 匹配阶段（必须全部满足）
+
+**Step 1：反向标签检查（Agent side required labels）** (`filter.go:76-86`)
+```go
+func requiredLabelsMissing(taskLabels, agentLabels map[string]string) bool {
+    for label, value := range agentLabels {
+        if len(label) > 0 && label[0] == '!' {
+            // Agent 要求任务必须带有某标签
+            // 如 Agent labels: {"!gpu": "true"}
+            // 表示任务必须有 gpu=true 标签
+            val, ok := taskLabels[label[1:]]
+            if !ok || val != value {
+                return true  // 缺失，不匹配
+            }
+        }
+    }
+    return false
+}
+```
+
+**Step 2：内部标签过滤** (`filter.go:37-41`)
+```go
+for k := range labels {
+    if strings.HasPrefix(k, pipeline.InternalLabelPrefix) {
+        delete(labels, k)  // woodpecker.org.cn/ 开头的不参与匹配
+    }
+}
+```
+
+**Step 3：任务标签全匹配** (`filter.go:43-71`)
+```go
+for taskLabel, taskLabelValue := range labels {
+    if taskLabelValue == "" {
+        continue  // 空值忽略
+    }
+
+    // 任务的每个标签必须在 Agent labels 中找到匹配
+    agentLabelValue, ok := agentFilter.Labels[taskLabel]
+    if !ok {
+        // 检查反向匹配: Agent labels 有 "!taskLabel" = value
+        agentLabelValue, ok = agentFilter.Labels["!"+taskLabel]
+        if !ok {
+            return false, 0  // 不匹配
+        }
+    }
+
+    switch agentLabelValue {
+    case "*":
+        score++  // 通配符匹配，得 1 分
+    case taskLabelValue:
+        score += 10  // 精确匹配，得 10 分
+    default:
+        return false, 0  // 不匹配
+    }
+}
+return true, score
+```
+
+#### 14.4.2 打分规则总结
+
+| 匹配类型 | 分数 | 说明 |
+|---------|------|------|
+| 精确匹配 | +10 | Agent label 值 == Task label 值 |
+| 通配符匹配 | +1 | Agent label 值 == "*" |
+| 不匹配 | - | 整个任务对该 Agent 不匹配 |
+
+**优先级**：精确匹配 > 通配符匹配，分数越高越优先。
+
+### 14.5 assignToWorker 选择逻辑
+
+`assignToWorker()` (`server/queue/fifo.go:314-336`) 遍历所有 pending task 和所有 worker，找到**最佳匹配**：
+
+```go
+func (q *fifo) assignToWorker() (*list.Element, *worker) {
+    var bestWorker *worker
+    var bestScore int
+
+    // 按 pending 顺序遍历（FIFO）
+    for element := q.pending.Front(); element != nil; element = element.Next() {
+        task, _ := element.Value.(*model.Task)
+
+        // 遍历所有在线 worker
+        for worker := range q.workers {
+            matched, score := worker.filter(task)
+            if matched && score > bestScore {
+                bestWorker = worker
+                bestScore = score
+            }
+        }
+        if bestWorker != nil {
+            return element, bestWorker  // 找到即返回，保证 FIFO
+        }
+    }
+    return nil, nil
+}
+```
+
+**关键特性**：
+1. **FIFO 顺序**：按 pending 队列顺序逐个尝试，先入队的先分配
+2. **最高分优先**：对同一个 task，选择 score 最高的 worker
+3. **贪心匹配**：找到一个匹配就立即返回，不继续看后面的 task（保证公平）
+
+### 14.6 调度匹配示例
+
+#### 场景 1：单 Agent 多标签
+
+```
+Task labels: {platform: "linux/amd64", size: "large", org: "123"}
+
+Agent1 labels: {platform: "linux/amd64", size: "*", org: "*"}
+  → platform 精确匹配 (+10), size 通配 (+1), org 通配 (+1) = 12 分 ✓
+
+Agent2 labels: {platform: "linux/arm64", size: "large", org: "*"}
+  → platform 不匹配 (arm64 ≠ amd64) = 不匹配 ✗
+
+选择：Agent1 (12 分)
+```
+
+#### 场景 2：多 Agent 精确 vs 通配
+
+```
+Task labels: {platform: "linux/amd64", backend: "docker", org: "123"}
+
+Agent1 labels: {platform: "linux/amd64", backend: "*", org: "*"}
+  → 精确(10) + 通配(1) + 通配(1) = 12 分
+
+Agent2 labels: {platform: "linux/amd64", backend: "docker", org: "123"}
+  → 精确(10) + 精确(10) + 精确(10) = 30 分 ✓
+
+选择：Agent2 (30 分)
+```
+
+#### 场景 3：系统 Agent vs 组织 Agent
+
+```
+Task labels: {org: "123", platform: "linux/amd64"}
+
+Agent1 (系统 Agent, OrgID=-1):
+  → labels = {org: "*", platform: "linux/amd64"}
+  → 通配(1) + 精确(10) = 11 分
+
+Agent2 (组织 Agent, OrgID=123):
+  → labels = {org: "123", platform: "linux/amd64"}
+  → 精确(10) + 精确(10) = 20 分 ✓
+
+选择：Agent2 (20 分)
+```
+
+> **重要**：组织 Agent 优先于系统 Agent 处理本组织任务，因为 `org=123` 精确匹配比 `org=*` 通配分数高。
+
+#### 场景 4：反向标签（Agent 要求任务有某标签）
+
+```
+Agent labels: {"!gpu": "true", platform: "linux/amd64"}
+  → "!gpu" 表示 Agent 要求任务必须有 gpu=true 标签
+
+Task1 labels: {gpu: "true", platform: "linux/amd64"}
+  → requiredLabelsMissing() 检查通过
+  → 精确匹配 + 精确匹配 = 20 分 ✓
+
+Task2 labels: {platform: "linux/amd64"}
+  → requiredLabelsMissing() 返回 true（缺少 gpu=true）
+  → 不匹配 ✗
+```
+
+### 14.7 依赖调度
+
+任务有依赖时，即使匹配了 Agent 也不会立即执行，而是进入 `waitingOnDeps` 队列：
+
+**依赖检查** (`server/queue/fifo.go:350-367`)：
+```go
+func (q *fifo) depsInQueue(task *model.Task) bool {
+    // 检查 pending 队列中是否有依赖
+    for element := q.pending.Front(); element != nil; element = element.Next() {
+        possibleDep, _ := element.Value.(*model.Task)
+        for _, dep := range task.Dependencies {
+            if possibleDep.ID == dep {
+                return true  // 依赖还在 pending
+            }
+        }
+    }
+    // 检查 running 队列中是否有依赖
+    for possibleDepID := range q.running {
+        if slices.Contains(task.Dependencies, possibleDepID) {
+            return true  // 依赖还在 running
+        }
+    }
+    return false
+}
+```
+
+**依赖流转**：
+1. 任务入队时先到 `pending`
+2. `filterWaiting()` 发现有依赖未完成 → 移到 `waitingOnDeps`
+3. 下一轮循环 `filterWaiting()` 再检查，依赖完成 → 移回 `pending`
+4. `assignToWorker()` 正常分配
+
+### 14.8 并发安全与锁
+
+整个调度过程在 `q.Lock()` 保护下执行 (`server/queue/fifo.go:265, 285`)：
+```go
+select {
+case <-time.After(processTimeInterval):
+case <-q.ctx.Done():
+    return
+}
+
+q.Lock()
+// ... 所有调度逻辑 ...
+q.Unlock()
+```
+
+这保证了：
+- 不会出现同一个 task 被分配给多个 worker
+- 不会出现 worker 被分配多个 task
+- pending/waitingOnDeps/running/workers 四个结构的一致性
+
+### 14.9 调度算法的优缺点
+
+| 优点 | 缺点 |
+|------|------|
+| 实现简单，FIFO 保证公平 | 遍历所有 pending × all workers，O(n×m) 复杂度 |
+| 精确匹配优先于通配，符合直觉 | 高并发场景下（如 1000 task × 1000 worker）每 100ms 一次遍历可能有性能问题 |
+| 组织 Agent 优先处理本组织任务 | 不支持 worker 负载感知（不会优先分配给负载低的 Agent） |
+| 反向标签支持 Agent 端强制需求 | 不支持任务优先级（所有 pending task 平等） |
+| 依赖调度自动处理 | 不支持任务抢占（高优先级任务不能打断低优先级任务） |
+| 全程锁保护，无竞态 | 全局锁在高并发下可能成为瓶颈 |
+
+### 14.10 调度算法关键代码路径
+
+| 阶段 | 代码位置 | 作用 |
+|------|---------|------|
+| 任务入队标签注入 | `server/model/task.go:48-58` | 注入 repo/org 标签 |
+| Agent Filter 构建 | `server/rpc/rpc.go:71-88` | 合并 Agent 标签 + 服务端强制标签 |
+| 匹配 + 打分 | `server/rpc/filter.go:27-74` | 核心过滤与评分逻辑 |
+| 依赖检查 | `server/queue/fifo.go:350-367` | 判断依赖是否满足 |
+| 最佳匹配选择 | `server/queue/fifo.go:314-336` | 遍历并选择最高分 worker |
+| 调度循环 | `server/queue/fifo.go:257-287` | 每 100ms 执行一次完整调度 |
+
+
