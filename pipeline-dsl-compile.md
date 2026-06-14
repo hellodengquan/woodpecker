@@ -792,4 +792,550 @@ filterMissingDependencies()   Workflow 级依赖清理
     └── RunsOn           # [success, failure] 执行条件
 ```
 
-这就是整个流水线 DSL 解析、编译、组装的完整过程。
+---
+
+## 六、DSL 校验失败的错误反馈与定位机制
+
+### 6.1 错误类型体系
+
+Woodpecker 将编译期所有错误统一抽象为 `PipelineError`（`pipeline/errors/pipeline.go:33-42`），包含 5 种类型：
+
+```go
+type PipelineErrorType string
+
+const (
+    PipelineErrorTypeLinter      PipelineErrorType = "linter"      // 配置语法错误
+    PipelineErrorTypeDeprecation PipelineErrorType = "deprecation" // 使用了废弃特性
+    PipelineErrorTypeCompiler    PipelineErrorType = "compiler"    // 配置语义错误
+    PipelineErrorTypeGeneric     PipelineErrorType = "generic"     // 通用错误
+    PipelineErrorTypeBadHabit    PipelineErrorType = "bad_habit"   // 不良实践
+)
+
+type PipelineError struct {
+    Type      PipelineErrorType `json:"type"`       // 错误分类
+    Message   string            `json:"message"`    // 人类可读的错误描述
+    IsWarning bool              `json:"is_warning"` // 是否为警告（不阻塞）
+    Data      any               `json:"data"`       // 结构化错误详情
+}
+```
+
+### 6.2 错误严重级别与阻断逻辑
+
+**核心判断函数**（`pipeline/errors/linter.go:69-82`）：
+
+```go
+func HasBlockingErrors(err error) bool {
+    errs := GetPipelineErrors(err)
+    for _, err := range errs {
+        if !err.IsWarning {
+            return true  // 只要有一个 IsWarning=false，整个编译中止
+        }
+    }
+    return false
+}
+```
+
+| 严重级别 | `IsWarning` | 行为 | 举例 |
+|---------|-------------|------|------|
+| **阻塞错误** | `false` | 编译中止，流水线标记为 `error` | 缺少 `steps` 段、循环依赖、缺少必填镜像 |
+| **警告** | `true` | 编译继续，错误记录到 `pipeline.Errors` 供 UI 展示 | Schema 校验失败、`runs_on` 弃用、缺少 event filter |
+
+### 6.3 错误定位机制 — 精确到文件+字段
+
+每种错误类型携带结构化的 `Data` 字段，实现精确定位：
+
+#### 6.3.1 Linter 错误定位
+
+**错误创建**（`pipeline/frontend/yaml/linter/error.go:21-28`）：
+
+```go
+func newLinterError(message, file, field string, isWarning bool) *PipelineError {
+    return &PipelineError{
+        Type:    PipelineErrorTypeLinter,
+        Message: message,
+        Data:    &LinterErrorData{File: file, Field: field},
+        IsWarning: isWarning,
+    }
+}
+```
+
+`LinterErrorData` 结构（`pipeline/errors/linter.go:23-26`）：
+
+```go
+type LinterErrorData struct {
+    File  string `json:"file"`  // YAML 文件名（如 "build" 或 "deploy"）
+    Field string `json:"field"` // 精确到字段路径（如 "steps.build.image"）
+}
+```
+
+示例错误输出：
+```
+[linter] Invalid or missing image
+  File: "build"
+  Field: "steps.my-step"
+```
+
+#### 6.3.2 Deprecation 错误定位
+
+```go
+type DeprecationErrorData struct {
+    File  string `json:"file"`   // 文件名
+    Field string `json:"field"`  // 废弃字段路径
+    Docs  string `json:"docs"`   // 迁移文档 URL
+}
+```
+
+示例：使用 `runs_on` 时：
+```
+[deprecation] Usage of `runs_on` is deprecated, use `when.status`
+  File: "deploy"
+  Field: "deploy.runs_on"
+  Docs:  "https://woodpecker-ci.org/docs/usage/workflow-syntax#status"
+```
+
+#### 6.3.3 BadHabit 错误定位
+
+```go
+type BadHabitErrorData struct {
+    File  string `json:"file"`
+    Field string `json:"field"`  // 如 "steps.build" 或 "steps.build.when[0]"
+    Docs  string `json:"docs"`
+}
+```
+
+示例：步骤缺少 event filter 时：
+```
+[bad_habit] Consider adding a `when` block with an `event` filter to this step or the entire workflow
+  File: "test"
+  Field: "steps.build"
+  Docs:  "https://woodpecker-ci.org/docs/usage/linter#event-filter-for-all-steps"
+```
+
+#### 6.3.4 Compiler 错误 — 4 种细粒度类型
+
+**代码位置**：`pipeline/frontend/yaml/compiler/errors.go`
+
+| 错误类型 | 触发场景 | 错误消息示例 |
+|---------|---------|-------------|
+| `ErrExtraHostFormat` | `extra_hosts` 格式错误 | `extra host "bad_host" is in wrong format` |
+| `ErrStepMissingDependency` | depends_on 引用不存在的步骤 | `step 'deploy' depends on unknown step 'buildx'` |
+| `ErrStepFilteredDependency` | 依赖步骤存在但被 When 过滤掉 | `step 'deploy' depends on step 'build' which is filtered out by its conditions` |
+| `ErrStepDependencyCycle` | 步骤间存在循环依赖 | `cycle detected: [build, test, build]` |
+
+**编译器错误的特殊处理**（`compiler/compiler.go:270-278`）：
+
+```go
+var missingDepErr *ErrStepMissingDependency
+if errors.As(err, &missingDepErr) {
+    if _, inConfig := stepNames[missingDepErr.dep]; inConfig {
+        // 依赖存在但被过滤 → 提供更精确的错误提示
+        return nil, &ErrStepFilteredDependency{name: missingDepErr.name, dep: missingDepErr.dep}
+    }
+}
+```
+
+#### 6.3.5 JSON Schema 校验 — YAML 结构合规
+
+**代码位置**：`pipeline/frontend/yaml/linter/schema/schema.go`
+
+流程：
+1. YAML 文本 → `xyaml` 解析为 `yaml.Node`
+2. `yaml2json.ConvertNode()` 转为 JSON
+3. `gojsonschema.Validate()` 使用嵌入的 `schema.json` 校验
+4. 过滤冗余组合错误（`filterRedundantCompositionErrors`）
+
+Schema 校验结果中每个 `ResultError` 包含：
+- `Field()`：出错字段的 JSON Path（如 `(root).steps.0.image`）
+- `Description()`：人类可读的校验失败描述
+
+### 6.4 错误生命周期 — 从产生到用户可见
+
+```
+Linter/Compiler 产生错误
+       │
+       ▼
+multierr.Append() 聚合多个错误
+       │
+       ▼
+genItemForWorkflow() 返回 errorsAndWarnings
+       │
+       ├── HasBlockingErrors() == true → 返回 nil, err
+       │     │
+       │     ▼
+       │   createPipelineItems() 检测到阻塞错误
+       │     │
+       │     ▼
+       │   handleParseErrors() → 返回 blocking=true
+       │     │
+       │     ▼
+       │   UpdateToStatusError() → pipeline.Status = "error"
+       │     │                     pipeline.Errors = GetPipelineErrors(err)
+       │     ▼
+       │   存入数据库 + 通知 Forge（如 PR 状态检查失败）
+       │
+       └── HasBlockingErrors() == false → 继续编译
+             │
+             ▼
+           pipeline.Errors = GetPipelineErrors(parseErr) → 仅记录警告
+             │
+             ▼
+           流水线正常运行，UI 显示警告信息
+```
+
+**关键函数**（`server/pipeline/pipeline_status.go:65-71`）：
+
+```go
+func UpdateToStatusError(store store.Store, pipeline model.Pipeline, err error) (*model.Pipeline, error) {
+    pipeline.Errors = errors.GetPipelineErrors(err)  // 结构化错误写入 pipeline 记录
+    pipeline.Status = model.StatusError
+    pipeline.Started = time.Now().Unix()
+    pipeline.Finished = pipeline.Started
+    return &pipeline, store.UpdatePipeline(&pipeline)
+}
+```
+
+`GetPipelineErrors()` 的聚合逻辑（`pipeline/errors/linter.go:52-67`）：遍历 `multierr` 展开的所有错误，将原生 `PipelineError` 直接保留，其他错误包装为 `PipelineErrorTypeGeneric`。
+
+### 6.5 错误反馈设计要点总结
+
+| 设计要点 | 实现方式 |
+|---------|---------|
+| **精确文件定位** | 每个错误携带 `File` 字段（来自 `YamlFile.Name`，经 `SanitizePath` 清洗） |
+| **精确字段定位** | `Field` 使用点分路径（如 `steps.build.depends_on`） |
+| **错误/警告二分** | `IsWarning` 区分，阻塞错误中止编译，警告仅记录 |
+| **多错误聚合** | `multierr.Append()` 不会因首个错误丢弃后续错误 |
+| **Schema 兼容** | JSON Schema 校验当前仅产生警告，不阻塞 |
+| **迁移指引** | Deprecation/BadHabit 错误附带 `Docs` URL 指向迁移文档 |
+| **运行时掩码** | `config.Secrets` 收集所有密钥值用于日志脱敏 |
+| **UI 可见** | `pipeline.Errors` 序列化为 JSON 返回前端，在流水线页面展示 |
+
+---
+
+## 七、编译产物的缓存与复用策略
+
+### 7.1 内存层 — 无缓存，每次全量编译
+
+**Woodpecker 的编译管线在进程内没有任何缓存机制**。每次调用 `PipelineBuilder.Build()` 都会完整执行以下流程：
+
+```
+YAML 原文 → 环境变量替换 → YAML 反序列化 → Linter 校验 → Compiler 编译 → DAG 生成
+```
+
+原因分析：
+1. **上下文敏感性**：同一段 YAML 在不同事件（push/tag/PR）、不同分支、不同 Matrix 轴下编译结果不同。环境变量替换（`EnvVarSubst`）和 `When.Match()` 过滤都依赖运行时元数据。
+2. **无状态设计**：`Compiler` 和 `PipelineBuilder` 每次调用 `New()` 创建新实例，不保留历史状态。
+3. **编译耗时可控**：纯 CPU 运算，无 I/O 阻塞，单文件编译通常在毫秒级完成。
+
+### 7.2 持久化层 — 配置文件哈希去重
+
+虽然编译结果不缓存，但**原始 YAML 配置文件**在持久化时有去重机制。
+
+**代码位置**：`server/store/datastore/config.go:48-70`
+
+```go
+func (s storage) ConfigPersist(conf *model.Config) (*model.Config, error) {
+    // 1. 计算内容 SHA-256 哈希
+    conf.Hash = fmt.Sprintf("%x", sha256.Sum256(conf.Data))
+
+    // 2. 事务内查找相同 repoID + hash + name 的已有记录
+    existingConfig, err := s.configFindIdentical(sess, conf.RepoID, conf.Hash, conf.Name)
+    if existingConfig != nil {
+        return existingConfig, nil  // 3. 命中则直接返回已有记录，不重复插入
+    }
+
+    // 4. 未命中则创建新记录
+    s.configCreate(sess, conf)
+    return conf, sess.Commit()
+}
+```
+
+去重维度：`(repo_id, hash, name)` 三元组。相同仓库、相同内容、相同文件名的配置只存储一份。
+
+**调用位置**（`server/pipeline/create.go:117-125`）：
+
+```go
+for _, forgeYamlConfig := range forgeYamlConfigs {
+    config, err := findOrPersistPipelineConfig(_store, pipeline, forgeYamlConfig)
+    // config 已存在则返回已有记录
+}
+```
+
+### 7.3 配置获取层 — 重启时的配置复用
+
+**代码位置**：`server/services/config/forge.go:49-53`
+
+```go
+func (f *forgeFetcher) Fetch(..., oldConfigData []*types.FileMeta, restart bool) {
+    // 重启时直接复用旧配置，不再从 Forge 拉取
+    if restart && len(oldConfigData) > 0 {
+        return oldConfigData, nil
+    }
+    // ... 正常从 Forge 获取
+}
+```
+
+Pipeline 重启时（`restart=true`），跳过从 Forge 拉取配置文件，直接复用已存储的配置数据。
+
+### 7.4 外部配置服务 — HTTP 扩展的回退机制
+
+**代码位置**：`server/services/config/http.go:57-102`
+
+```
+Forge 获取配置 → HTTP 扩展服务处理
+                       │
+                       ├─ 200 OK     → 使用扩展返回的新配置
+                       ├─ 204 No Content → 回退到 Forge 原始配置（oldConfigData）
+                       └─ 其他错误   → 返回 oldConfigData + 错误
+```
+
+`config.NewCombined(forgeFetcher, httpFetcher)` 的链式处理（`server/services/config/combined.go:33-39`）：
+
+```go
+func (c *combined) Fetch(...) (files []*types.FileMeta, err error) {
+    files = oldConfigData
+    for _, s := range c.services {
+        files, err = s.Fetch(ctx, forge, user, repo, pipeline, files, restart)
+    }
+    return files, err
+}
+```
+
+Forge 获取的结果作为 HTTP 服务的输入，HTTP 服务可修改/替换/原样返回配置。204 表示"不做修改"，实现优雅回退。
+
+### 7.5 缓存策略总结
+
+| 层级 | 缓存策略 | 理由 |
+|------|---------|------|
+| **内存编译** | 无缓存，每次全量编译 | 上下文敏感（事件/分支/矩阵轴），编译快 |
+| **DB 配置存储** | SHA-256 哈希去重 | 避免相同配置重复存储，节省空间 |
+| **Pipeline 重启** | 复用已存储配置 | 无需再从 Forge 拉取，保证配置一致性 |
+| **HTTP 配置扩展** | 204 回退机制 | 扩展服务不可用时自动降级到原始配置 |
+| **Forge 配置拉取** | 可配置重试次数 | `forgeFetcher.retryCount` 应对网络抖动 |
+
+---
+
+## 八、DSL 演进与版本兼容性
+
+### 8.1 版本演进时间线
+
+Woodpecker CI 从 Drone v0.8 分叉后，DSL 经历了多次重大变更：
+
+```
+Drone v0.8  ──fork──►  Woodpecker v0.14  ──►  v1.0  ──►  v2.0  ──►  v3.0 (当前)
+    │                      │                  │         │          │
+    │                      │                  │         │          │
+  .drone.yml          .woodpecker.yml    关键重构     大清理     语法严化
+  pipeline:           pipeline:          移除command:  移除CI_BUILD_*  移除secrets:
+  build:              steps:             API 用 ID    移除SSH后端    移除pipeline:
+    ...                  ...             ed25519签名  platform→labels  branches→when.branch
+```
+
+### 8.2 各版本关键语法差异
+
+#### 8.2.1 Drone → Woodpecker v0.x：基础迁移
+
+| Drone 语法 | Woodpecker v0.x 语法 | 变更原因 |
+|-----------|---------------------|---------|
+| `.drone.yml` | `.woodpecker.yml` / `.woodpecker/` | 品牌独立 |
+| `build:` 段 | `pipeline:` 段 | 术语统一（build→pipeline） |
+| `DRONE_*` 环境变量 | `CI_*` 环境变量 | 通用 CI 前缀 |
+| 工作空间 `/drone` | 工作空间 `/woodpecker` | 品牌独立 |
+
+#### 8.2.2 v0.x → v1.x：API 重构与安全升级
+
+| 变更项 | v0.x | v1.x | 影响 |
+|--------|------|------|------|
+| `command:` | 支持 | **移除** | 必须用 `commands:`（数组） |
+| 配置扩展签名 | HMAC 共享密钥 | ed25519 密钥对 | 安全升级 |
+| API 路由 | `owner/repo` | `repo-id`（数字 ID） | 路由重构 |
+| 日志系统 | 旧格式 | 新格式 | 需迁移脚本 |
+
+#### 8.2.3 v1.x → v2.x：环境变量大清理
+
+| 变更项 | v1.x | v2.x | 影响 |
+|--------|------|------|------|
+| `CI_BUILD_*` 变量 | 存在（已标记废弃） | **移除** | 必须用 `CI_PIPELINE_*` |
+| `platform:` 过滤器 | 存在（已标记废弃） | **移除** | 必须用 `labels:` |
+| SSH 后端 | 支持 | **移除** | 改用 `local` 后端或 ssh 命令 |
+| Secret 的 `plugin_only` | 支持 | **移除** | 改用 `image` 过滤器 |
+| `build` CLI 命令 | 存在（已标记废弃） | **移除** | 必须用 `pipeline` 命令 |
+
+#### 8.2.4 v2.x → v3.x（当前版本）：语法严化
+
+| 变更项 | v2.x | v3.x | 影响 |
+|--------|------|------|------|
+| `secrets: [token]` | 支持（有警告） | **移除** | 必须用 `environment: { TOKEN: { from_secret: token } }` |
+| `pipeline:` 段名 | 支持（有警告） | **报错** | 必须用 `steps:` |
+| `branches:` | 支持（有警告） | **报错** | 必须用 `when.branch` |
+| `platform:` | 支持（有警告） | **报错** | 必须用 `labels:` |
+| `environment:` 列表语法 | 支持 | **移除** | 必须用映射语法 |
+| 环境变量自动大写 | 默认行为 | **移除** | 保留原始大小写 |
+| `steps.[name].group` | 支持 | **废弃** | 改用 `depends_on` |
+| `includes/excludes` 事件过滤 | 支持 | **移除** | 改用 `when.event` |
+| `gated` 设置 | 支持 | **移除** | 改用 `require-approval` |
+
+### 8.3 当前代码中的兼容性处理
+
+#### 8.3.1 `runs_on` 废弃兼容
+
+**YAML 解析层**仍接受 `runs_on`（`pipeline/frontend/yaml/types/workflow.go:33`）：
+
+```go
+// Deprecated: use when.status. TODO remove in next major.
+RunsOn []string `yaml:"runs_on,omitempty"`
+```
+
+**Linter 层**发出废弃警告（`pipeline/frontend/yaml/linter/linter.go:318-332`）：
+
+```go
+if len(parsed.RunsOn) > 0 { //nolint:staticcheck
+    err = multierr.Append(err, &PipelineError{
+        Type:      PipelineErrorTypeDeprecation,
+        IsWarning: true,
+        Message:   "Usage of `runs_on` is deprecated, use `when.status`",
+        Data: DeprecationErrorData{...},
+    })
+}
+```
+
+**Builder 层**自动将 `runs_on` 转换为等价的 `RunsOn` 字段（`pipeline/frontend/builder/builder.go:178-183`）：
+
+```go
+if !slices.Contains(item.RunsOn, "failure") && parsed.When.IncludesStatusFailure(...) {
+    item.RunsOn = append(item.RunsOn, "failure")
+}
+if !slices.Contains(item.RunsOn, "success") && parsed.When.IncludesStatusFailure(...) {
+    item.RunsOn = append(item.RunsOn, "success")
+}
+```
+
+#### 8.3.2 `forceIgnoreServiceFailure` 兼容
+
+整个调用链保留此选项，计划在 4.x 移除：
+
+```
+server/config.go:88     ForceIgnoreServiceFailure bool
+    ↓
+server/pipeline/items.go:151-152  compiler.WithForceIgnoreServiceFailure()
+    ↓
+pipeline/frontend/yaml/compiler/option.go:203-208  WithForceIgnoreServiceFailure()
+    ↓
+pipeline/frontend/yaml/compiler/compiler.go:98-99   forceIgnoreServiceFailure bool
+    ↓
+pipeline/frontend/yaml/compiler/convert.go:159-162  if c.forceIgnoreServiceFailure && detached { failure = ignore }
+```
+
+#### 8.3.3 Drone CI 插件兼容
+
+**代码位置**：`pipeline/frontend/metadata/drone_compatibility.go:19-72`
+
+在**运行时**为 Plugin 类型步骤注入 `DRONE_*` 环境变量（`pipeline/runtime/step.go:95-96`）：
+
+```go
+if step.Type == backend_types.StepTypePlugin {
+    metadata.SetDroneEnviron(step.Environment)
+}
+```
+
+映射关系（部分）：
+
+| Woodpecker 变量 | Drone 兼容变量 |
+|-----------------|---------------|
+| `CI_COMMIT_BRANCH` | `DRONE_BRANCH` |
+| `CI_COMMIT_SHA` | `DRONE_COMMIT_SHA` |
+| `CI_PIPELINE_NUMBER` | `DRONE_BUILD_NUMBER` |
+| `CI_REPO` | `DRONE_REPO` |
+| `CI_REPO_CLONE_URL` | `DRONE_REMOTE_URL` |
+
+#### 8.3.4 环境变量废弃兼容
+
+`pipeline/frontend/metadata/environment.go` 中多处标记了待移除的环境变量：
+
+```go
+// Deprecated remove in 4.x
+setNonEmptyEnvVar(params, "CI_REPO_TRUSTED", ...)          // 合并值 → 应分别用 CI_REPO_TRUSTED_NETWORK/VOLUMES/SECURITY
+
+// TODO Deprecated, remove in next major
+setNonEmptyEnvVar(params, "CI_COMMIT_AUTHOR_AVATAR", ...)   // → 应使用 CI_PIPELINE_AVATAR
+setNonEmptyEnvVar(params, "CI_PREV_COMMIT_AUTHOR_AVATAR", ...) // → 应使用 CI_PREV_PIPELINE_AVATAR
+```
+
+#### 8.3.5 ContainerList 双语法兼容
+
+**代码位置**：`pipeline/frontend/yaml/types/container_list.go:29-77`
+
+`steps`、`clone`、`services` 段同时支持**映射语法**和**列表语法**：
+
+```yaml
+# 映射语法（key 作为步骤名）
+steps:
+  build:
+    image: golang
+    commands: [go build]
+
+# 列表语法（name 字段指定步骤名）
+steps:
+  - name: build
+    image: golang
+    commands: [go build]
+```
+
+实现原理：自定义 `UnmarshalYAML` 根据 `yaml.Kind` 分派：
+- `yaml.MappingNode` → 遍历 `Content` 取奇数索引值，key 作为 `Name`
+- `yaml.SequenceNode` → 遍历 `Content`，缺省 `Name` 为 `step-{i}`
+
+### 8.4 废弃策略的执行流程
+
+Woodpecker 遵循严格的废弃策略（参考官方文档 [Deprecation Policy](https://woodpecker-ci.org/docs/next/development/deprecations)）：
+
+```
+版本 N.x（小版本）           版本 (N+1).0（大版本）       版本 (N+1).x（小版本）
+─────────────────         ──────────────────         ──────────────────
+• Linter 添加警告           • 警告变为错误               • 废弃代码路径移除
+• 旧语法仍可正常工作         • 旧语法不再支持              • 解析器简化
+• 文档更新为新语法           • 迁移指南记录破坏性变更       • 不再识别旧语法
+• 警告消息包含迁移指引       • 用户必须更新配置
+```
+
+**实际案例**：`secrets: [token]` 的废弃时间线：
+- **v2.5.0**：Linter 添加废弃警告，`secrets` 语法仍可工作
+- **v2.6-2.9**：警告持续，两种语法并存
+- **v3.0.0**：Linter 报错，`secrets` 语法不再支持（破坏性变更）
+- **v3.1.0**：废弃代码路径移除，解析器简化
+
+### 8.5 Schema 校验与语法演进
+
+**代码位置**：`pipeline/frontend/yaml/linter/schema/schema.json`
+
+JSON Schema 是 DSL 语法的权威定义，随版本同步更新：
+- `runs_on` 字段标记 `"description": "Deprecated: use when.status instead"` 但仍允许（兼容期）
+- `depends_on` 支持 string 和 object 两种格式（新增 `depends_on_item` 定义支持 `name` + `optional` 字段）
+- 新增字段（如 `backend_options`）通过 Schema 扩展而非修改核心类型
+
+Schema 校验当前仅产生**警告**（`IsWarning: true`），不阻塞编译，这为语法演进提供了缓冲期。
+
+---
+
+## 九、补充文件清单
+
+| 文件路径 | 补充内容相关 |
+|---------|------------|
+| `pipeline/errors/pipeline.go` | PipelineError 类型体系与 5 种错误分类 |
+| `pipeline/errors/linter.go` | 错误聚合、阻断判断、结构化 Data 提取 |
+| `pipeline/errors/runtime.go` | 运行时错误类型（ExitError、OomError） |
+| `pipeline/frontend/yaml/linter/error.go` | Linter 错误创建（File + Field 定位） |
+| `pipeline/frontend/yaml/compiler/errors.go` | 编译器 4 种细粒度错误类型 |
+| `pipeline/frontend/yaml/linter/schema/schema.go` | JSON Schema 校验实现 |
+| `pipeline/frontend/yaml/linter/schema/schema.json` | DSL Schema 权威定义 |
+| `server/store/datastore/config.go` | 配置 SHA-256 哈希去重存储 |
+| `server/pipeline/config.go` | 配置持久化入口 |
+| `server/pipeline/pipeline_status.go` | 错误状态更新（UpdateToStatusError） |
+| `server/pipeline/create.go` | Pipeline 创建与错误处理主流程 |
+| `server/services/config/forge.go` | Forge 配置获取与重启复用 |
+| `server/services/config/http.go` | HTTP 配置扩展与 204 回退机制 |
+| `server/services/config/combined.go` | 配置服务链式组合 |
+| `pipeline/frontend/metadata/drone_compatibility.go` | Drone CI 环境变量兼容层 |
+| `pipeline/frontend/yaml/types/container_list.go` | 步骤列表双语法兼容（Map/Sequence） |
+| `pipeline/frontend/yaml/types/workflow.go` | `runs_on` 废弃字段定义 |
+| `pipeline/frontend/yaml/constraint/constraint.go` | `when` 条件约束实现 |
+| `shared/constant/constant.go` | 默认配置路径、克隆插件常量 |
