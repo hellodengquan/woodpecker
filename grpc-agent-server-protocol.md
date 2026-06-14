@@ -2505,5 +2505,601 @@ pipelineCount := factory.NewCounterVec(prometheus.CounterOpts{
 
 > **重要**：Agent 端的运行状态 **不会主动上报** 到 Server。Server 只能通过 `LastContact` 间接推断 Agent 是否存活，无法知道 Agent 当前跑了多少个工作流、负载如何。如果需要集中监控所有 Agent 的状态，需要外部 Prometheus 分别抓取每个 Agent 的 `/varz` 端点。
 
+---
+
+## 18. Agent 升级与协议向后兼容
+
+本章节详解 Agent/Server 版本升级时的协议兼容策略、版本协商机制、以及升级过程中的任务处理。
+
+### 18.1 协议版本号机制
+
+Woodpecker 使用 **严格的整数版本号** 来标识 gRPC 协议版本。
+
+**版本定义** (`rpc/proto/version.go:19`)：
+```go
+const Version int32 = 16
+```
+
+**Proto 文件中的约定** (`rpc/proto/woodpecker.proto:21-23`)：
+```protobuf
+// !IMPORTANT!
+// Increased Version in version.go by 1 if you change something here!
+// !IMPORTANT!
+```
+
+每次修改 `.proto` 文件，**必须** 将 `version.go` 中的 `Version` 递增 1。当前版本为 **16**。
+
+### 18.2 版本协商流程
+
+Agent 在启动时执行一次版本协商，**不兼容则直接退出**，不会尝试降级运行。
+
+```
+Agent                                          Server
+  │                                               │
+  │  Version() ─────────────────────────────────▶│
+  │                                               │
+  │  ◀──── VersionResponse {                      │
+  │           grpc_version: 16,                   │
+  │           server_version: "v2.7.0"            │
+  │         }                                     │
+  │                                               │
+  │  比较:                                         │
+  │    ClientGrpcVersion == resp.GrpcVersion ?    │
+  │                                               │
+  │    相等 ✓ → 继续                               │
+  │    不等 ✗ → 日志 + 退出                        │
+```
+
+**代码实现** (`cmd/agent/core/agent.go:146-158`)：
+```go
+grpcServerVersion, err := client.Version(grpcCtx)
+if err != nil {
+    log.Error().Err(err).Msg("could not get grpc server version")
+    return err
+}
+if grpcServerVersion.GrpcVersion != agent_rpc.ClientGrpcVersion {
+    err := errors.New("GRPC version mismatch")
+    log.Error().Err(err).Msgf(
+        "server version %s does report grpc version %d but we only understand %d",
+        grpcServerVersion.ServerVersion,
+        grpcServerVersion.GrpcVersion,
+        agent_rpc.ClientGrpcVersion)
+    return err
+}
+```
+
+**Agent 端版本号** 在编译时绑定 (`agent/rpc/client_grpc.go:44`)：
+```go
+const ClientGrpcVersion int32 = proto.Version
+```
+
+### 18.3 版本兼容策略
+
+Woodpecker 采用 **严格匹配** 策略，而非语义化版本兼容：
+
+| 策略 | Woodpecker | 典型的 gRPC 项目 |
+|------|-----------|-----------------|
+| 兼容判断 | `grpc_version == ClientGrpcVersion` | 支持版本范围（如 `>= min_version`） |
+| 不兼容行为 | Agent 直接退出 | 降级使用旧字段 |
+| 新增字段 | protobuf 默认值（零值） | 同上 |
+| 删除字段 | 编译时错误 | 运行时忽略 |
+
+**这意味着**：
+- Server 从 v2.6 升级到 v2.7（grpc_version 从 15 → 16），**所有旧 Agent 必须同时升级**
+- 没有"Server 先升级、Agent 后升级"的滚动升级窗口
+- proto 新增字段时，旧 Agent 虽然能反序列化（protobuf 向后兼容），但版本号不同仍会被拒绝
+
+### 18.4 Protobuf 字段演化的实际影响
+
+尽管版本号采用严格匹配，protobuf3 本身的字段编号机制提供了隐式兼容：
+
+| 变更类型 | protobuf 兼容性 | Woodpecker 兼容性 | 实际效果 |
+|---------|----------------|-------------------|---------|
+| 新增字段（新编号） | ✓ 旧代码忽略未知字段 | ✗ 版本号不同被拒绝 | 需同时升级 |
+| 删除字段 | ✓ 旧代码返回零值 | ✗ 版本号不同被拒绝 | 需同时升级 |
+| 重命名字段 | ✗ 二进制不兼容 | ✗ 版本号不同被拒绝 | 需同时升级 |
+| 修改字段类型 | ✗ 二进制不兼容 | ✗ 版本号不同被拒绝 | 需同时升级 |
+
+### 18.5 升级策略与运行中任务处理
+
+#### 场景 1：Server 先升级（不推荐）
+
+```
+1. Server 停止 → gRPC 连接断开
+2. 所有 Agent 的 retryRPC 开始重试
+3. Server 升级完成，grpc_version 从 15 → 16
+4. Server 启动，Agent 重连成功
+5. Agent 调用 Version() → grpc_version=16 ≠ ClientGrpcVersion=15
+6. Agent 退出
+
+问题: 所有 Agent 同时退出，运行中的工作流丢失
+```
+
+#### 场景 2：Agent 先升级（不推荐）
+
+```
+1. Agent 停止 → 运行中的工作流被 Server 检测为超时（1分钟内）
+2. Agent 升级完成，ClientGrpcVersion=16
+3. Agent 启动 → Version() → grpc_version=15 ≠ 16
+4. Agent 退出
+
+问题: Agent 连不上旧 Server，无法工作
+```
+
+#### 场景 3：同时升级（推荐）
+
+```
+1. 暂停队列调度: scheduler.Pause()  ← 防止新任务分配
+2. 等待运行中的工作流完成（或超时）
+3. 停止所有 Agent
+4. 停止 Server
+5. 升级 Server → grpc_version 从 15 → 16
+6. 升级 Agent → ClientGrpcVersion=16
+7. 启动 Server
+8. 启动 Agent → Version() 匹配 ✓
+9. 恢复队列调度: scheduler.Resume()
+```
+
+#### 场景 4：滚动升级（受限支持）
+
+由于严格版本匹配，Woodpecker **不支持** Agent/Server 版本不同的滚动升级。唯一的滚动升级方式是：
+
+1. 启动新版本 Agent（新端口/新部署），旧 Agent 仍运行
+2. 旧 Agent 完成任务后自然退出（`single-workflow` 模式）或手动停止
+3. 升级 Server
+4. 此时旧 Agent 已全部退出，新 Agent 可以连接
+
+### 18.6 Server 端版本返回
+
+Server 端在 `Version()` RPC 中返回两个版本信息：
+
+```go
+func (s *WoodpeckerServer) Version(_ context.Context, _ *proto.Empty) (*proto.VersionResponse, error) {
+    return &proto.VersionResponse{
+        GrpcVersion:   proto.Version,       // 协议版本（当前=16）
+        ServerVersion: version.String(),     // 应用版本（如 "v2.7.0"）
+    }, nil
+}
+```
+
+- `GrpcVersion`：用于兼容性检查，**必须严格相等**
+- `ServerVersion`：仅用于信息展示和日志记录，不参与兼容判断
+
+### 18.7 Unimplemented RPC 的处理
+
+Server 端嵌入了 `proto.UnimplementedWoodpeckerServer`，如果 Agent 调用了 Server 未实现的新 RPC，会返回 `Unimplemented` 错误码：
+
+```go
+type WoodpeckerServer struct {
+    proto.UnimplementedWoodpeckerServer
+    peer RPC
+}
+```
+
+这提供了**向前兼容**的安全网：如果 Agent 版本比 Server 新，调用了 Server 没有的 RPC，不会崩溃，而是收到明确的错误。但由于版本号严格匹配在前，这种情况实际上不会发生。
+
+---
+
+## 19. Server 重启时 In-Flight 任务恢复路径
+
+本章节详解 Server 重启（计划内/崩溃恢复）时，处于不同状态的任务如何恢复。
+
+### 19.1 Server 重启对内存状态的影响
+
+Server 重启时，所有内存中的状态全部丢失：
+
+| 数据结构 | 存储位置 | 重启后状态 | 恢复方式 |
+|---------|---------|-----------|---------|
+| `workers` map | 内存 | 丢失（空） | Agent 重新调用 Next() 注册 |
+| `running` map | 内存 | 丢失（空） | 任务从 DB 恢复 |
+| `pending` list | 内存 | 丢失（空） | 任务从 DB 恢复 |
+| `waitingOnDeps` list | 内存 | 丢失（空） | 依赖检查后重新分类 |
+| `entry.done` channel | 内存 | 丢失 | 重建 |
+| `entry.deadline` | 内存 | 丢失 | 重建为 `now + TaskTimeout` |
+| JWT secret | 配置 | 不变 | 重启后重新加载 |
+| Agent token | 配置 | 不变 | 重启后重新加载 |
+| Task 记录 | DB | 保留 | `TaskList()` 恢复 |
+| Workflow/Step 状态 | DB | 保留 | 查询 DB 恢复 |
+
+### 19.2 任务恢复的完整流程
+
+Server 启动时，`persistentQueue` 从 DB 加载所有未完成的任务：
+
+```
+Server 启动
+    │
+    ├── 1. 初始化内存队列 (NewMemoryQueue)
+    │     ├── workers = {}
+    │     ├── running = {}
+    │     ├── pending = list.New()
+    │     └── waitingOnDeps = list.New()
+    │
+    ├── 2. 从 DB 恢复任务 (WithTaskStore)
+    │     ├── store.TaskList() → 所有 Task 记录
+    │     └── q.PushAtOnce(tasks) → 写入 pending
+    │
+    ├── 3. 启动调度循环 (process goroutine)
+    │     ├── resubmitExpiredPipelines() ← running 为空，无操作
+    │     ├── filterWaiting() ← 检查依赖关系
+    │     └── assignToWorker() ← 等待 Agent 连接
+    │
+    ├── 4. Agent 重新连接
+    │     ├── Auth() → 获取新 JWT
+    │     ├── Version() → 版本检查
+    │     ├── RegisterAgent() → 注册
+    │     └── Next() → 注册 worker
+    │
+    └── 5. 任务重新分配
+          └── assignToWorker() → 匹配 worker → 执行
+```
+
+**代码实现** (`server/queue/persistent.go:32-38`)：
+```go
+func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
+    tasks, _ := s.TaskList()
+    if err := q.PushAtOnce(ctx, tasks); err != nil {
+        log.Error().Err(err).Msg("PushAtOnce failed")
+    }
+    return &persistentQueue{q, s}
+}
+```
+
+### 19.3 In-Flight 任务的状态分类与恢复
+
+Server 重启时，DB 中可能有以下状态的工作流，恢复策略各不同：
+
+#### 类型 A：等待调度（pending）
+
+```
+DB 状态: workflow.State = pending
+队列状态: Task 在 pending list 中
+恢复: 正常，直接入 pending 队列
+影响: 无，等 Agent 连接后正常调度
+```
+
+#### 类型 B：等待依赖（waitingOnDeps）
+
+```
+DB 状态: workflow.State = pending, Dependencies 未完成
+队列状态: Task 在 pending list 中
+恢复: filterWaiting() 会重新检查依赖
+      → 依赖已完成 → 移入 pending
+      → 依赖未完成 → 移入 waitingOnDeps
+影响: 依赖关系在 DB 中保留，正确恢复
+```
+
+#### 类型 C：运行中（running）— 最复杂
+
+```
+DB 状态: workflow.State = running
+队列状态: Task 在 DB 中，但 running map 为空
+
+问题: Agent 还在执行，但 Server 不知道
+```
+
+**恢复路径**：
+
+```
+Server 重启
+    │
+    ├── 所有 running 任务从 DB 加载到 pending
+    │   (因为 running map 为空，它们被视为"新任务")
+    │
+    ├── Agent 正在执行的工作流:
+    │     ├── Extend RPC 失败 → 只打日志，不影响执行
+    │     ├── Update RPC 失败 → retryRPC 重试
+    │     ├── Wait RPC 失败 → retryRPC 重试
+    │     └── Done RPC → 新 Server 接收
+    │         ├── checkAgentPermissionByWorkflow() → 验证 agentID
+    │         ├── checkWorkflowState() → 校验 workflow 状态
+    │         └── 正常更新 DB
+    │
+    └── 任务被重新调度给另一个 Agent:
+          ├── 同一任务可能被两个 Agent 同时执行
+          └── 这是已知的竞态问题（下文分析）
+```
+
+#### 类型 D：已完成但 Done 未上报
+
+```
+DB 状态: workflow.State = running (Agent 完成但 Done 未到达)
+队列状态: Task 在 pending 中
+
+恢复:
+    Agent Done RPC 到达 → checkWorkflowState()
+      → workflow 已在 DB 中标记为 running
+      → Done 成功更新为 finished
+      → 同时 pending 中的副本被忽略（DB 幂等）
+```
+
+### 19.4 任务重复执行的竞态问题
+
+**核心问题**：Server 重启后，running 中的任务被重新放入 pending，可能被另一个 Agent 拿到并开始执行。同时，原 Agent 还在执行同一个任务。
+
+```
+时间线:
+  T0: Agent1 执行 Task-A，Server 崩溃
+  T1: Server 重启，Task-A 从 DB 加载到 pending
+  T2: Agent2 通过 Next() 拿到 Task-A，开始执行
+  T3: Agent1 执行完毕，调用 Done() → 更新 DB
+  T4: Agent2 也执行完毕，调用 Done() → checkWorkflowState() 报错
+
+  或者更糟:
+  T3: Agent2 先完成 → Done() 成功
+  T4: Agent1 后完成 → Done() → checkWorkflowState() 报错
+```
+
+**现有缓解措施**：
+1. `checkWorkflowState()` 防止已完成的工作流被再次更新
+2. `checkAgentPermissionByWorkflow()` 验证 agentID（但新 Agent 也获得了合法权限）
+
+**未解决**：没有全局锁或分布式去重机制。Server 重启后的短暂窗口期内，任务可能被重复执行。
+
+### 19.5 持久化队列的 DB 写入时机
+
+| 操作 | DB 写入 | DB 删除 |
+|------|---------|---------|
+| `PushAtOnce` | `store.TaskInsert(task)` | 失败时回滚删除 |
+| `Poll` | - | `store.TaskDelete(task.ID)` |
+| `Error` | - | `store.TaskDelete(id)` |
+| `ErrorAtOnce` | - | `store.TaskDelete(id)` |
+
+**代码** (`server/queue/persistent.go:65-76`)：
+```go
+func (q *persistentQueue) Poll(c context.Context, agentID int64, f FilterFn) (*model.Task, error) {
+    task, err := q.Queue.Poll(c, agentID, f)
+    if task != nil {
+        // 任务被消费，从 DB 删除
+        if deleteErr := q.store.TaskDelete(task.ID); deleteErr != nil {
+            log.Error().Err(deleteErr).Msgf("pull queue item: %s: failed to remove from backup", task.ID)
+        }
+    }
+    return task, err
+}
+```
+
+> ⚠️ **注意**：`Poll` 成功后才从 DB 删除。如果 Server 在 Poll 和 TaskDelete 之间崩溃，任务会同时存在于内存队列和 DB 中。重启后 `TaskList()` 会再次加载它，导致 pending 中出现重复任务。
+
+### 19.6 Server 优雅关闭
+
+Server 收到停止信号后，执行优雅关闭：
+
+**代码** (`server/rpc/serve.go:74-82`)：
+```go
+grpcCtx, cancel := context.WithCancelCause(ctx)
+defer cancel(nil)
+
+go func() {
+    <-grpcCtx.Done()
+    log.Info().Msg("terminating grpc service gracefully")
+    grpcServer.GracefulStop()  // 等待所有进行中的 RPC 完成
+    log.Info().Msg("grpc service stopped")
+}()
+```
+
+**GracefulStop 的行为**：
+1. 停止接受新 RPC 请求
+2. 等待所有进行中的 RPC 完成
+3. 关闭连接
+
+**对 Agent 的影响**：
+- 进行中的 Next/Wait 调用会收到 `Unimplemented` 或 `Canceled` 错误
+- Agent 的 `retryRPC` 会尝试重连，直到 `connectionRetryTimeout` 耗尽
+- 如果 Server 很快重启，Agent 可以无缝恢复
+
+### 19.7 恢复流程总结表
+
+| 任务状态 | DB 状态 | 恢复后队列位置 | 风险 |
+|---------|--------|--------------|------|
+| 等待调度 | pending | pending | 无 |
+| 等待依赖 | pending | pending → filterWaiting 分类 | 无 |
+| 运行中（Agent 仍在执行） | running | pending（重复入队） | 可能重复执行 |
+| 运行中（Agent 已崩溃） | running | pending（正确入队） | 延迟恢复，最多 1 分钟 |
+| 已完成但 Done 未上报 | running | pending | Done 到达时幂等更新 |
+| 已取消 | canceled | 不在 DB | 无 |
+
+---
+
+## 20. 网络分区下的 Agent/Server 状态收敛
+
+本章节分析网络分区（Network Partition）场景下 Agent 和 Server 各自的状态演化，以及分区恢复后的状态收敛行为。
+
+### 20.1 网络分区的分类
+
+根据分区方向和持续时间，分为四种场景：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    网络分区场景                           │
+│                                                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │ 单向:       │  │ 双向:       │  │ 部分分区:   │    │
+│  │ Agent→Server│  │ 完全断开    │  │ 部分Agent   │    │
+│  │ 不通        │  │             │  │ 不通        │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+│                                                         │
+│  ┌─────────────┐                                       │
+│  │ 短暂分区:   │  ← 最常见，通常 < 30s                 │
+│  │ 自动恢复    │                                       │
+│  └─────────────┘                                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 20.2 分区期间的 Agent 端状态演化
+
+分区发生时，Agent 端各个 RPC 的行为：
+
+| RPC | 分区期间行为 | Agent 端状态 |
+|-----|------------|-------------|
+| **Next** (阻塞等待) | `retryRPC` 重试 | Runner 阻塞，等待重连 |
+| **Wait** (阻塞等待) | `retryRPC` 重试 | Wait goroutine 阻塞 |
+| **Extend** (定期续期) | `retryRPC` 重试 | 续期失败，只打日志 |
+| **Update** (状态上报) | `retryRPC` 重试 | 状态暂存在 Agent 内存 |
+| **Log** (日志上报) | 缓冲 → 丢弃 | 日志丢失 |
+| **ReportHealth** (心跳) | `retryRPC` 重试 | Server 端 LastContact 过期 |
+| **Done** (工作流完成) | `retryRPC` 重试 | Agent 已完成但 Server 不知道 |
+
+**Agent 端关键状态**：
+```go
+// agent/runner.go 中的核心 context
+workflowCtx    → WithTimeout(workflow.Timeout) → 不受分区影响，继续倒计时
+cancelWorkflowCtx → Wait() 返回 canceled=true 时触发 → 分区时不会触发
+runnerCtx      → Agent 进程生命周期 → 不受分区影响
+```
+
+**重要**：Agent 的工作流执行 **不依赖** 与 Server 的实时通信。分区期间：
+- 工作流继续执行（受本地 workflowCtx 超时控制）
+- Step 继续运行
+- 日志写入本地容器 stdout（如果 logs channel 满则阻塞容器）
+
+### 20.3 分区期间的 Server 端状态演化
+
+| 状态 | 行为 | 影响 |
+|------|------|------|
+| **队列** | `resubmitExpiredPipelines()` 检测 deadline 过期 | 1 分钟后任务重新入队 |
+| **Agent 记录** | `LastContact` 不更新 | UI 显示 Agent 离线 |
+| **Wait 阻塞** | `entry.done` 不会被关闭 | 等待中的 Wait 持续阻塞 |
+| **PubSub** | 无新事件推送 | 前端页面无更新 |
+
+**Server 端对分区的感知延迟**：
+
+```
+T+0s:  网络分区发生
+T+10s: ReportHealth 失败（但 Server 不主动检测）
+T+60s: Extend 失败 → deadline 过期 → resubmitExpiredPipelines()
+       → 任务重新入队 → 分配给其他 Agent
+T+??:  新 Agent 开始执行同一任务（如果有的话）
+```
+
+### 20.4 双向完全分区的完整时序
+
+```
+Agent                                    Server
+  │                                         │
+  │  [分区发生]                              │
+  │                                         │
+  │  Extend → 失败 (retryRPC 重试)           │
+  │  Update → 失败 (retryRPC 重试)           │
+  │  Log → 失败 (缓冲，最终丢弃)             │
+  │  ReportHealth → 失败 (retryRPC 重试)     │
+  │                                         │  T+60s: deadline 过期
+  │                                         │  resubmitExpiredPipelines()
+  │                                         │  → Task-A 重新入 pending
+  │                                         │
+  │  [工作流继续执行]                        │  → Task-A 分配给 Agent2
+  │  Agent1 仍在执行 Task-A                  │  Agent2 开始执行 Task-A
+  │                                         │
+  │  [工作流完成]                            │
+  │  Done() → retryRPC 重试                  │  Agent2 也在执行 Task-A
+  │  (如果分区仍未恢复，继续重试)              │
+  │                                         │
+  │  [分区恢复]                              │
+  │  Done() 成功                             │
+  │                                         │  Agent2 Done() → 冲突
+  │                                         │  checkWorkflowState() 报错
+```
+
+### 20.5 分区恢复后的状态收敛
+
+分区恢复后，Agent 和 Server 需要从不一致状态收敛到一致。收敛行为取决于分区期间发生了什么：
+
+#### 场景 1：分区短于 TaskTimeout（< 1 分钟）
+
+```
+Agent                                    Server
+  │                                         │
+  │  [分区恢复]                              │
+  │                                         │
+  │  retryRPC 重连成功                       │
+  │  Extend → 成功，续期 deadline            │  deadline 更新，任务仍在 running
+  │  Update → 成功，状态更新到 DB            │  Step 状态更新
+  │  Log → 发送缓冲的日志                    │  日志追加
+  │                                         │
+  │  [收敛结果: 无损恢复]                     │
+  │  所有状态一致，无副作用                   │
+```
+
+**这是最理想的场景**。`retryRPC` 的指数退避保证 Agent 在分区期间持续重试，恢复后立即成功。
+
+#### 场景 2：分区长于 TaskTimeout，但 Agent 工作流未完成
+
+```
+Agent                                    Server
+  │                                         │
+  │  [分区恢复]                              │  Task-A 已被 Agent2 接管
+  │                                         │
+  │  retryRPC 重连成功                       │
+  │  Extend → 返回错误（Agent2 在续期）       │  AgentID 不匹配
+  │  Wait → 可能返回 canceled=true            │  entry.done 已关闭
+  │                                         │
+  │  cancelWorkflowCtx(ErrCancel)            │
+  │  → 工作流被取消                          │
+  │  Done(canceled=true)                     │
+  │                                         │  checkWorkflowState()
+  │                                         │  → workflow 可能已被 Agent2 更新
+  │                                         │  → 幂等或报错
+  │
+  │  [收敛结果: Agent1 工作流被取消]
+  │  Agent2 继续执行，最终 Done()
+```
+
+#### 场景 3：分区长于 TaskTimeout，Agent 工作流已完成
+
+```
+Agent                                    Server
+  │                                         │
+  │  [分区恢复]                              │  Task-A 已被 Agent2 完成
+  │  Done() → retryRPC 重连后发送            │
+  │                                         │  checkWorkflowState()
+  │                                         │  → workflow.State = finished (Agent2 已 Done)
+  │                                         │  → 返回错误 "workflow already finished"
+  │                                         │
+  │  [收敛结果: Agent1 Done 被忽略]
+  │  Task-A 以 Agent2 的结果为准
+  │  Agent1 的中间状态更新（Update/Log）可能丢失
+```
+
+### 20.6 分区期间的数据丢失
+
+| 数据类型 | 是否丢失 | 原因 |
+|---------|---------|------|
+| **Step 状态 (Update)** | 可能丢失 | retryRPC 有重试，但 Permanent error 会放弃 |
+| **日志 (Log)** | 可能丢失 | 缓冲满后丢弃，不无限重试 |
+| **工作流结果 (Done)** | 不丢失 | retryRPC + shutdownCtx 兜底 |
+| **Agent 心跳 (ReportHealth)** | 不影响 | Server 端仅更新 LastContact |
+| **取消信号 (Wait)** | 可能丢失 | 如果 Server 端 entry.done 已关闭，Wait 会返回 canceled=true |
+
+### 20.7 状态收敛的关键保证
+
+| 保证 | 机制 | 限制 |
+|------|------|------|
+| **工作流最终状态不会丢失** | Done 的 retryRPC + shutdownCtx(5s) | 如果 Agent 进程崩溃则丢失 |
+| **任务最终会被执行** | resubmitExpiredPipelines 重新入队 | 可能重复执行 |
+| **Agent 不会永远阻塞** | retryRPC 的 connectionRetryTimeout | 超时后 Agent 退出 |
+| **Server 不会永远占用任务** | deadline 过期后重新入队 | 延迟最多 TaskTimeout |
+| **已完成的工作流不会被覆盖** | checkWorkflowState() 校验 | 重复的 Done 只会报错不会覆盖 |
+
+### 20.8 不保证的场景
+
+| 场景 | 不保证的行为 | 原因 |
+|------|------------|------|
+| **恰好一次执行** | 任务可能被执行两次 | 没有全局去重或分布式锁 |
+| **日志完整性** | 分区期间的日志可能丢失 | Agent 端内存有限 |
+| **状态更新顺序** | Agent1 和 Agent2 的 Update 可能交错 | 没有全局序列号 |
+| **取消信号的实时性** | 分区期间无法传达取消信号 | Wait 依赖 gRPC 连接 |
+| **Agent 负载均衡** | 所有 Agent 可能同时重试 | 无抖动（jitter）机制 |
+
+### 20.9 减少分区影响的运维建议
+
+| 建议 | 实施方式 | 效果 |
+|------|---------|------|
+| **缩短 TaskTimeout** | 修改 `shared/constant/constant.go` 中的值 | 加速死 Agent 检测，但增加 Extend 频率 |
+| **增加 connectionRetryTimeout** | Agent flag `--retry-timeout=0`（无限重试） | Agent 不会因短暂分区退出 |
+| **部署多个 Agent** | 横向扩展 Agent 数量 | 分区影响部分 Agent 时，其他 Agent 仍可工作 |
+| **使用持久化队列** | `WithTaskStore` 默认启用 | Server 重启不丢失 pending 任务 |
+| **配置 Workflow.Timeout** | 合理设置超时时间 | 避免工作流无限运行 |
+| **监控 Agent 连接状态** | Prometheus 抓取 `/healthz` | 及时发现分区 |
+
+
 
 
