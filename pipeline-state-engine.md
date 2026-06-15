@@ -523,3 +523,753 @@ func (q *fifo) updateDepStatusInQueue(taskID string, status model.StatusValue) {
 1. **Created → Blocked**：需要审批
 2. **Created/Pending → Running**：第一个 workflow `Init()` 被调用
 3. **Running → Success/Failure/Killed**：所有 workflow 完成后根据结果计算
+
+---
+
+## 6. Agent 与 Server 的 gRPC 通信链路
+
+### 6.1 连接建立过程
+
+**完整调用链：`cmd/agent/core/agent.go:52-321**
+
+```
+run()
+├─ agent_rpc.Dial(authCtx, cfg)
+│  ├─ grpc.NewClient(serverAddr) → authConn       // 认证连接
+│  ├─ NewAuthGrpcClient(authConn, token, agentID)
+│  ├─ NewAuthInterceptor(authCtx, authClient)      // JWT 自动续签
+│  └─ grpc.NewClient(serverAddr,                  // 业务连接
+│       WithUnaryInterceptor(authInterceptor),
+│       WithStreamInterceptor(authInterceptor))
+│
+├─ agent_rpc.NewGrpcClient(ctx, mainConn,          // 封装 Peer 接口
+│       SetConnectionRetryTimeout(retryTimeout))
+│
+├─ client.Version(ctx)                             // 版本校验
+├─ client.RegisterAgent(ctx, info)                 // 注册 agent
+│
+└─ for i := range maxWorkflows {                   // 每个槽位一个 runner
+     go runner.Run(agentCtx)                       // 持续轮询
+  }
+```
+
+### 6.2 gRPC 服务定义
+
+**代码位置：`rpc/proto/woodpecker.proto:26-38**
+
+```protobuf
+service Woodpecker {
+  rpc Next            (NextRequest)          returns (NextResponse) {}   // 长轮询：拉取下一个 workflow
+  rpc Init            (InitRequest)          returns (Empty) {}         // 通知 workflow 已启动
+  rpc Wait            (WaitRequest)          returns (WaitResponse) {}  // 长轮询：等待取消信号
+  rpc Done            (DoneRequest)          returns (Empty) {}         // 通知 workflow 已完成
+  rpc Extend          (ExtendRequest)        returns (Empty) {}         // 续期 lease
+  rpc Update          (UpdateRequest)        returns (Empty) {}         // 上报步骤状态
+  rpc Log             (LogRequest)           returns (Empty) {}         // 批量发送日志
+  rpc RegisterAgent   (RegisterAgentRequest) returns (RegisterAgentResponse) {}
+  rpc UnregisterAgent (Empty)                returns (Empty) {}
+  rpc ReportHealth    (ReportHealthRequest)  returns (Empty) {}
+}
+```
+
+### 6.3 双层连接架构：Auth + Main
+
+**代码位置：`agent/rpc/dial.go:68-112**
+
+Agent 建立两条 gRPC 连接：
+
+1. **Auth 连接**（`authConn`）：仅用于 `WoodpeckerAuth.Auth` 获取 JWT token
+2. **Main 连接**（`mainConn`）：承载所有业务 RPC，通过 `AuthInterceptor` 自动注入 JWT
+
+```
+┌───────────────────────────────────────────────────┐
+│  Agent                                            │
+│                                                   │
+│  authConn ──→ WoodpeckerAuth.Auth() ──→ JWT      │
+│                        │                          │
+│  AuthInterceptor ◄─────┘  (定时刷新 token)        │
+│       │                                           │
+│  mainConn ──→ [Unary/Stream Interceptor] ──→     │
+│       │        Next / Init / Wait / Done / ...    │
+└───────┼───────────────────────────────────────────┘
+        │ gRPC
+┌───────┼───────────────────────────────────────────┐
+│  Server                                          │
+│  grpc.NewServer(                                 │
+│    StreamInterceptor(authorizer.Stream),          │
+│    UnaryInterceptor(authorizer.Unary),            │
+│    KeepaliveEnforcementPolicy(...)                │
+│  )                                               │
+│  ├─ WoodpeckerAuthServer                         │
+│  └─ WoodpeckerServer ──→ RPC struct              │
+│       ├─ Next()   → scheduler.Poll()             │
+│       ├─ Wait()   → scheduler.Wait()             │
+│       ├─ Init()   → UpdateToStatusRunning()      │
+│       ├─ Done()   → scheduler.Done()/Error()     │
+│       ├─ Update() → UpdateStepStatus()           │
+│       └─ Log()    → LogStore.LogAppend()         │
+└───────────────────────────────────────────────────┘
+```
+
+**Server 端注册流程：`server/rpc/serve.go:55-88**
+
+```go
+func Serve(ctx context.Context, cfg ServeConfig) error {
+    jwtManager := NewJWTManager(cfg.JWTSecret)
+    authorizer := NewAuthorizer(jwtManager)
+
+    grpcServer := grpc.NewServer(
+        grpc.StreamInterceptor(authorizer.StreamInterceptor),
+        grpc.UnaryInterceptor(authorizer.UnaryInterceptor),
+        grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+            MinTime: cfg.KeepaliveMinTime,
+        }),
+    )
+    proto.RegisterWoodpeckerServer(grpcServer, NewWoodpeckerServer(...))
+    proto.RegisterWoodpeckerAuthServer(grpcServer, NewWoodpeckerAuthServer(...))
+
+    grpcServer.Serve(cfg.Listener)
+}
+```
+
+### 6.4 Agent 主循环与 gRPC 调用顺序
+
+**代码位置：`agent/runner.go:63-217 + `cmd/agent/core/agent.go:267-310**
+
+每个 runner 槽位持续执行以下循环：
+
+```
+for {
+    runner.Run(agentCtx)
+    │
+    ├─ 1. client.Next(ctx, filter)          ← 长轮询，阻塞直到获得 workflow
+    │     └─ gRPC Next → scheduler.Poll() → 阻塞等待任务出队
+    │
+    ├─ 2. client.Init(ctx, workflowID, state)  ← 通知 server workflow 已启动
+    │     └─ gRPC Init → UpdateToStatusRunning()
+    │
+    ├─ 3. 并发启动三个后台协程：
+    │     ├─ go client.Wait(ctx, workflowID)     ← 长轮询，监听取消信号
+    │     │     └─ gRPC Wait → scheduler.Wait() → 阻塞直到完成或取消
+    │     │
+    │     ├─ go client.Extend(ctx, workflowID)   ← 每 TaskTimeout/3 续期一次
+    │     │     └─ gRPC Extend → scheduler.Extend() → 更新 deadline
+    │     │
+    │     └─ pipeline_runtime.New(...).Run()     ← 执行工作流
+    │        ├─ traceStep(started) → client.Update()
+    │        ├─ traceStep(running) → client.Update()
+    │        └─ traceStep(finished) → client.Update()
+    │
+    ├─ 4. client.Done(ctx, workflowID, state)   ← 通知 server workflow 已完成
+    │     └─ gRPC Done → scheduler.Done()/Error()
+    │
+    └─ 如果 ErrConnectionLost → 关闭整个 agent
+       其他错误 → 等待 5s 后继续轮询
+}
+```
+
+### 6.5 gRPC 消息流与状态变更对应关系
+
+| gRPC 方法 | 方向 | 触发时机 | 引发的状态变更 |
+|-----------|------|---------|--------------|
+| **Next** | Agent → Server | runner 循环开头 | 无（仅出队，状态仍为 Pending） |
+| **Init** | Agent → Server | workflow 开始执行 | Pipeline: Pending→Running, Workflow: Pending→Running |
+| **Wait** | Agent → Server | 并发监听 | 无（阻塞等待 Done/Cancel） |
+| **Extend** | Agent → Server | 每 TaskTimeout/3 | 仅更新 queue deadline，无数据库变更 |
+| **Update** | Agent → Server | 每次 traceStep | Step: Pending→Running→Success/Failure/Killed |
+| **Done** | Agent → Server | workflow 执行结束 | Workflow→终态, Pipeline 汇总, Queue 清理 |
+| **Log** | Agent → Server | 步骤日志产出 | 无状态变更，写入 LogStore + pubsub |
+
+---
+
+## 7. 队列出队的 Retry / Backoff 机制
+
+### 7.1 三层 retry 架构总览
+
+```
+┌────────────────────────────────────────────────────────┐
+│  Layer 1: Agent gRPC Retry (backoff/v5)                │
+│  位置: agent/rpc/client_grpc.go retryRPC()             │
+│  作用: 网络层重试，处理 gRPC 连接抖动                     │
+│  参数: InitialInterval=10ms, MaxInterval=10s            │
+│        MaxElapsedTime=connectionRetryTimeout(可配置)     │
+├────────────────────────────────────────────────────────┤
+│  Layer 2: Queue Lease / Expiry (FIFO 内存队列)          │
+│  位置: server/queue/fifo.go resubmitExpiredPipelines() │
+│  作用: 检测 agent 失联，将过期 running 任务重新入队        │
+│  参数: TaskTimeout=1min (deadline 续期)                  │
+├────────────────────────────────────────────────────────┤
+│  Layer 3: Persistent Queue (数据库持久化)                │
+│  位置: server/queue/persistent.go WithTaskStore()       │
+│  作用: Server 重启后从数据库恢复未完成任务                  │
+└────────────────────────────────────────────────────────┘
+```
+
+### 7.2 Layer 1: gRPC 指数退避重试
+
+**代码位置：`agent/rpc/client_grpc.go:98-166**
+
+```go
+func (c *client) retryOpts(op string) []backoff.RetryOption {
+    b := backoff.NewExponentialBackOff()
+    b.MaxInterval = 10 * time.Second
+    b.InitialInterval = 10 * time.Millisecond
+    return []backoff.RetryOption{
+        backoff.WithBackOff(b),
+        backoff.WithMaxElapsedTime(c.connectionRetryTimeout),
+        backoff.WithNotify(notify),
+    }
+}
+```
+
+**错误分类策略 (`client_grpc.go:171-193`)**：
+
+```go
+func classifyRPCErr(ctx context.Context, err error) error {
+    switch status.Code(err) {
+    case codes.Canceled:
+        if ctx.Err() != nil {
+            return backoff.Permanent(ctx.Err())  // 自己的 ctx 取消 → 永久终止
+        }
+        return backoff.Permanent(err)            // 服务端取消 → 永久终止
+    case codes.Aborted, codes.DataLoss,
+         codes.DeadlineExceeded, codes.Internal,
+         codes.Unavailable:
+        return err                               // 可重试错误 → 继续重试
+    default:
+        return backoff.Permanent(err)            // 其他错误 → 永久终止
+    }
+}
+```
+
+**可重试 vs 永久终止的 gRPC 状态码**：
+
+| gRPC Code | 行为 | 说明 |
+|-----------|------|------|
+| `Canceled` | **Permanent** | 除非是自身 ctx 取消，否则不重试 |
+| `Unavailable` | **Retry** | 服务端不可达，核心重试场景 |
+| `DeadlineExceeded` | **Retry** | 超时，可能是暂时的 |
+| `Aborted` | **Retry** | 事务冲突，可重试 |
+| `DataLoss` | **Retry** | 数据丢失，尝试恢复 |
+| `Internal` | **Retry** | 服务端内部错误，可能恢复 |
+| `NotFound/PermissionDenied/...` | **Permanent** | 不可恢复，停止重试 |
+
+**重试终止条件 (`client_grpc.go:143-166`)**：
+
+```go
+func retryRPC[T any](ctx context.Context, c *client, opName string, op backoff.Operation[T]) (T, error) {
+    res, err := backoff.Retry(ctx, op, c.retryOpts(opName)...)
+    
+    // 1. ctx 被取消 → 返回零值+nil（吞掉错误，由上层判断）
+    if ctxErr := context.Cause(ctx); ctxErr != nil && errors.Is(err, ctxErr) {
+        return zero, nil
+    }
+    // 2. connectionRetryTimeout 耗尽且仍断连 → ErrConnectionLost
+    if errors.Is(err, errNotConnected) {
+        return zero, ErrConnectionLost
+    }
+    // 3. 其他永久错误 → 直接返回
+    return zero, err
+}
+```
+
+**ErrConnectionLost 的处理 (`cmd/agent/core/agent.go:278-283`)**：
+
+```go
+for {
+    if err := runner.Run(agentCtx); err != nil {
+        if errors.Is(err, agent_rpc.ErrConnectionLost) {
+            ctxCancel(err)   // 关闭整个 agent
+            return nil
+        }
+        // 其他错误 → 等待 5s 后继续
+        time.Sleep(time.Second * 5)
+    }
+}
+```
+
+### 7.3 Layer 2: Queue Lease 与过期重提交
+
+**核心配置 (`shared/constant/constant.go:40-41`)**：
+
+```go
+var TaskTimeout = time.Minute  // running 任务的默认 lease 时长
+```
+
+**Lease 续期机制（双向保障）**：
+
+**Agent 端**（`agent/runner.go:134-148`）：
+```go
+go func() {
+    for {
+        select {
+        case <-workflowCtx.Done():
+            return
+        case <-time.After(constant.TaskTimeout / 3):  // 每 20s 续期一次
+            r.client.Extend(workflowCtx, workflow.ID)
+        }
+    }
+}()
+```
+
+**Server 端**（`server/queue/fifo.go:186-200`）：
+```go
+func (q *fifo) Extend(_ context.Context, agentID int64, taskID string) error {
+    state, ok := q.running[taskID]
+    if ok && state.item.AgentID == agentID {
+        state.deadline = time.Now().Add(q.extension)  // 重置 deadline
+        return nil
+    }
+    return ErrNotFound
+}
+```
+
+**过期重提交（`server/queue/fifo.go:338-348`）**：
+
+```go
+func (q *fifo) resubmitExpiredPipelines() {
+    for taskID, taskState := range q.running {
+        if time.Now().After(taskState.deadline) {
+            log.Info().Msgf("queue: resubmitting expired task %s", taskID)
+            taskState.error = ErrTaskExpired
+            q.pending.PushFront(taskState.item)   // 重新放回 pending 队列前端
+            delete(q.running, taskID)
+            close(taskState.done)                  // 通知 Wait() 返回
+        }
+    }
+}
+```
+
+**过期重提交流程图**：
+
+```
+                    Agent 正常                        Agent 失联
+                    ─────────                       ─────────────
+Task 出队          │                                │
+→ running[id]      │                                │
+deadline=now+1m    │                                │
+                    │                                │
+    ┌─────┐        │                                │
+    │20s  │ Extend()│                                │
+    │     ├───────►│ deadline = now + 1m             │
+    │     │        │                                │ deadline 到期
+    │40s  │ Extend()│                                │ (无 Extend)
+    │     ├───────►│ deadline = now + 1m             │ ↓
+    │     │        │                                │ resubmitExpired()
+    │60s  │ Extend()│                                │ pending.PushFront(task)
+    │     ├───────►│ deadline = now + 1m             │ delete(running, id)
+    └─────┘        │                                │ close(entry.done)
+                   │                                │
+                   │                                │ → Wait() 返回 ErrTaskExpired
+                   │                                │ → 新 Agent Poll() 可获取此任务
+```
+
+### 7.4 Layer 3: Persistent Queue（服务端重启恢复）
+
+**代码位置：`server/queue/persistent.go:32-111`
+
+```go
+func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
+    tasks, _ := s.TaskList()          // 从数据库加载所有未完成任务
+    q.PushAtOnce(ctx, tasks)          // 重新推入内存队列
+    return &persistentQueue{q, s}
+}
+```
+
+**持久化包装器的关键方法**：
+
+| 方法 | 行为 | 持久化操作 |
+|------|------|-----------|
+| `PushAtOnce` | 入队时同步写入数据库 | `store.TaskInsert(task)` |
+| `Poll` | 出队时从数据库删除 | `store.TaskDelete(task.ID)` |
+| `Error` | 错误完成时从数据库删除 | `store.TaskDelete(id)` |
+| `ErrorAtOnce` | 批量错误时批量删除 | `store.TaskDelete(id)` × N |
+
+**恢复场景**：
+1. Server 正常运行时，内存队列（`fifo`）是主存储，数据库是备份
+2. Server 重启时，`WithTaskStore()` 从数据库加载所有 task，重建内存队列
+3. Agent 重新 Poll 后获取这些 task，实现无缝恢复
+
+---
+
+## 8. Canceled 状态清理的完整调用栈
+
+### 8.1 取消触发入口
+
+取消流水线有三种触发来源：
+
+#### 入口 1: 用户 API 请求
+
+**代码位置：`server/api/pipeline.go:475-500**
+
+```
+HTTP DELETE /api/repos/{repo}/pipelines/{number}/cancel
+    │
+    └─ CancelPipeline(c *gin.Context)
+        └─ pipeline.Cancel(ctx, forge, store, repo, user, pl, &model.CancelInfo{
+               CanceledByUser: user.Login,
+           })
+```
+
+#### 入口 2: 步骤失败触发取消
+
+**代码位置：`server/pipeline/step_status.go:129-152`
+
+```
+UpdateStepStatus(ctx, store, step, state)
+    │
+    ├─ CalcStepStatus() → cancelPipelineFromStep = true
+    │  (当 step.Failure == model.FailureCancel)
+    │
+    └─ cancelPipelineFromStep(ctx, store, step)
+        └─ Cancel(ctx, forge, store, repo, repoUser, pipeline, &model.CancelInfo{
+               CanceledByStep: step.Name,
+           })
+```
+
+#### 入口 3: 新流水线替换旧流水线
+
+**代码位置：`server/pipeline/cancel.go:100-159`
+
+```
+start() → cancelPreviousPipelines(ctx, forge, store, pipeline, repo, user)
+    │
+    └─ for _, active := range activeBuilds {
+           if pipelineNeedsCancel(active) {
+               Cancel(ctx, forge, store, repo, user, active, &model.CancelInfo{
+                   SupersededBy: pipeline.Number,
+               })
+           }
+       }
+```
+
+### 8.2 Cancel 函数完整执行流程
+
+**代码位置：`server/pipeline/cancel.go:32-98**
+
+```
+Cancel(ctx, forge, store, repo, user, pipeline, cancelInfo)
+│
+│  前置检查: pipeline.Status 必须是 Running/Pending/Blocked
+│
+├─ 1. 队列层面：批量驱逐任务
+│     workflowsToCancel = [所有 Running/Pending 的 workflow ID]
+│     server.Config.Services.Scheduler.ErrorAtOnce(ctx, workflowsToCancel, queue.ErrCancel)
+│     │
+│     └─ fifo.ErrorAtOnce() → fifo.finished(ids, StatusKilled, ErrCancel)
+│         ├─ 对 running 中的任务: close(entry.done) → Wait() 返回 ErrCancel
+│         ├─ 对 pending/waiting 中的任务: removeFromPendingAndWaiting()
+│         └─ updateDepStatusInQueue(id, StatusKilled) → 传播依赖状态
+│
+├─ 2. 数据库层面：更新 workflow/step 状态
+│     for _, workflow := range workflows {
+│         if workflow.State == StatusPending {
+│             UpdateWorkflowToStatusSkipped(store, workflow)
+│             → workflow.State = StatusSkipped
+│         }
+│         for _, step := range workflow.Children {
+│             if step.State == StatusPending {
+│                 UpdateStepToStatusSkipped(store, step, 0, StatusCanceled)
+│                 → step.State = StatusCanceled
+│             }
+│         }
+│     }
+│
+├─ 3. 数据库层面：更新 pipeline 状态
+│     if hasPendingOnly {
+│         plState = StatusCanceled    // 全部是 pending → canceled
+│     } else {
+│         plState = StatusKilled      // 有 running → killed
+│     }
+│     UpdateToStatusKilled(store, pipeline, cancelInfo, plState)
+│     → pipeline.Status = plState
+│     → pipeline.Finished = now
+│     → pipeline.CancelInfo = cancelInfo
+│
+├─ 4. 通知 Forge
+│     updatePipelineStatus(ctx, forge, killedPipeline, repo, user)
+│
+└─ 5. 通知 PubSub
+      publishToTopic(ctx, killedPipeline, repo)
+```
+
+### 8.3 Agent 端的取消检测与清理
+
+**代码位置：`agent/runner.go:117-131`
+
+```
+// 并发监听取消信号
+go func() {
+    canceled, err := r.client.Wait(workflowCtx, workflow.ID)
+    if canceled {
+        cancelWorkflowCtx(pipeline_errors.ErrCancel)  // 取消 workflow 上下文
+    }
+}()
+```
+
+**取消信号在 Agent 端的传播路径**：
+
+```
+Server: Cancel() → ErrorAtOnce() → close(entry.done)
+    │
+    │  (Wait() 返回 ErrCancel)
+    ↓
+Agent: client.Wait() → canceled = true
+    │
+    ├─ cancelWorkflowCtx(pipeline_errors.ErrCancel)
+    │     │
+    │     ├─ workflowCtx 被取消
+    │     │     │
+    │     │     ├─ completeStep() 检测到 context.Canceled
+    │     │     │     → waitState.Error = pipeline_errors.ErrCancel
+    │     │     │     → traceStep() → Canceled=true
+    │     │     │
+    │     │     └─ workflow.Run() 返回 ErrCancel
+    │     │
+    │     └─ extend 协程退出（workflowCtx.Done()）
+    │
+    └─ Runner 主循环:
+          state.Canceled = true
+          state.Error = "cancel"
+          client.Done(doneCtx, workflow.ID, state)
+              │
+              ↓
+          Server: RPC.Done()
+              ├─ workflow.Failing() → scheduler.Error()
+              ├─ !state.Canceled → scheduler.Done(id, workflow.State)
+              └─ state.Canceled:
+                    ├─ Started > 0 → scheduler.Done(id, StatusKilled)
+                    └─ Started == 0 → scheduler.Done(id, StatusCanceled)
+```
+
+### 8.4 Workflow Done 的取消分支
+
+**代码位置：`server/rpc/rpc.go:356-369**
+
+```go
+var queueErr error
+if !state.Canceled {
+    if workflow.Failing() {
+        queueErr = s.scheduler.Error(c, strWorkflowID, ...)
+    } else {
+        queueErr = s.scheduler.Done(c, strWorkflowID, workflow.State)
+    }
+} else {
+    if workflow.Started > 0 {
+        queueErr = s.scheduler.Done(c, strWorkflowID, model.StatusKilled)
+    } else {
+        queueErr = s.scheduler.Done(c, strWorkflowID, model.StatusCanceled)
+    }
+}
+```
+
+**关键区分**：
+- `StatusKilled`：已启动的 workflow 被取消（Running → Killed）
+- `StatusCanceled`：未启动的 workflow 被取消（Pending → Canceled）
+
+### 8.5 取消后仍需完成的清理工作
+
+**代码位置：`server/rpc/rpc.go:536-548**
+
+```go
+func (s *RPC) completeChildrenIfParentCompleted(completedWorkflow *model.Workflow, finished int64) {
+    for _, c := range completedWorkflow.Children {
+        if c.Running() {
+            // 仍在运行的子步骤（如 service 容器）标记为 Killed
+            pipeline.UpdateStepToStatusSkipped(s.store, *c, finished, model.StatusKilled)
+        }
+    }
+}
+```
+
+**日志流清理**（`server/rpc/rpc.go:388-396`）：
+
+```go
+go func() {
+    for _, step := range workflow.Children {
+        if step.State != model.StatusSkipped {
+            s.logger.Close(c, step.ID)   // 关闭日志流
+        }
+    }
+}()
+```
+
+### 8.6 Step 状态上报的安全检查
+
+**代码位置：`server/rpc/sanitize.go:97-119**
+
+```go
+func checkWorkflowAllowsStepUpdate(workflowState model.StatusValue, step *model.Step, state rpc.StepState) error {
+    // 活跃状态的 workflow 允许任何 step 更新
+    if isActiveState(workflowState) {   // Created/Pending/Running
+        return nil
+    }
+    // 已终止的 workflow 只允许 step 转换到终态
+    newStep, _, err := pipeline.CalcStepStatus(*step, state)
+    if isDoneState(newStep.State) {     // Success/Failure/Killed/Canceled/Skipped/Error/Declined
+        return nil
+    }
+    return ErrAgentIllegalWorkflowReRunStateChange
+}
+```
+
+**这确保了**：即使 workflow 已被 cancel，agent 仍然可以上报步骤的最终状态（如 `Killed`），但绝不允许将已终止的步骤重新变回 `Running`。
+
+---
+
+## 9. 状态合并与优先级机制
+
+### 9.1 状态优先级
+
+**代码位置：`server/pipeline/status.go:20-44**
+
+```go
+var statusPriorityOrder = []model.StatusValue{
+    model.StatusDeclined,    // 0 - 最高优先级
+    model.StatusBlocked,     // 1
+    model.StatusCreated,     // 2
+    model.StatusError,       // 3
+    model.StatusKilled,      // 4
+    model.StatusCanceled,    // 5
+    model.StatusRunning,     // 6
+    model.StatusPending,     // 7
+    model.StatusFailure,     // 8
+    model.StatusSuccess,     // 9
+    model.StatusSkipped,     // 10 - 最低优先级
+}
+```
+
+### 9.2 MergeStatusValues 规则
+
+**代码位置：`server/pipeline/status.go:56-69**
+
+```go
+func MergeStatusValues(s, t model.StatusValue) model.StatusValue {
+    // 两个都是 canceled → canceled
+    if s == StatusCanceled && t == StatusCanceled {
+        return StatusCanceled
+    }
+    // 只有一个 canceled → 升级为 killed（因为已经有 workflow 在运行）
+    if s == StatusCanceled { s = StatusKilled }
+    if t == StatusCanceled { t = StatusKilled }
+    // 取优先级更高的（索引更小的）
+    return statusPriorityOrder[min(priorityMap[s], priorityMap[t])]
+}
+```
+
+**合并示例**：
+
+| Workflow A | Workflow B | Pipeline 结果 | 说明 |
+|-----------|-----------|-------------|------|
+| Success | Failure | **Failure** | 有一个失败则整体失败 |
+| Success | Killed | **Killed** | 被取消优先于成功 |
+| Canceled | Canceled | **Canceled** | 全部未启动即取消 |
+| Canceled | Failure | **Killed** | 部分运行过，取消视为 killed |
+| Running | Success | **Running** | 仍在运行 |
+| Error | Success | **Error** | 系统错误优先级最高 |
+| Skipped | Skipped | **Skipped** | 全部跳过 |
+
+### 9.3 Pipeline 最终状态计算
+
+**代码位置：`server/pipeline/pipeline_status.go:27-35 + `server/rpc/rpc.go:379-383**
+
+```go
+// PipelineStatus 遍历所有 workflow，合并得到最终状态
+func PipelineStatus(workflows []*model.Workflow) model.StatusValue {
+    status := model.StatusSuccess
+    for _, p := range workflows {
+        status = MergeStatusValues(status, p.State)
+    }
+    return status
+}
+
+// Done() 中判断是否所有 workflow 都已完成
+if !model.IsThereRunningStage(currentPipeline.Workflows) {
+    pipeline.UpdateStatusToDone(store, *currentPipeline,
+        pipeline.PipelineStatus(currentPipeline.Workflows),
+        workflow.Finished)
+}
+```
+
+---
+
+## 10. 全链路时序图（含 gRPC + Retry + Cancel）
+
+```
+Agent                                 Server
+  │                                     │
+  │ ══════ 连接建立 ══════              │
+  │                                     │
+  │  Dial() → authConn + mainConn      │
+  │  Version() ──────────────────────►  │  版本校验
+  │  RegisterAgent() ───────────────►   │  注册 agent
+  │                                     │
+  │ ══════ 工作流执行 ══════           │
+  │                                     │
+  │  Next(filter) ──────────────────►   │  scheduler.Poll() 阻塞
+  │        ◄────────────────────────    │  出队后返回 workflow
+  │                                     │
+  │  Init(id, state) ───────────────►   │  Pipeline: Pending→Running
+  │                                     │  Workflow: Pending→Running
+  │                                     │
+  │  ┌─ Wait(id) ───────────────────►   │  阻塞，监听取消
+  │  │                                   │
+  │  ├─ Extend(id) ────────────────►    │  每 20s 续期 lease
+  │  │  Extend(id) ────────────────►    │
+  │  │  ...                             │
+  │  │                                   │
+  │  └─ [执行步骤]                       │
+  │     Update(id, stepState) ──────►   │  Step: Pending→Running
+  │     Update(id, stepState) ──────►   │  Step: Running→Success
+  │     ...                             │
+  │                                     │
+  │ ══════ 正常完成 ══════             │
+  │                                     │
+  │  Done(id, state) ───────────────►   │  scheduler.Done(id, StatusSuccess)
+  │                                     │  Workflow: → Success
+  │                                     │  Pipeline: 汇总所有 workflow
+  │                                     │  → 最终状态
+  │                                     │
+  │ ══════ 取消场景 ══════             │
+  │                                     │
+  │                       [API: CancelPipeline()] 
+  │                       Cancel() → ErrorAtOnce(ids, ErrCancel)
+  │                                     │  └─ close(entry.done)
+  │                                     │     └─ Wait() 返回 ErrCancel
+  │  ◄── Wait() canceled=true ──────   │
+  │                                     │
+  │  cancelWorkflowCtx(ErrCancel)       │
+  │  └─ 步骤检测到 ctx 取消            │
+  │     └─ traceStep(canceled)          │
+  │  Update(id, {canceled:true}) ───►   │  Step: → Killed
+  │                                     │
+  │  Done(id, {canceled:true}) ─────►   │  scheduler.Done(id, StatusKilled)
+  │                                     │  Workflow: → Killed
+  │                                     │  Pipeline: → Killed
+  │                                     │
+  │ ══════ Agent 失联场景 ══════       │
+  │                                     │
+  │  [网络断开，Extend 停止]             │
+  │                                     │
+  │                       [1min 后 deadline 过期]
+  │                       resubmitExpiredPipelines()
+  │                       └─ pending.PushFront(task)
+  │                       └─ delete(running, id)
+  │                       └─ close(entry.done)
+  │                                     │
+  │                       [新 Agent Poll() 获得该任务]
+  │                       Next() → 返回同一 workflow
+  │                                     │
+  │ ══════ gRPC 重试场景 ══════        │
+  │                                     │
+  │  Update() ──────► Unavailable       │
+  │  10ms 后重试 ──────► Unavailable    │
+  │  20ms 后重试 ──────► Unavailable    │
+  │  40ms 后重试 ──────► ...            │
+  │  (指数退避直到 10s 上限)             │
+  │  成功 ─────────────────────────►    │
+  │                                     │
+  │  [若 connectionRetryTimeout 耗尽]    │
+  │  → ErrConnectionLost               │
+  │  → 整个 agent 关闭                  │
+```
