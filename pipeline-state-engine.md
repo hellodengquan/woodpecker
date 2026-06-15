@@ -1273,3 +1273,686 @@ Agent                                 Server
   │  → ErrConnectionLost               │
   │  → 整个 agent 关闭                  │
 ```
+
+---
+
+## 11. Agent 心跳与重连机制
+
+### 11.1 双重心跳：HTTP 服务端/客户端监控
+
+#### 11.1.1 本地 HTTP Healthcheck（Dockerflow 协议）
+
+**代码位置：`cmd/agent/core/health.go:35-104`**
+
+Agent 在启动时（`runWithRetry` → `initHealth()`）注册三个 HTTP 端点：
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  HTTP Server（默认 :3000                                    │
+│                                                         │
+│  GET /healthz   → handleHeartbeat()                   │
+│     └─ counter.Healthy()                               │
+│        200 OK  /  500 Internal Server Error       │
+│                                                         │
+│  GET /version   → handleVersion()                         │
+│     └─ 返回 JSON: {source, version}                      │
+│                                                         │
+│  GET /varz   → handleStats()                            │
+│     ├─ Healthy() 检查 + 返回统计信息                     │
+│     └─ counter.WriteTo(w) 输出 JSON 统计                  │
+│                                                         │
+└───────────────────────────────────────────────────────────┘
+```
+
+**健康检查核心——`agent/state.go`的判定逻辑**：
+
+- `counter.Healthy()` 基于统计数据汇总所有 runner 工作流数量判断。
+
+#### 11.1.2 gRPC ReportHealth 心跳（Agent → Server
+
+**代码位置：`cmd/agent/core/agent.go:47-49, 245-264`**
+
+```go
+const reportHealthInterval = time.Second * 10  // 每 10 秒报告一次
+```
+
+Agent 启动后在一个独立 goroutine 内持续上报：
+
+```go
+go func() {
+    for {
+        err := client.ReportHealth(grpcCtx)
+        if err != nil {
+            if grpcCtx.Err() != nil || agentCtx.Err() != nil {
+                return nil   // context 取消则退出
+            }
+        }
+        select {
+        case <-agentCtx.Done():
+            return nil
+        case <-time.After(reportHealthInterval):   // 10s
+        }
+    }
+}()
+```
+
+**gRPC 客户端实现**（`agent/rpc/client_grpc.go:431-442）：
+
+```go
+func (c *client) ReportHealth(ctx context.Context) error {
+    req := &proto.ReportHealthRequest{Status: "I am alive!"}
+    return retryRPC(ctx, c, "report_health", func() (*proto.Empty, error) {
+        if !c.IsConnected() {
+            return nil, errNotConnected
+        }
+        r, err := c.client.ReportHealth(ctx, req)
+        return r, classifyRPCErr(ctx, err)
+    })
+}
+```
+
+**Server 端处理**（`server/rpc/rpc.go:520-534`
+
+```go
+func (s *RPC) ReportHealth(ctx context.Context, status string) error {
+    agent, _ := s.getAgentFromContext(ctx)
+    if status != "I am alive!" {
+        return errors.New("Are you alive?")
+    }
+    agent.LastContact = time.Now().Unix()
+    return s.store.AgentUpdate(agent)
+}
+```
+
+**心跳作用总结表**：
+
+| 机制 | 方向 | 频率 | 作用 |
+|--------|------|------|------|
+| HTTP Health | 外部→Agent | 按需 | Kubernetes/容器健康检查，决定是否重启 |
+| ReportHealth gRPC | Agent→Server | 每 10s | 更新数据库 Agent 表的 LastContact 字段 |
+| Extend gRPC | Agent→Server | 每 20s | 续期队列 lease |
+| gRPC Keepalive | 双向 | 配置化 | 底层 TCP 保活 |
+
+### 11.2 Agent ID 持久化与重连（崩溃重启重用 Agent 崩溃循环重连策略
+
+**代码位置：`cmd/agent/core/agent.go:128-135, 222-226
+
+Agent 启动时通过 `agent-config` 持久化自己的 ID：
+
+```
+┌─────── 首次启动 ─────────────────────────────────────────────┐
+│                                                         │
+│  1. grpcClientCtx, ... Dial(grpcClientCtx, DialConfig{│
+│        AgentID: agentConfig.AgentID (初次 = 0)             │
+│                                                         │
+│     └─ Auth 阶段：如果 AgentID == 0  → 自动创建新      │
+│        服务端：AgentCreate() → 返回新 agent.ID             │
+│                                                         │
+│  2. RegisterAgent() → 更新：Platform/Backend/Capacity/Version  │
+│        └─ store.AgentUpdate(agent)                       │
+│                                                         │
+│  3. Persist agent ID 到本地文件：                         │
+│     agentConfig.AgentID = agentConn.AgentID               │
+│     writeAgentConfig(agentConfig, agentConfigPath)        │
+│     agentConfigPersisted.Store(true)                      │
+│                                                         │
+└───────────────────────────────────────────────────────────┘
+
+┌─────── 崩溃重启 ─────────────────────────────────────┐
+│                                                         │
+│  1. 读取 agentConfigPath → 读出上次持久化的 AgentID       │
+│                                                         │
+│  2. Dial() 时携带已有 AgentID                         │
+│     → Auth 阶段：                                                        │
+│        服务端：AgentFind(agentID)                          │
+│        ├─ 存在 → 复用原 ID，不会在数据库里新建          │
+│        └─ 不存在 → 自动创建新 ID（避免 leak 旧 agent             │
+│                                                         │
+│  3. RegisterAgent() → 更新 agent 最新信息             │
+│                                                         │
+│  4. agentConfigPersisted = true → 优雅关闭时不会 Unregister   │
+│                                                         │
+└───────────────────────────────────────────────────────────┘
+```
+
+**关键配置选项**：
+- `agentConfigPersisted == true 的 Agent：关闭时 Unregister，重启后数据库保留 ID
+- `agentConfigPersisted == false` 的无状态 Agent：关闭时 Unregister，彻底删除
+
+**Agent→ 1.3 连接失败重连架构
+
+**代码位置：`cmd/agent/core/agent.go:323-344
+
+```go
+func runWithRetry(backendEngines []types.Backend) func(...) error {
+    retryCount := c.Int("connect-retry-count")
+    retryDelay := c.Duration("connect-retry-delay")
+    for range retryCount {
+        if err = run(ctx, c, backendEngines); status.Code(err) == codes.Unavailable {
+            log.Warn().Err(err).Msg(...)
+            time.Sleep(retryDelay)          // 线性等待
+        } else {
+            break
+        }
+    }
+    return err
+}
+```
+
+**三层重连层级**：
+
+```
+                    ┌───────────────────────────────────────────────┐
+│ Layer 1: runWithRetry()                               │
+│  位置: cmd/agent/core/agent.go:323-344                  │
+│  触发: run() 返回 codes.Unavailable                    │
+│  策略: 固定间隔 retryDelay，次数: retryCount 次          │
+│  作用: 整个 agent 全量重启（重新 Dial/Register/Runner）        │
+│                                                         │
+│  （codes.Unavailable    │
+│  └── 非 Unavailable → 停止（Version 版本不兼容等 fatal         │
+│                                                         │
+├───────────────────────────────────────────────────────────────┤
+│ Layer 2: retryRPC()                                    │
+│  位置: agent/rpc/client_grpc.go:143-166                 │
+│  触发: 每个 RPC 调用（Next/Init/Update/Done/...            │
+│  策略: 指数退避 10ms→10s，MaxElapsedTime           │
+│  作用: 单次 RPC 重试                                    │
+│                                                         │
+│  ctx 取消        → 不重试，返回零值                          │
+│  MaxElapsed 耗尽且仍未连接 → ErrConnectionLost          │
+│  其他永久错误           → 返回原始错误                          │
+│                                                         │
+├───────────────────────────────────────────────────────────────┤
+│ Layer 3: Runner 循环                                    │
+│  位置: cmd/agent/core/agent.go:272-309                  │
+│  触发: runner.Run() 返回非 ErrConnectionLost 的普通错误     │
+│  策略: 等待 5s 后继续循环                           │
+│  作用: 单个 runner 槽位重试                            │
+│                                                         │
+│  ErrConnectionLost → 触发 ctxCancel → 整个 agent 关闭        │
+│  singleWorkflow=true → ctxCancel                    │
+│  其他错误       → sleep 5s，继续下一次循环           │
+│                                                         │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 11.4 优雅关闭：Unregister 流程
+
+**代码位置：`cmd/agent/core/agent.go:200-220
+
+```go
+serviceWaitingGroup.Go(func() error {
+    defer grpcClientCtxCancel(nil)
+    <-agentCtx.Done()
+
+    if !agentConfigPersisted.Load() {  // 无状态 agent
+        if client.IsConnected() {
+            client.UnregisterAgent(grpcClientCtx)
+            // UnregisterAgent()
+        }
+    }
+    return nil
+})
+```
+
+Server 端处理 `cmd/server/rpc/rpc.go:504-515`：
+
+```go
+func (s *RPC) UnregisterAgent(ctx context.Context) error {
+    agent, _ := s.getAgentFromContext(ctx)
+    server.Config.Services.Scheduler.Queue.RemoveAgent(agent.ID)
+    return s.store.AgentDelete(agent)
+}
+```
+
+---
+
+## 12. Dead Letter 落盘：重试失败后的日志持久化机制
+
+### 12.1 Agent 端日志批量处理架构
+
+**代码位置：`agent/rpc/client_grpc.go:340-409`
+
+Agent 端不做日志不直接发送到 `logs := make(chan *proto.LogEntry, 10) 通道，由后台 goroutine 合并批量发送：
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Agent 端日志管道                          │
+│                                                          │
+│  pipeline.Logger(step, rc) ──→ 后端日志流             │
+│        │                                                  │
+│        │  每条日志行                              │
+│        ▼                                                  │
+│  EnqueueLog(logEntry)  ──→ c.logs channel (缓冲 10     │
+│        │                                                  │
+│        ▼                                                  │
+│  processLogs(ctx)                               │
+│        │                                                  │
+│        ├─ 触发 1：bytes >= maxLogBatchSize (1 MiB)    │
+│        ├─ 触发 2：time.After(maxLogFlushPeriod (1s)     │
+│        ├─ 触发 3：ctx.Done() / channel 关闭               │
+│        │                                                  │
+│        ▼                                                  │
+│  sendLogs(ctx, entries) → retryRPC("log")                   │
+│        │                                                  │
+│        ├─ 指数退避重试                                     │
+│        └─ 重试耗尽：log.Error()     丢弃                │
+│                                                          │
+│  ⚠️ 关键: 即使 sendLogs 失败后 entries[:0]            │
+│     （注释：even if send failed, we don't have infinite memory│
+│                retry has already been used                         │
+│                                                          │
+└────────────────────────────────────────────────────────────┘
+```
+
+**processLogs 的实现细节**：
+
+```go
+func (c *client) processLogs(ctx context.Context) {
+    var entries []*proto.LogEntry
+    var bytes int
+    send := func() {
+        if len(entries) == 0 { return }
+        if err := c.sendLogs(ctx, entries); err != nil {
+            log.Error().Err(err)
+        }
+        // 即使失败也清空内存！
+        entries = entries[:0]
+        bytes = 0
+    }
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case entry, ok := <-c.logs:
+            entries = append(entries, entry)
+            bytes += grpc_proto.Size(entry)
+            if bytes >= maxLogBatchSize { send() }
+        case <-time.After(maxLogFlushPeriod):
+            send()
+        }
+    }
+}
+```
+
+### 12.2 Server 端日志落盘：内存广播 + 持久化双通道
+
+**代码位置：`server/rpc/rpc.go:415-475
+
+Server 收到 `RPC.Log() 使用双通道写入：
+
+```
+RPC.Log(c, stepUUID, rpcLogEntries)
+    │
+    │  ┌───────────────────────────────────────────────────┐
+    │  安全检查:                              │
+    │  - Step 存在性检查                   │
+    │  - Agent 权限检查                          │
+    │  - allowAppendingLogs() 终态检查           │
+    │  - 更新 Agent LastWork                │
+    │  └───────────────────────────────────────────────┘
+    │
+    ├─ 通道 A（异步）                 │
+    │    （go func() {                               │
+    │    │      s.logger.Write(c, step.ID, logEntries)    │
+    │    │  └─ 内存 pubsub/webclient 实时流        │
+    │    │      └─ s.streams[stepID].list = append    │
+    │    │     ：subscriber channel 满              │
+    │    │        log.Info("subscriber channel is full │
+    │    │             -- dropping logs")                    │
+    │    │   （慢消费者丢弃          │
+    │    └─ }()                                         │
+    │
+    └─ 通道 B（同步，持久化   持久化存储
+         s.LogStore.LogAppend(step, logEntries)
+         │
+         └─ file/file.go:90-115
+             os.OpenFile(O_APPEND|O_CREATE|O_WRONLY)
+             for _, entry := range logEntries {
+                 json.Marshal(entry) → 逐行 JSON Lines 格式
+                 file.Write(jsonBytes)
+             }
+             file.Close()
+```
+
+### 12.3 File LogStore（file.go:37-121
+
+Dead Letter 概念映射关系：
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                                                          │
+│  {base}/{step.ID}.json                                │
+│                                                          │
+│  存储格式: JSON Lines (每行一条)              │
+│                                                          │
+│  示例内容:                                               │
+│  {"StepID":42,"Time":1718457600,"Line":1,   │
+│    "Data":"+ go build ./...","Type":0}                  │
+│  {"StepID":42,"Time":1718457601,"Line":2,   │
+│    "Data":"go: downloading...","Type":0}                     │
+│                                                          │
+│  LogFind(step): 逐行扫描读回 []*model.LogEntry      │
+│  LogAppend(step, entries): APPEND 追加写          │
+│  LogDelete(step): os.Remove(file)                       │
+│  StepFinished(step): 空操作（file）                        │
+│                                                          │
+└────────────────────────────────────────────────────────────┘
+```
+
+**配置来源：`server/config.go → `server/services/log/file/file.go:41-52
+
+```go
+func NewLogStore(base string) (service_log.Service, error {
+    if base == "" { return nil, ... }
+    os.MkdirAll(base, 0o700)
+    return logStore{base: base}, nil
+}
+```
+
+### 12.4 日志落盘保障级别汇总
+
+| 环节 | 失败处理 | 是否落盘 |
+|------|---------|-------|
+| **Agent 端 batch sendLogs 连接中断 | MaxElapsedTime 耗尽后丢弃 | ❌ 不 |
+| **Server 端内存 pubsub** | subscriber channel 满 → 慢消费者丢弃 | ❌ 仅内存 |
+| **Server 端 LogStore** | 磁盘 IO 失败 → log.Error() 记录 | ✅ JSON 文件持久化 |
+| **步骤完成后 StepFinished** | 触发文件保留文件 | ✅ 持久化 |
+| **Server 重启** | 通过 LogFind 读取持久化内容 | ✅ 恢复 |
+
+> **核心设计权衡**：Agent 侧重内存优先，不做本地落盘；Server 端同步持久化。这样设计上保证**日志至少一次**落盘。
+
+---
+
+## 13. Cancel 事件跨 step 的传播分发栈
+
+### 13.1 Cancel 事件源
+
+Cancel 事件传播两条路径传播
+
+```
+                    ┌─────────────────────────────────────────────────┐
+│ 路径 A: Context 取消（硬终止             │
+│  workflowCtx 被 cancelWorkflowCtx(ErrCancel)       │
+│                                                         │
+│ 路径 B: err.Protected[error] 错误状态（软传播）          │
+│  r.err.Set(ExitError/OomError/ErrCancel)       │
+└──────────────────────────────────────────────────┘
+```
+
+### 13.2 路径 A：Context 级硬终止
+
+**代码位置：`agent/runner.go:100-148` 的 context tree
+
+```
+Workflow Runtime.│
+│  workflowCtx = WithTimeout(WithCancelCause(WithTimeout(ctxMeta, timeout)))
+│                                                           │
+│  Cancel 信号来源:                                       │
+│  ├─ 来源 1: Wait() 返回 canceled=true                 │
+│  │    cancelWorkflowCtx(pipeline_errors.ErrCancel)             │
+│  │                                                         │
+│  ├─ 来源 2: utils.WithContextSigtermCallback                │
+│  │    SIGTERM → cancelWorkflowCtx(ErrCancel)            │
+│  │                                                         │
+│  └─ 来源 3: Workflow超时                                   │
+│       cancelWorkflowCtx(nil)  (deadline exceeded            │
+│                                                           │
+│  workflowCtx 通过 WithContext(workflowCtx) 注入到 Runtime.ctx      │
+│                                                           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Runtime.ctx 传播的具体传递路径**：
+
+```go
+// agent/runner.go:172-184
+pipeline_runtime.New(
+    workflow.Config,backend,
+    pipeline_runtime.WithContext(workflowCtx),  ← 注入 Runtime.ctx
+    ...
+).Run(runnerCtx)
+```
+
+在 Runtime 内部**双重 context 设计**：
+
+```go
+// pipeline/runtime/workflow.go:35-86
+func (r *Runtime) Run(runnerCtx context.Context) error {
+    ...
+    for _, stage := range r.spec.Stages {
+        stageChan := r.runStage(runnerCtx, stage.Steps)
+        select {
+        case <-r.ctx.Done():   // workflowCtx 取消
+            <-stageChan         // 等待当前 stage 优雅退出
+            return ErrCancel
+        case err := <-stageChan:
+            r.err.Set(err)       // 记录错误，供后续 stage 使用
+        }
+    }
+    ...
+}
+```
+
+**Context 取消在 step 内部的渗透点**：
+
+| 调用链
+--------+---------------+---------------------------+
+| 位置 | 检查点 | 行为 |
+|------|--------|------|
+| `startStep()` | `r.engine.StartStep(r.ctx, ...)` | backend 接收取消 | backend 用 r.ctx → StartStep 失败 → traceStep(startError) |
+| `startStep()` | `r.engine.TailStep(r.ctx, ...) 日志流终止 | rc.Close() |
+| `completeStep()` | `r.engine.WaitStep(r.ctx, ...)` | errors.Is(err, context.Canceled) | waitState.Error = ErrCancel |
+| `completeStep()` | r.ctx.Err() 二次检查| 重新检测 race 与 context.Canceled 检查 | waitState.Error = ErrCancel |
+| `runBlockingStep()` | errors.Is(err, context.Canceled) → ErrCancel |
+| `runStage()` | stageChan 返回 ErrCancel → r.err.Set() |
+| `Run()` 主循环 | `<-r.ctx.Done()` → 提前返回 ErrCancel |
+
+### 13.3 路径 B：err 状态软传播（OnFailure/OnSuccess 决策
+
+**代码位置：`pipeline/runtime/step.go:62-85
+
+```go
+func (r *Runtime) shouldSkipStep(step *backend_types.Step) bool {
+    currentErr := r.err.Get()  // 读取前序错误
+    
+    // 前序有错误，当前 step.OnFailure == false → 跳过
+    if currentErr != nil && !step.OnFailure { return true }
+    
+    // 前序无错误，当前 step.OnSuccess == false → 跳过
+    if currentErr == nil && !step.OnSuccess { return true }
+    
+    return false
+}
+```
+
+**OnFailure / OnSuccess 配置矩阵**：
+
+| r.err | OnSuccess | OnFailure | 是否执行 | 典型场景
+----------|-----------|----------|---------|---------|
+| nil (无错) | true | - | ✅ 执行 | 默认，普通 step |
+| nil (无错) | false | - | ❌ 跳过 | 手动设置只在失败时执行（失败清理 |
+| 有错误 | - | true | ✅ 执行 | cleanup/notify/rollback |
+| 有错误 | - | false | ❌ 跳过 | 普通 step，失败链断裂 |
+
+**step 错误设置点**：
+
+```
+Stage 0                                  Stage 1
+┌─────────────┐ 阶段：                           ┌──────────────────────┐
+│ Step A (build     │                         │ Step E (notify) │
+│ OnSuccess: true     │  r.err = ErrExit(1)                │ OnFailure: true │
+│                   │ ─────────────────────────────────► │               │
+│ ExitCode: 1      │                         │ E 执行✅       │
+└─────────────┘                         │ (slack 通知     │
+                                          └───────────────┘
+                                                   │
+                                                   │
+                                                   ▼
+                                          ┌──────────────────────┐
+                                          │ Step F (deploy) │
+                                          │ OnSuccess: true    │
+                                          │ OnFailure: false  │
+                                          │                  │
+                                          │ F 跳过❌        │
+                                          │ (不部署失败不部署失败)  │
+                                          └──────────────┘
+```
+
+### 13.4 step 启动之前的并行 step 间的 event 分发时序
+
+**代码位置：`pipeline/runtime/workflow.go:141-159
+
+```go
+func (r *Runtime) runStage(runnerCtx context.Context, steps []*backend_types.Step) <-chan error {
+    var g errgroup.Group
+    done := make(chan error)
+    
+    for _, step := range steps {
+        g.Go(func() error {
+            return r.executeStep(runnerCtx, step)
+        })
+    }
+    
+    go func() { done <- g.Wait(); close(done) }()
+    return done
+}
+```
+
+**同 stage 并行 step 间的传播**：
+
+```
+Stage (并行执行
+    │
+    ├─ Step 1 (clone)       Step 2 (service)
+    │   │                  │
+    │   │ startStep()       │ startStep()
+    │   │ completeStep()    │ completeStep()
+    │   │ traceStep()    │ traceStep()
+    │   │                  │
+    │   ▼                  ▼
+    │   err1               err2
+    │   │                  │
+    │   └────────┬──────────┘
+    │            │
+    │            ▼
+    │        g.Wait() → 返回第一个非 nil error
+    │
+    │            │
+    │            ▼
+    └── Stage error (若有一个错误 → 下一个 stage shouldSkipStep()
+
+关键设计：**同一 stage 内的所有 step 同时启动，并行执行，
+               step 间的通过 errgroup.Group 的首个错误传播给下一个 stage 的所有 step 的 OnFailure/OnSuccess 判定
+
+跨 stage 顺序执行，err 传播
+```
+
+### 13.5 Cancel 事件在 step.go:99-109：CI_PIPELINE_STATUS 环境变量注入
+
+**代码位置：`pipeline/runtime/step.go:99-109
+
+```go
+func (r *Runtime) setStepEnv(step *backend_types.Step) error {
+    if r.err.Get() != nil {
+        step.Environment["CI_PIPELINE_STATUS"] = "failure"
+    } else {
+        step.Environment["CI_PIPELINE_STATUS"] = "success"
+    }
+}
+```
+
+这样 OnFailure step 在执行时**可以感知整个 pipeline 已经处于失败状态，
+据此决定行为（例如发送失败通知）。
+
+### 13.6 detached step 的特殊处理
+
+**代码位置：`pipeline/runtime/step.go:227-258`
+
+```go
+func (r *Runtime) runDetachedStep(...) error {
+    waitForLogs, startTime, err := r.startStep(step)
+    if err != nil { return r.traceStep(nil, err, step) }
+    
+    r.uploadWait.Add(1)
+    go func() {                              // 后台goroutine
+        defer r.uploadWait.Done()
+        
+        processState, err := r.completeStep(...)
+        if errors.Is(err, context.Canceled) {
+            err = pipeline_errors.ErrCancel
+        }
+        r.traceStep(processState, err, step)  // 最终状态上报
+    }()
+    
+    return nil   // 立即返回，不阻塞 pipeline
+}
+```
+
+**detached 的传播注意事项**：
+
+- detach step**提前返回 nil，不阻塞 stage 继续
+- 其完成结果通过 uploadWait 延迟到 workflow 完成前确保完成
+- **不会通过 err.Set(workflow 返回，不会影响下一个 stage 的 skip 影响
+- 但 context 取消时，completeStep 通过 ErrCancel 处理
+
+### 13.7 Failure 传播完整栈图
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                    Server 触发                                │
+│                                                    │
+│  Cancel()                                       │
+│    │                                              │
+│    ├── queue.ErrorAtOnce(ids, ErrCancel)                 │
+│    │       │                                         │
+│    │       └── close(entry.done)                         │
+│    │                                                │
+│    └── 数据库 Pending workflow/step 批量设置为终态        │
+│                                                    │
+└──────────────────────────────┬─────────────────────┘
+                               │
+                               ▼
+                    ┌────────────────────────────┐
+                    │  Agent: Wait() 返回 canceled=true          │
+                    │  cancelWorkflowCtx(ErrCancel)          │
+                    └──────────────┬────────────────────┘
+                                   │
+              ┌────────────────────────┼──────────────────────┐
+              │                    │                     │
+              ▼                    ▼                     ▼
+┌─────────────────────┐  ┌───────────────────┐  ┌──────────────────┐
+│ 路径 A: r.ctx 被取消     │  │ 路径 B: r.err 设置     │  │ Extend 协程退出       │
+│ 上下文取消│  │ ErrCancel│  │ workflowCtx.Done()│
+└──────────┬───────────┘  └──────┬────────┘  └──────────────────┘
+           │                   │
+           ▼                   ▼
+┌────────────────────────────┐  ┌─────────────────────────────────────┐
+│ 运行中的步骤:                │  │ 后续 stage 的步骤:             │
+│ completeStep() 检测到            │  │ shouldSkipStep() 检查 r.err  │
+│ context.Canceled               │  │   ├─ OnSuccess=false → 正常执行       │
+│ → ErrCancel               │  │   └─ OnFailure=true → 执行     │
+│                                 │
+└──────────┬──────────┘  └───────────────┬──────────────┘
+           │                           │
+           ▼                           ▼
+┌──────────────────────────────────────────────────────┐
+│  traceStep(Canceled=true)                 │
+│       client.Update(stepState)           │
+│       通知 Server Step → Killed         │
+└──────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  Run() 主循环检测 r.ctx.Done()                │
+│       return ErrCancel                  │
+└──────────────────────────────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────────────────┐
+│  Runner.Run() 收尾                                    │
+│  state.Canceled = true                       │
+│  client.Done(doneCtx, workflow.ID, state)           │
+└──────────────────────────────────────────────────────┘
+```
