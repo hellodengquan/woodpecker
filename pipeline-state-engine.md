@@ -1956,3 +1956,585 @@ func (r *Runtime) runDetachedStep(...) error {
 │  client.Done(doneCtx, workflow.ID, state)           │
 └──────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 14. Matrix Expansion：矩阵拆分为多 Workflow 的调度机制
+
+### 14.1 Matrix 的两种定义形式
+
+**代码位置：`pipeline/frontend/yaml/matrix/matrix.go:46-135`**
+
+矩阵有两种写法，`Parse()` 函数会按顺序尝试：
+
+#### 形式 1：`matrix.include` 列表（显式枚举）
+
+```yaml
+matrix:
+  include:
+    - GO_VERSION: "1.21"
+      OS: linux
+    - GO_VERSION: "1.22"
+      OS: darwin
+```
+
+由 `parseList()` 解析，直接返回 `[]Axis`。
+
+#### 形式 2：`matrix` key-value 笛卡尔积（自动展开）
+
+```yaml
+matrix:
+  GO_VERSION: ["1.21", "1.22"]
+  OS: [linux, darwin, windows]
+```
+
+由 `parse()` 解析后，通过 `calc()` 计算笛卡尔积。
+
+### 14.2 笛卡尔积展开算法
+
+**代码位置：`pipeline/frontend/yaml/matrix/matrix.go:70-112`**
+
+```go
+func calc(matrix Matrix) []Axis {
+    // 计算总排列数
+    var perm int
+    var tags []string
+    for k, v := range matrix {
+        perm *= len(v)
+        if perm == 0 { perm = len(v) }
+        tags = append(tags, k)
+    }
+
+    var axisList []Axis
+    for p := 0; p < perm; p++ {
+        axis := map[string]string{}
+        decrease := perm
+        for i, tag := range tags {
+            elems := matrix[tag]
+            decrease /= len(elems)
+            elem := p / decrease % len(elems)   // 模数展开
+            axis[tag] = elems[elem]
+            if i > limitTags { break }          // 最多 10 个 tag
+        }
+        axisList = append(axisList, axis)
+        if p > limitAxis { break }              // 最多 25 个组合
+    }
+    return axisList
+}
+```
+
+**限制常量**：
+- `limitTags = 10`：最多 10 个维度（key）
+- `limitAxis = 25`：最多 25 个组合（展开后的 workflow 数）
+
+### 14.3 PipelineBuilder：从矩阵到多 Workflow
+
+**代码位置：`pipeline/frontend/builder/builder.go:52-97`**
+
+```go
+func (b *PipelineBuilder) Build() (items []*Item, errorsAndWarnings error) {
+    b.Yamls = SortYamlFilesByName(b.Yamls)
+    pidSequence := 1
+
+    for _, y := range b.Yamls {
+        // 1. 解析矩阵
+        axes, err := matrix.ParseString(string(y.Data))
+        if len(axes) == 0 {
+            axes = append(axes, matrix.Axis{})  // 无矩阵也生成一个空 axis
+        }
+
+        // 2. 每个 axis 生成一个 workflow
+        for i, axis := range axes {
+            workflow := &Workflow{
+                PID:     pidSequence,
+                Environ: axis,           // 矩阵变量作为环境变量
+                Name:    SanitizePath(y.Name),
+            }
+            if len(axes) > 1 {
+                workflow.AxisID = i + 1  // 多矩阵时标记 axis id
+            }
+
+            item, err := b.genItemForWorkflow(workflow, axis, string(y.Data))
+            items = append(items, item)
+            pidSequence++
+        }
+    }
+
+    items = filterMissingDependencies(items)
+    return items, errorsAndWarnings
+}
+```
+
+**执行流程**：
+
+```
+PipelineBuilder.Build()
+    │
+    ├─ 遍历每个 YAML 文件
+    │
+    ├─ matrix.ParseString(yaml)
+    │    ├─ parseList()   → 尝试 matrix.include
+    │    └─ parse()+calc() → 笛卡尔积展开
+    │
+    ├─ 对每个 axis 执行 genItemForWorkflow()
+    │    ├─ 环境变量合并: metadata.Environ() + axis
+    │    ├─ 变量替换: metadata.EnvVarSubst(data, environ)
+    │    ├─ yaml.ParseString(substituted)
+    │    ├─ linter.Lint()
+    │    ├─ when 条件过滤
+    │    ├─ toInternalRepresentation() → compiler.Compile()
+    │    └─ 生成 Item{Workflow, Config, Labels, DependsOn, RunsOn}
+    │
+    └─ filterMissingDependencies(items)
+         → 去掉依赖不存在的 workflow，确保依赖图完整
+```
+
+### 14.4 矩阵变量注入路径
+
+矩阵变量作为环境变量，在三层传递：
+
+| 层次 | 代码位置 | 作用 |
+|------|---------|------|
+| **Builder 层** | `builder.go:70` `workflow.Environ = axis` | 存入 workflow 元数据 |
+| **环境变量层** | `builder.go:207-211` `environmentVariables()` | 合并到 environ 用于变量替换 |
+| **Compiler 层** | `compiler/option.go:143-147` `WithEnviron()` | 注入到每个 step 的 Environment map |
+| **运行时层** | `runtime/step.go:90-93` `step.Environment` | 容器启动时作为环境变量 |
+
+### 14.5 多 Workflow 的依赖调度
+
+矩阵展开后生成的多个 workflow 通过 `DependsOn` 形成依赖图，由队列调度：
+
+```
+workflow-a (axis 1)
+workflow-b (axis 2)
+workflow-c (axis 3)
+
+depends_on: [workflow-a]
+    ↓
+workflow-deploy
+```
+
+在 `server/pipeline/queue.go:31-45` 的 `getTaskDependencies()` 中，依赖以 workflow 名称解析。
+
+每个 matrix axis 生成的 workflow 使用**同一个基础名称**，通过 `AxisID` 区分。
+如果 `depends_on` 引用矩阵 workflow，则**所有矩阵实例完成**后才会执行依赖者。
+
+---
+
+## 15. Global Secret 注入与权限隔离
+
+### 15.1 Secret 的三层级架构
+
+**代码位置：`server/services/secret/db.go:41-72`**
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                       优先级从高到低                           │
+│                                                          │
+│  ┌─────────────┐  ┌────────────────┐  ┌───────────────┐   │
+│  │ Repo Secret │  │ Org Secret     │  │ Global Secret │   │
+│  │ (仓库级)     │  │ (组织级)        │  │ (全局级)       │   │
+│  └─────────────┘  └────────────────┘  └───────────────┘   │
+│                                                          │
+│  同名字段冲突时，Repo 覆盖 Org，Org 覆盖 Global          │
+│  （SecretListPipeline 去重时按优先级遍历）               │
+└────────────────────────────────────────────────────────────┘
+```
+
+**去重逻辑**（`db.go:48-70`）：
+
+```go
+// Priority order: repository > user/organization > global
+for _, condition := range []struct {
+    IsRepository, IsOrganization, IsGlobal bool
+}{
+    {IsRepository: true},
+    {IsOrganization: true},
+    {IsGlobal: true},
+} {
+    for _, secret := range s {
+        if _, ok := uniq[secret.Name]; ok { continue }
+        uniq[secret.Name] = struct{}{}
+        secrets = append(secrets, secret)
+    }
+}
+```
+
+### 15.2 Secret 服务组合链
+
+**代码位置：`server/services/manager.go:90, 104-110 + secret/combined.go:37-74`**
+
+完整的 secret 获取链：
+
+```
+Manager.SecretServiceFromRepo(repo)
+    │
+    ├─ repo.SecretExtensionEndpoint 非空
+    │    └─ secret.NewCombined(base, httpExtension)
+    │          ├─ extension 优先级更高（同名字段覆盖 base）
+    │          └─ extension 失败时仅记录警告，不中断
+    │
+    └─ 否则返回 m.secret（DB 来源）
+```
+
+**Combined 合并逻辑**（`combined.go:56-71`）：
+
+```go
+// extension 优先级最高（同名覆盖 base）
+merged := append(merged, extensionSecrets...)  // 先放 extension
+for _, s := range baseSecrets {                 // 再放 base
+    if _, ok := exists[s.Name]; ok { continue }  // 跳过重名
+    merged = append(merged, s)
+}
+```
+
+最终的完整优先级链（从高到低）：
+1. **HTTP Extension**（repo 级别的 secret 扩展）
+2. **Repo Secret**（仓库级）
+3. **Org Secret**（组织级）
+4. **Global Secret**（全局级）
+
+### 15.3 Secret 注入编译期：Compiler 的注入时机
+
+**代码位置：`pipeline/frontend/yaml/compiler/compiler.go:35-48, 119-142, 164-193**
+
+Secret 在编译期（compiler 阶段）完成注入，而非运行时。
+
+#### 编译期 Secret 列表（用于日志脱敏）
+
+```go
+func (c *Compiler) Compile(conf *yaml_types.Workflow) (*backend_types.Config, error) {
+    // 将所有 secret 名+值加入 config.Secrets 列表
+    for _, sec := range c.secrets {
+        config.Secrets = append(config.Secrets, &backend_types.Secret{
+            Name:  sec.Name,
+            Value: sec.Value,
+        })
+    }
+    // backend 用这个列表做日志脱敏（masking）
+}
+```
+
+#### Step 级别 Secret 注入：`from_secret` 语法
+
+**代码位置：`pipeline/frontend/yaml/compiler/convert.go:101-125 + settings/params.go`**
+
+```go
+getSecretValue := func(name string) (string, error) {
+    name = strings.ToLower(name)
+    secret, ok := c.secrets[name]
+    if !ok {
+        return "", fmt.Errorf("secret %q not found", name)
+    }
+    // 权限检查：事件类型 + 允许的镜像
+    event := c.metadata.Curr.Event
+    err := secret.Available(event, container)
+    if err != nil {
+        return "", err
+    }
+    return secret.Value, nil
+}
+
+// settings 中使用 from_secret
+settings.ParamsToEnv(container.Settings, environment, "PLUGIN_", true, getSecretValue, secretMapping)
+// environment 中使用 from_secret
+settings.ParamsToEnv(container.Environment, environment, "", false, getSecretValue, secretMapping)
+```
+
+**YAML 使用方式**：
+
+```yaml
+steps:
+  - name: deploy
+    image: plugins/docker
+    settings:
+      password:
+        from_secret: docker_password  # ← 编译期替换为真实值
+```
+
+### 15.4 Secret 权限隔离机制
+
+**代码位置：`pipeline/frontend/yaml/compiler/compiler.go:49-64`**
+
+每个 secret 有两个维度的权限限制：
+
+```go
+func (s *Secret) Available(event metadata.Event, container *yaml_types.Container) error {
+    // 限制 1: 仅允许特定 plugin 镜像使用
+    onlyAllowSecretForPlugins := len(s.AllowedPlugins) > 0
+    if onlyAllowSecretForPlugins && !container.IsPlugin() {
+        return fmt.Errorf("secret %q is only allowed to be used by plugins", s.Name)
+    }
+    if onlyAllowSecretForPlugins && !utils.MatchImageDynamic(container.Image, s.AllowedPlugins...) {
+        return fmt.Errorf("secret %q is not allowed with image %q", s.Name, container.Image)
+    }
+
+    // 限制 2: 仅允许特定事件类型
+    if !s.Match(event) {
+        return fmt.Errorf("secret %q is not allowed with event %q", s.Name, event)
+    }
+    return nil
+}
+```
+
+**权限检查矩阵**：
+
+| 限制维度 | 配置字段 | 默认 | 检查时机 |
+|---------|---------|------|---------|
+| **Plugin 镜像白名单** | `AllowedPlugins` / `Images` | 空（所有可用） | 编译期 `getSecretValue` 回调时 |
+| **事件类型白名单** | `Events` | 空（所有事件） | 编译期 `getSecretValue` 回调时 |
+| **作用域隔离** | `OrgID` / `RepoID` | 强制 | 列表查询时数据库过滤 |
+
+### 15.5 Server 端 Secret 获取完整调用栈
+
+```
+pipeline.Create()
+  │
+  └─ parsePipeline()                # server/pipeline/items.go:38
+      │
+      ├─ SecretServiceFromRepo(repo) → 返回 combined/db secret service
+      │
+      ├─ secretService.SecretListPipeline(ctx, repo, pipeline, netrc)
+      │    │
+      │    ├─ combined: base.SecretListPipeline() + extension.SecretListPipeline()
+      │    │
+      │    └─ db: store.SecretList(repo, true, ...)  # 含值（for pipeline use）
+      │         （第 2 个参数 true = 返回 Value 字段）
+      │
+      ├─ 转换为 compiler.Secret{Name, Value, AllowedPlugins, Events}
+      │
+      └─ compiler.WithSecret(secrets...)
+           │
+           └─ compiler.secrets[name] = secret  # 小写 key 存储
+                │
+                └─ Compile() 时通过 getSecretValue() 注入到步骤环境变量
+```
+
+### 15.6 Secret 的数据保护
+
+- **API 返回时**：`SecretList(repo, false, ...)` 第 2 参数 false → 不返回 Value 字段
+- **Pipeline 执行时**：`SecretListPipeline` 返回完整 value，但仅在编译期使用
+- **日志脱敏**：所有 secret 值在日志输出前被 backend 替换为 `***`
+- **数据库加密**：通过 `encryption/wrapper/store/secret_store_wrapper.go` 可加密存储
+
+---
+
+## 16. Agent Capacity 与 Quota 上报调用栈
+
+### 16.1 Capacity 的来源与含义
+
+**代码位置：`cmd/agent/core/agent.go:69-77, 193, 267, 316`**
+
+`capacity` = agent 能同时执行的最大 workflow 数 = runner 槽位数
+
+```go
+maxWorkflows := c.Int("max-workflows")  // CLI 参数
+
+// 初始化 state counter
+counter.Polling = maxWorkflows
+counter.Running = 0
+
+// 注册时上报给 server
+client.RegisterAgent(grpcCtx, rpc.AgentInfo{
+    Capacity: maxWorkflows,  // ← capacity = max-workflows
+    ...
+})
+
+// 启动对应数量的 runner goroutine
+for i := range maxWorkflows {
+    serviceWaitingGroup.Go(func() error {
+        runner := agent.NewRunner(...)
+        for { runner.Run(agentCtx) }  // 每个 runner 独立循环 Poll
+    })
+}
+```
+
+**capacity 与 runner 的关系**：
+
+```
+Agent Capacity = 3
+    │
+    ├─ Runner #0 → Poll() → worker #0（queue.workers 中占一个槽位）
+    ├─ Runner #1 → Poll() → worker #1
+    └─ Runner #2 → Poll() → worker #2
+
+每个 runner:
+  - 独立调用 scheduler.Poll()
+  - 在 queue.workers 中注册一个独立 worker
+  - 一次只能处理一个 workflow
+  - 完成后自动重新 Poll
+```
+
+### 16.2 Capacity 上报流程：Agent → Server
+
+**完整调用栈**：
+
+```
+Agent 端 (cmd/agent/core/agent.go)
+  │
+  ├─ maxWorkflows = c.Int("max-workflows")
+  │
+  ├─ client.RegisterAgent(ctx, rpc.AgentInfo{Capacity: maxWorkflows})
+  │    │
+  │    └─ gRPC Woodpecker.RegisterAgent()
+  │         └─ proto.RegisterAgentRequest{Info: {Capacity: ...}}
+  │
+  ▼
+Server gRPC 层 (server/rpc/server.go:193-205)
+  │
+  └─ WoodpeckerServer.RegisterAgent()
+       └─ s.peer.RegisterAgent(ctx, rpc.AgentInfo{Capacity: int(agentInfo.GetCapacity()), ...})
+  │
+  ▼
+RPC 业务层 (server/rpc/rpc.go:477-500)
+  │
+  └─ RPC.RegisterAgent()
+       ├─ getAgentFromContext(ctx) → 从 JWT 取出 agent 对象
+       ├─ agent.Capacity = int32(info.Capacity)  ← 更新 capacity
+       ├─ agent.Backend/Platform/Version/CustomLabels 一并更新
+       ├─ s.store.AgentUpdate(agent)  ← 持久化到数据库
+       └─ server.Config.Services.Scheduler.Queue.AddAgent(agent)  ← 加入调度池
+```
+
+**关键代码**（`server/rpc/rpc.go:489-492`）：
+
+```go
+agent.Backend = info.Backend
+agent.Platform = info.Platform
+agent.Capacity = int32(info.Capacity)  // ← 更新 capacity
+agent.Version = info.Version
+```
+
+### 16.3 Queue 中的 Worker 注册与 Capacity 关系
+
+**代码位置：`server/queue/fifo.go:87-111`**
+
+每个 runner 的 Poll 调用在 queue 中注册一个独立的 `worker`：
+
+```go
+func (q *fifo) Poll(c context.Context, agentID int64, filter FilterFn) (*model.Task, error) {
+    ctx, stop := context.WithCancelCause(c)
+    w := &worker{
+        agentID: agentID,
+        channel: make(chan *model.Task, 1),
+        filter:  filter,
+        stop:    stop,
+    }
+    q.workers[w] = struct{}{}  // 加入 worker 池
+    defer delete(q.workers, w)
+
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        case t := <-w.channel:
+            return t, nil
+        }
+    }
+}
+```
+
+**调度时的分配**（`fifo.go:314-336`）：
+
+```go
+func (q *fifo) assignToWorker() (*list.Element, *worker) {
+    for element := q.pending.Front(); element != nil; element = element.Next() {
+        task := element.Value.(*model.Task)
+        for worker := range q.workers {
+            matched, score := worker.filter(task)
+            if matched && score > bestScore {
+                bestWorker = worker
+                bestScore = score
+            }
+        }
+        if bestWorker != nil {
+            return element, bestWorker
+        }
+    }
+    return nil, nil
+}
+```
+
+**重要发现**：
+- `capacity` 在数据库中**仅作元数据记录**（用于 UI 展示）
+- **实际并发控制**由 queue 中的 `workers` 数量决定（即 agent 实际 Poll 的 runner 数）
+- 每个 runner 独立 Poll → 独立 worker → 自然形成并发上限
+
+### 16.4 Worker 的生命周期
+
+```
+Agent 启动
+  │
+  ├─ Runner 1: Poll() → 加入 queue.workers
+  ├─ Runner 2: Poll() → 加入 queue.workers
+  └─ Runner N: Poll() → 加入 queue.workers
+        │
+        │  (阻塞等待任务)
+        │
+        ▼
+  process() 循环分配任务
+    assignToWorker() → 选中某个 worker
+    worker.channel <- task
+        │
+        ▼
+  Runner 收到 task
+    → 从 queue.workers 移除？ ❌ 不会移除
+    → 执行 workflow
+    → 完成后再次 Poll() → 重新加入 workers
+
+Worker 移除时机：
+  - ctx 取消（agent 关闭、runner 退出）
+  - Poll() 返回时 defer delete(q.workers, w)
+```
+
+### 16.5 Agent 注销与清理
+
+**代码位置：`server/rpc/rpc.go:504-515` + `cmd/agent/core/agent.go:200-213`**
+
+```go
+// Server 端
+func (s *RPC) UnregisterAgent(ctx context.Context) error {
+    agent, _ := s.getAgentFromContext(ctx)
+    server.Config.Services.Scheduler.Queue.RemoveAgent(agent.ID)
+    return s.store.AgentDelete(agent)
+}
+```
+
+**仅无状态 agent 会注销**：
+- `agentConfigPersisted == false`：关闭时 Unregister，数据库删除
+- `agentConfigPersisted == true`（持久化 agent）：关闭时不注销，保留 ID
+
+### 16.6 与 Capacity 相关的状态上报
+
+Agent 有两个独立的状态追踪体系：
+
+| 体系 | 位置 | 作用 |
+|------|------|------|
+| **Agent State** (agent/state.go) | Agent 本地内存 | `Polling / Running / Metadata` 计数，用于健康检查和 varz |
+| **Agent Capacity** (model/agent.go) | Server 数据库 | 声明的最大并发数，注册时上报 |
+
+**健康检查逻辑**（`agent/state.go:62-73`）：
+
+```go
+func (s *State) Healthy() bool {
+    now := time.Now()
+    buf := time.Hour  // 1 小时缓冲
+    for _, item := range s.Metadata {
+        // 运行超过 timeout+1 小时的 workflow 视为不健康
+        if now.After(item.Started.Add(item.Timeout).Add(buf)) {
+            return false
+        }
+    }
+    return true
+}
+```
+
+### 16.7 配额与限流总结
+
+Woodpecker 中**没有独立的 quota 限额系统**，并发控制完全由以下机制实现：
+
+1. **Agent 侧**：`--max-workflows` 参数 → capacity → runner 数量 → 自然并发上限
+2. **Server 侧**：每个 runner 注册一个 worker，worker 数即为并发槽位
+3. **调度侧**：`assignToWorker()` 只能分配给空闲 worker
+4. **标签路由**：通过 label filter 实现资源分区（不同 agent 处理不同类型任务）
+5. **Org 隔离**：`agent.OrgID` 限制 agent 只能处理对应组织的任务
