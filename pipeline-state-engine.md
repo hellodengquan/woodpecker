@@ -2538,3 +2538,679 @@ Woodpecker 中**没有独立的 quota 限额系统**，并发控制完全由以�
 3. **调度侧**：`assignToWorker()` 只能分配给空闲 worker
 4. **标签路由**：通过 label filter 实现资源分区（不同 agent 处理不同类型任务）
 5. **Org 隔离**：`agent.OrgID` 限制 agent 只能处理对应组织的任务
+
+---
+
+## 17. Workspace Volume 共享与 Cache 协议
+
+### 17.1 Workspace 的编译期生成
+
+**代码位置：`pipeline/frontend/yaml/compiler/compiler.go:130-134 + `pipeline/frontend/yaml/compiler/convert.go:54-56**
+
+Compiler 在编译 workflow 时创建唯一的 volume 和 network 名称：
+
+```go
+// compiler.go:130-134
+config.Volume  = fmt.Sprintf("%s_default", c.prefix)   // 例: wp_01HXYZ_default
+config.Network = fmt.Sprintf("%s_default", c.prefix)   // 例: wp_01HXYZ_default
+```
+
+`c.prefix` 由 `WithPrefix()` 选项注入，通常使用 taskUUID 作为前缀，确保不同 workflow 之间资源隔离。
+
+### 17.2 Workspace Volume 挂载路径
+
+**代码位置：`pipeline/frontend/yaml/compiler/convert.go:34-56**
+
+```go
+pluginWorkspaceBase = "/woodpecker"              // plugin 步骤的固定基路径
+DefaultWorkspaceBase = pluginWorkspaceBase        // 默认基路径
+
+// createProcess 中:
+if stepType == backend_types.StepTypeService || container.IsPlugin() {
+    workspaceBase = pluginWorkspaceBase           // plugin/service: /woodpecker
+}
+workspaceVolume := fmt.Sprintf("%s_default:%s", c.prefix, workspaceBase)
+// 生成: "wp_01HXYZ_default:/woodpecker"
+```
+
+**环境变量注入**：
+
+```go
+environment["CI_WORKSPACE"] = path.Join(workspaceBase, c.workspacePath)
+// 生成: "/woodpecker/src/go.woodpecker-ci.org/woodpecker"
+```
+
+### 17.3 Docker Backend 的 Workspace 实现
+
+**代码位置：`pipeline/backend/docker/docker.go:156-175**
+
+```
+SetupWorkflow(ctx, conf, taskUUID)
+    │
+    ├─ VolumeCreate(ctx, client.VolumeCreateOptions{
+    │      Name:   conf.Volume,     // "wp_01HXYZ_default"
+    │      Driver: volumeDriver,    // 默认 "local"
+    │  })
+    │  → 创建命名 Docker Volume
+    │
+    └─ NetworkCreate(ctx, conf.Network, client.NetworkCreateOptions{
+           Driver:     networkDriver,  // Linux: "bridge", Windows: "nat"
+           EnableIPv6: &e.config.enableIPv6,
+       })
+       → 创建隔离 Docker Network
+```
+
+**Step 启动时挂载**（`pipeline/backend/docker/convert.go:120-122`）：
+
+```go
+// toHostConfig 中:
+if len(step.Volumes) != 0 {
+    config.Binds = step.Volumes   // 包含 workspace volume 绑定
+}
+// 例: ["wp_01HXYZ_default:/woodpecker"]
+```
+
+**Volume 清理**（`docker.go:385-407`）：
+
+```go
+DestroyWorkflow(ctx, conf, taskUUID)
+    │
+    ├─ VolumeRemove(ctx, conf.Volume, Force: true)
+    │    └─ 指数退避重试（"volume is in use" 场景）
+    │       InitialInterval: volumeRetryWait
+    │       Multiplier: 2
+    │       MaxTries: maxRetry
+    │
+    └─ NetworkRemove(ctx, conf.Network)
+```
+
+### 17.4 Kubernetes Backend 的 Workspace 实现
+
+**代码位置：`pipeline/backend/kubernetes/kubernetes.go:226-253 + `pipeline/backend/kubernetes/volume.go:28-86**
+
+```
+SetupWorkflow(ctx, conf, taskUUID)
+    │
+    ├─ [可选] mkNamespace()        → EnableNamespacePerOrg 时按组织创建 K8s namespace
+    │
+    ├─ startVolume(ctx, engine, conf.Volume, namespace)
+    │    │
+    │    └─ mkPersistentVolumeClaim(engineConfig, name, namespace)
+    │         ├─ AccessMode:  StorageRwx → ReadWriteMany / else → ReadWriteOnce
+    │         ├─ StorageClassName: 可配置
+    │         └─ Resources.Requests[storage]: VolumeSize（默认 "10Gi"）
+    │
+    └─ startHeadlessService(ctx, engine, namespace, taskUUID)
+         └─ 用于 workflow 内 pod 间 DNS 解析
+```
+
+**Pod 挂载 Workspace PVC**（`pipeline/backend/kubernetes/pod.go`）：
+
+每个 step 的 Pod 通过 `PersistentVolumeClaim` 挂载 workspace：
+
+```yaml
+# 生成的 PVC 示例
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wp-01hxyz-default
+  namespace: woodpecker
+spec:
+  accessModes: [ReadWriteMany]     # StorageRwx=true
+  storageClassName: local-storage
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+### 17.5 Step 间 Workspace 共享机制
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  同一 Workflow 内所有 Step 共享相同的 Volume                   │
+│                                                           │
+│  Docker:                                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │  clone   │  │  build   │  │  deploy  │                │
+│  │          │  │          │  │          │                │
+│  │ /woodpecker │ /woodpecker │ /woodpecker │              │
+│  │    ↕     │  │    ↕     │  │    ↕     │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
+│       │              │              │                       │
+│       └──────────────┼──────────────┘                       │
+│                      │                                      │
+│            wp_01HXYZ_default                                │
+│            (Docker Named Volume)                            │
+│                                                           │
+│  Kubernetes:                                               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                │
+│  │  Pod     │  │  Pod     │  │  Pod     │                │
+│  │  clone   │  │  build   │  │  deploy  │                │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                │
+│       │              │              │                       │
+│       └──────────────┼──────────────┘                       │
+│                      │                                      │
+│            PVC: wp-01hxyz-default                           │
+│            (ReadWriteMany)                                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键设计**：
+- **同一 Workflow 内**：所有 step 共享同一个 volume（clone 写入 → build 读取 → deploy 使用）
+- **不同 Workflow 间**：完全隔离（不同 prefix → 不同 volume name）
+- **Matrix 展开后**：每个 axis 是独立 workflow → 各自有独立 volume
+
+### 17.6 Cache Step 类型
+
+**代码位置：`pipeline/backend/types/step.go:53-58**
+
+```go
+const (
+    StepTypeClone    StepType = "clone"      // git clone 步骤
+    StepTypeService  StepType = "service"    // 后台服务
+    StepTypePlugin   StepType = "plugin"     // plugin 步骤
+    StepTypeCommands StepType = "commands"   // 命令步骤
+    StepTypeCache    StepType = "cache"      // 缓存步骤（预留类型）
+)
+```
+
+**当前状态**：`StepTypeCache` 是预留类型，代码中**没有使用处**。Woodpecker 的缓存机制不是通过专用的 cache step type 实现的，而是通过 **plugin 生态** 解决：
+
+**缓存的实际实现方式**：
+
+1. **Volume 级缓存**：Docker volume 在 workflow 生命周期内持续存在（但 workflow 结束后删除）
+2. **Plugin 级缓存**：如 `woodpecker-plugins/plugin-cache` 通过 volume 挂载实现目录级缓存恢复/保存
+3. **外部存储**：用户可在 YAML 中使用缓存 plugin（如 S3 缓存）将构建产物上传/下载
+
+```yaml
+steps:
+  restore_cache:
+    image: meltwater/drone-cache
+    settings:
+      restore: true
+      mount:
+        - .cache
+      bucket: my-cache-bucket
+    volumes:
+      - cache:/cache        # 自定义 volume（非 workspace）
+
+  build:
+    image: golang
+    commands:
+      - go build ./...
+
+  rebuild_cache:
+    image: meltwater/drone-cache
+    settings:
+      rebuild: true
+      mount:
+        - .cache
+      bucket: my-cache-bucket
+```
+
+### 17.7 自定义 Volume 与 Workspace 的区别
+
+| 维度 | Workspace Volume | 自定义 Volume |
+|------|-----------------|-------------|
+| **生命周期** | SetupWorkflow 创建 → DestroyWorkflow 删除 | 由 YAML volumes 定义 |
+| **挂载路径** | `/woodpecker`（固定） | 用户指定 |
+| **共享范围** | 同一 workflow 所有 step | 同一 workflow 所有 step |
+| **命名** | `{prefix}_default` | YAML 中定义 |
+| **Docker** | Named Volume | Named Volume 或 Host Bind |
+| **Kubernetes** | PVC（ReadWriteMany） | PVC 或 emptyDir |
+
+---
+
+## 18. Cron Scheduler 触发器调用栈
+
+### 18.1 Cron 数据模型
+
+**代码位置：`server/model/cron.go:24-36**
+
+```go
+type Cron struct {
+    ID        int64             `xorm:"pk autoincr 'id'"`
+    Name      string            `xorm:"name UNIQUE(s) INDEX"`
+    RepoID    int64             `xorm:"repo_id UNIQUE(s) INDEX"`
+    CreatorID int64             `xorm:"creator_id INDEX"`
+    NextExec  int64             `xorm:"next_exec"`        // Unix 时间戳
+    Schedule  string            `xorm:"schedule NOT NULL"` // cron 表达式
+    Timezone  string            `xorm:"timezone NOT NULL DEFAULT 'UTC'"`
+    Branch    string            `xorm:"branch"`
+    Enabled   bool              `xorm:"enabled NOT NULL DEFAULT TRUE"`
+    Variables map[string]string `xorm:"json 'variables'"` // 额外环境变量
+}
+```
+
+**唯一约束**：`(Name, RepoID)` 联合唯一。
+
+### 18.2 Cron 调度循环
+
+**代码位置：`server/cron/cron.go:41-65**
+
+```go
+func Run(ctx context.Context, store store.Store) error {
+    for {
+        select {
+        case <-ctx.Done():
+            return nil
+        case <-time.After(checkTime):   // checkTime = 1 minute
+            go func() {
+                now := time.Now()
+                crons, _ := store.CronListNextExecute(now.Unix(), checkItems)  // checkItems = 10
+                for _, cron := range crons {
+                    runCron(ctx, store, cron, now)
+                }
+            }()
+        }
+    }
+}
+```
+
+**启动入口**：`cmd/server/server.go` 中作为后台服务启动。
+
+### 18.3 Cron 执行流程（含分布式锁）
+
+**代码位置：`server/cron/cron.go:88-113**
+
+```
+runCron(ctx, store, cron, now)
+    │
+    ├─ 1. 计算下次执行时间
+    │     CalcNewNext(cron.Schedule, cron.Timezone, now)
+    │     │
+    │     ├─ time.LoadLocation(tzLoc)  → 时区转换
+    │     ├─ cron.NewDefaultParser(StandardOptions) → 解析器
+    │     └─ parser.Parse(schedule).Next(now) → 计算下次时间
+    │
+    ├─ 2. 获取分布式锁（防多实例重复执行）
+    │     gotLock, err := store.CronGetLock(cron, newNext.Unix())
+    │     │
+    │     ├─ 锁获取成功 → 继续执行
+    │     │    同时将 cron.NextExec 更新为 newNext
+    │     │
+    │     └─ 锁获取失败 → return nil
+    │        （另一个 server 实例已经抢到了）
+    │
+    ├─ 3. 创建 Pipeline
+    │     CreatePipeline(ctx, store, cron)
+    │     │
+    │     ├─ store.GetRepo(cron.RepoID)       → 获取仓库
+    │     ├─ ForgeFromRepo(repo)               → 获取 forge 实例
+    │     ├─ cron.Branch 空时 fallback 到 repo.Branch
+    │     ├─ store.GetUser(repo.UserID)        → 获取仓库 owner
+    │     ├─ forge.Refresh(ctx, _forge, store, repoUser) → 刷新 token
+    │     ├─ _forge.BranchHead(ctx, repoUser, repo, cron.Branch) → 获取最新 commit
+    │     │
+    │     └─ 返回 &model.Pipeline{
+    │            Event:               model.EventCron,        // 事件类型: cron
+    │            Commit:              commit.SHA,
+    │            Ref:                 "refs/heads/" + cron.Branch,
+    │            Branch:              cron.Branch,
+    │            Timestamp:           cron.NextExec,
+    │            Cron:                cron.Name,
+    │            ForgeURL:            commit.ForgeURL,
+    │            AdditionalVariables: cron.Variables,          // cron 附加变量
+    │        }
+    │
+    └─ 4. 提交 Pipeline
+          pipeline.Create(ctx, store, repo, newPipeline)
+          → 走标准 pipeline 创建流程（解析 YAML、入队、调度）
+```
+
+### 18.4 CronGetLock 的原子性保障
+
+**数据库层**：`CronGetLock` 通过 CAS（Compare-And-Swap）实现乐观锁：
+
+```sql
+UPDATE crons
+SET next_exec = {newNext}
+WHERE id = {cronID}
+  AND next_exec = {cron.NextExec}   -- CAS 条件：只有当前值未变时才更新
+```
+
+**多实例安全**：
+- 多个 server 实例同时读取到同一个 cron 记录
+- 只有第一个成功执行 CAS 更新的实例会获得锁
+- 其他实例的 CAS 失败，gotLock=false，跳过执行
+
+### 18.5 Cron 触发 vs Webhook 触发对比
+
+| 维度 | Webhook 触发 | Cron 触发 |
+|------|-------------|----------|
+| **事件源** | Forge 推送 webhook | Server 内部定时器 |
+| **Pipeline.Event** | push / pull_request / tag | cron |
+| **Commit SHA** | webhook 携带 | `BranchHead()` 实时查询 |
+| **触发分支** | webhook 决定 | cron.Branch 或 repo 默认分支 |
+| **额外变量** | 无 | cron.Variables 注入 |
+| **Pipeline.Cron** | 空 | cron.Name |
+| **Token 刷新** | PostHook 中 Refresh() | CreatePipeline 中 Refresh() |
+
+---
+
+## 19. Forge Integration 与 Webhook 调用栈
+
+### 19.1 Forge 接口定义
+
+**代码位置：`server/forge/forge.go:56-178**
+
+Forge 是 Woodpecker 与 Git 托管平台的统一抽象层。核心方法：
+
+| 方法 | 用途 | 调用时机 |
+|------|------|---------|
+| `Login()` | OAuth2 登录 | 用户授权回调 |
+| `Hook()` | 解析 webhook | `/api/hook` 接收推送 |
+| `File()` | 获取仓库文件 | pipeline 创建时读取 `.woodpecker.yml` |
+| `Dir()` | 获取目录文件列表 | 多文件 pipeline 配置 |
+| `Status()` | 上报 workflow 状态 | 步骤状态变更时 |
+| `Netrc()` | 生成 clone 凭证 | clone 步骤执行时 |
+| `Activate()` | 注册 webhook | 用户激活仓库 |
+| `Deactivate()` | 注销 webhook | 用户停用仓库 |
+| `BranchHead()` | 获取分支最新 commit | cron 触发 |
+| `Branches()` | 列出分支 | UI/API |
+| `PullRequests()` | 列出 PR | UI/API |
+| `Teams()` | 列出团队/组织 | 用户登录 |
+| `OrgMembership()` | 检查组织成员权限 | 权限校验 |
+| `Repo()`/`Repos()` | 获取仓库信息 | UI/API |
+
+### 19.2 ForgeManager 多实例管理
+
+**代码位置：`server/services/manager.go`**
+
+Woodpecker 支持同时接入多个 Forge 实例（如 GitHub + GitLab）：
+
+```
+ForgeManager
+    │
+    ├─ forges: map[int64]forge.Forge   ← ForgeID → Forge 实例
+    │
+    ├─ ForgeFromRepo(repo) → forges[repo.ForgeID]
+    │    └─ 每个仓库绑定到特定 Forge
+    │
+    ├─ ForgeAccessURL(forgeID) → forges[forgeID].URL()
+    │
+    └─ MainForge() → 主 Forge（用于全局操作）
+```
+
+### 19.3 Webhook 处理完整调用栈
+
+**代码位置：`server/api/hook.go:69-213**
+
+```
+POST /api/hook
+    │
+    ├─ 1. 验证 Webhook Token
+    │     token.ParseRequest([HookToken], req, func(t) {
+    │         repo = getRepoFromToken(store, t)
+    │         return repo.Hash, nil
+    │     })
+    │     │
+    │     ├─ 从 query string 或 header 中提取 token
+    │     ├─ 解析 JWT → 获取 forge-id + repo-forge-remote-id
+    │     └─ store.GetRepoForgeID(forgeID, remoteID) → 定位仓库
+    │
+    ├─ 2. 路由到对应 Forge 解析
+    │     _forge = ForgeFromRepo(repo)
+    │     repoFromForge, pipelineFromForge = _forge.Hook(ctx, req)
+    │     │
+    │     ├─ GitHub:  github.Hook() → 解析 X-GitHub-Event header
+    │     ├─ GitLab:  gitlab.Hook() → 解析 X-GitLab-Event header
+    │     ├─ Gitea:   gitea.Hook()  → 解析 X-Gitea-Event header
+    │     ├─ Forgejo: forgejo.Hook() → 解析 X-Forgejo-Event header
+    │     └─ Bitbucket: bitbucket.Hook() → 解析 X-Event-Key header
+    │
+    │  Hook() 返回语义:
+    │     (repo, pipeline, nil)       → 正常执行 pipeline
+    │     (repo, nil, nil)            → 有效 webhook 但不触发 pipeline
+    │     (nil, nil, ErrIgnoreEvent)  → 忽略的事件类型
+    │     (nil, nil, error)           → 解析错误
+    │
+    ├─ 3. 安全校验
+    │     ├─ repoFromForge.ForgeRemoteID == repo.ForgeRemoteID  → 防 webhook 伪造
+    │     ├─ repo.IsActive  → 仓库必须已激活
+    │     ├─ repo.UserID != 0  → 仓库必须有 owner
+    │     └─ pipelineFromForge.IsPullRequest() → repo.AllowPull 检查
+    │
+    ├─ 4. 仓库信息同步
+    │     ├─ FullName 变更 → 创建 Redirection
+    │     └─ repo.Update(repoFromForge) → store.UpdateRepo(repo)
+    │
+    ├─ 5. Token 刷新
+    │     forge.Refresh(ctx, _forge, store, user)
+    │     └─ 如果 token 将在 30 分钟内过期 → 使用 refresh_token 刷新
+    │
+    └─ 6. 创建 Pipeline
+          pipeline.Create(ctx, store, repo, pipelineFromForge)
+```
+
+### 19.4 Forge Hook 事件类型映射
+
+以 GitHub 为例（`server/forge/github/convert.go`）：
+
+| GitHub Event | Woodpecker Event | 触发条件 |
+|-------------|-----------------|---------|
+| `push` | `EventPush` | 分支推送 |
+| `pull_request` (opened/synchronized) | `EventPullRequest` | PR 创建/更新 |
+| `pull_request` (closed/merged) | 忽略 | PR 关闭 |
+| `deployment` | `EventDeploy` | 部署触发 |
+| `release` (published) | `EventRelease` | 发布创建 |
+| `create` (tag) | `EventTag` | 标签创建 |
+
+**事件过滤**（`pipeline/frontend/yaml/constraint/constraint.go`）：
+
+YAML 中的 `when` 条件在编译期过滤步骤：
+
+```yaml
+steps:
+  deploy:
+    when:
+      event: [push, deployment]
+      branch: main
+```
+
+### 19.5 Forge Status 回调
+
+**代码位置：`server/forge/forge.go:116` + `server/forge/common/status.go`**
+
+当 workflow 状态变更时，Server 向 Forge 报告：
+
+```
+pipeline.Create() / step_status.Update() / pipeline.Cancel()
+    │
+    └─ updatePipelineStatus(ctx, forge, pipeline, repo, user)
+         │
+         ├─ forge.Status(ctx, user, repo, pipeline, workflow)
+         │    │
+         │    ├─ GitHub:  创建 Commit Status（pending/success/failure/error）
+         │    ├─ GitLab:  创建 Pipeline Status
+         │    ├─ Gitea:   创建 Commit Status
+         │    └─ Forgejo: 创建 Commit Status
+         │
+         └─ 失败仅记录日志，不阻塞 pipeline 执行
+```
+
+**Status 与 Forge UI 的关系**：
+
+```
+Forge UI 显示:
+  commit abc123  ──→  ✓ woodpecker/build   (success)
+                      ✓ woodpecker/test    (success)
+                      ✗ woodpecker/deploy  (failure)
+
+每个 workflow 对应 Forge 中的一个 commit status，
+status 名称 = "woodpecker/" + workflow.Name
+```
+
+### 19.6 Activate / Deactivate：Webhook 注册
+
+**代码位置：`server/api/repo.go`**
+
+```
+POST /api/repos/{repo}/activate
+    │
+    ├─ forge.Activate(ctx, user, repo, webhookURL)
+    │    │
+    │    ├─ 生成 webhook URL:  {woodpecker_url}/hook?access_token={JWT}
+    │    │    JWT 包含: forge-id + repo-forge-remote-id
+    │    │
+    │    └─ GitHub: 创建 Repository Webhook
+    │       POST /repos/{owner}/{repo}/hooks
+    │       events: [push, pull_request, deployment, release, create]
+    │
+    └─ repo.IsActive = true → store.UpdateRepo(repo)
+
+DELETE /api/repos/{repo}
+    │
+    ├─ forge.Deactivate(ctx, user, repo, webhookURL)
+    │    └─ 删除 Forge 侧的 Webhook
+    │
+    └─ repo.IsActive = false
+```
+
+### 19.7 Forge Token 刷新机制
+
+**代码位置：`server/forge/refresh.go`**
+
+```go
+func Refresh(ctx context.Context, f forge.Forge, store store.Store, user *model.User) {
+    if user.Expiry == 0 { return }  // 无过期时间 → 不需要刷新
+
+    now := time.Now().Unix()
+    expiresAt := user.Expiry
+
+    // 提前 30 分钟刷新
+    if now < expiresAt && now > expiresAt-refreshTokenBeforeExpiry {
+        refreshedUser, err := f.Refresh(ctx, user)
+        if err != nil {
+            log.Error().Err(err)
+            return
+        }
+        store.UpdateUser(refreshedUser)
+    }
+}
+```
+
+### 19.8 Netrc 凭证生成（私有仓库 Clone）
+
+**代码位置：`server/forge/forge.go:120` + 各 forge 实现**
+
+Clone 步骤需要访问私有仓库时，Forge 提供 `.netrc` 格式的凭证：
+
+```go
+// GitHub
+func (g *GitHub) Netrc(u *model.User, r *model.Repo) (*model.Netrc, error) {
+    return &model.Netrc{
+        Machine:  "github.com",
+        Login:    "x-oauth-basic",     // GitHub 固定用户名
+        Password: u.AccessToken,       // OAuth token 作为密码
+    }, nil
+}
+
+// GitLab
+func (g *GitLab) Netrc(u *model.User, r *model.Repo) (*model.Netrc, error) {
+    return &model.Netrc{
+        Machine:  "gitlab.com",
+        Login:    "oauth2",            // GitLab 固定用户名
+        Password: u.AccessToken,
+    }, nil
+}
+```
+
+**Netrc 注入到 clone 步骤**（`server/pipeline/items.go` 编译期）：
+
+```go
+compiler.WithCloneEnv(map[string]string{
+    "CI_NETRC_MACHINE":  netrc.Machine,
+    "CI_NETRC_USERNAME": netrc.Login,
+    "CI_NETRC_PASSWORD": netrc.Password,
+})
+```
+
+Clone plugin（如 `woodpecker-plugin-git`）读取这些环境变量，写入 `.netrc` 文件后执行 git clone。
+
+---
+
+## 20. 完整事件流转总图
+
+```
+┌─────────────── Forge (GitHub/GitLab/Gitea/...) ──────────────┐
+│                                                            │
+│  Webhook Push ────► POST /api/hook                           │
+│  Webhook PR   ────► POST /api/hook                           │
+│  Cron Timer   ────► server/cron.Run() → BranchHead() → hook   │
+│                                                            │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────── Server: Pipeline Create ──────────────────────┐
+│                                                            │
+│  pipeline.Create()                                          │
+│    ├─ Forge.File() → 读取 .woodpecker.yml                   │
+│    ├─ PipelineBuilder.Build() → Matrix 展开多 workflow       │
+│    ├─ Compiler.Compile()                                     │
+│    │    ├─ Secret 注入 (from_secret → getSecretValue)        │
+│    │    ├─ Netrc 注入 (CI_NETRC_*)                            │
+│    │    ├─ Workspace Volume 生成 ({prefix}_default:/woodpecker)│
+│    │    ├─ Network 生成 ({prefix}_default)                    │
+│    │    └─ Clone/Service/Commands/Plugin 步骤生成              │
+│    ├─ 审批检查 → Blocked/Pending                               │
+│    └─ queuePipeline() → PushAtOnce() → 入队                  │
+│                                                            │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────── Queue: 调度 ──────────────────────────────────┐
+│                                                            │
+│  FIFO.process() 每 100ms                                    │
+│    ├─ 依赖检查 depsInQueue()                                 │
+│    ├─ assignToWorker() → label filter + 评分                  │
+│    ├─ worker.channel <- task → Agent Poll() 收到             │
+│    └─ resubmitExpiredPipelines() → lease 过期重入队            │
+│                                                            │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────── Agent: 执行 ──────────────────────────────────┐
+│                                                            │
+│  Runner.Run() 循环                                           │
+│    ├─ client.Next() → 获取 workflow                         │
+│    ├─ client.Init() → Pipeline: Pending→Running             │
+│    ├─ 并发: Wait() + Extend() + Runtime.Run()                │
+│    │    │                                                    │
+│    │    └─ Runtime.Run()                                     │
+│    │       ├─ engine.SetupWorkflow()                         │
+│    │       │    ├─ Docker: VolumeCreate + NetworkCreate       │
+│    │       │    └─ K8s: PVC + HeadlessService                │
+│    │       │                                                 │
+│    │       ├─ for stage in stages:                           │
+│    │       │    runStage() → errgroup 并行执行 steps          │
+│    │       │    │                                            │
+│    │       │    └─ executeStep(step)                         │
+│    │       │       ├─ shouldSkipStep(OnFailure/OnSuccess)    │
+│    │       │       ├─ engine.StartStep()                     │
+│    │       │       ├─ engine.TailStep() → 日志流              │
+│    │       │       ├─ engine.WaitStep() → 等待完成            │
+│    │       │       ├─ engine.DestroyStep()                    │
+│    │       │       └─ traceStep() → client.Update() 上报状态  │
+│    │       │                                                 │
+│    │       └─ engine.DestroyWorkflow()                        │
+│    │            ├─ Docker: VolumeRemove + NetworkRemove       │
+│    │            └─ K8s: PVC 删除 + Service 删除               │
+│    │                                                         │
+│    └─ client.Done() → Workflow→终态, Pipeline 汇总            │
+│                                                            │
+└───────────────────────────┬────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────── Server: 状态汇总 ──────────────────────────────┐
+│                                                            │
+│  RPC.Done() / RPC.Update()                                  │
+│    ├─ CalcStepStatus() → Step 终态                          │
+│    ├─ UpdateWorkflowStatusToDone() → Workflow 终态           │
+│    ├─ PipelineStatus() → MergeStatusValues() → Pipeline 终态 │
+│    ├─ forge.Status() → Forge UI 更新                         │
+│    ├─ publishToTopic() → PubSub 通知                         │
+│    └─ scheduler.Done() → 队列清理, 触发下游 workflow           │
+│                                                            │
+└────────────────────────────────────────────────────────────┘
+```
