@@ -697,10 +697,384 @@ Docker 后端只返回原始 `ExitCode` + `OOMKilled`，但 Runtime 层将其丰
 
 ---
 
-## 五、关键代码位置速查
+## 五、补充细节分析
+
+### 5.1 Matrix Build：Step 展开多 Container 的对应关系
+
+**展开发生在前端构建阶段**（后端 Docker 层不感知 matrix），完整链路在 `pipeline/frontend/builder/builder.go:52-97`：
+
+```
+PipelineBuilder.Build()
+  ├─ matrix.ParseString(y.Data)                  ←── 解析 matrix 定义
+  │   └─ calc(matrix) → []Axis                   ←── 笛卡尔积生成排列组合
+  │       限制: limitTags=10, limitAxis=25       (matrix.go:26-28)
+  │
+  ├─ 空 matrix 时: axes = [Axis{}]               ←── 非 matrix pipeline 退化为单个空轴
+  │
+  └─ for i, axis := range axes                   ←── 每轴 = 一个独立 workflow
+      ├─ workflow.PID = pidSequence++
+      ├─ workflow.Environ = axis                 ←── matrix 变量注入环境
+      ├─ workflow.AxisID = i+1                   ←── 多轴时编号
+      └─ genItemForWorkflow(workflow, axis, data)
+          ├─ environmentVariables(metadata, axis) ←── axis 作为环境变量用于模板替换
+          ├─ metadata.EnvVarSubst(data, environ)  ←── ${GO_VERSION} 等占位符替换
+          ├─ yaml.ParseString(substituted)        ←── 解析替换后的 YAML
+          └─ toInternalRepresentation()           ←── 转为 backend_types.Config
+```
+
+**对应关系**：
+- 一个 matrix `axis`（如 `GO_VERSION=1.21, REDIS=7`）→ 一个 `Workflow` → 一个 `backend_types.Config`
+- 每个 Config 有独立的 `conf.Volume`（`${prefix}_default`）和 `conf.Network`，互不共享
+- 展开后多个 workflow 可能被调度到不同 agent 上执行，各自独立创建卷/网络/容器
+
+**关键代码**：
+- `pipeline/frontend/yaml/matrix/matrix.go:70-112` —— `calc()` 笛卡尔积算法（阶乘式展开）
+- `pipeline/frontend/builder/builder.go:57-88` —— axis 循环生成 workflow
+- `pipeline/frontend/builder/builder.go:207-211` —— `environmentVariables()` 将 axis 合并入环境
+
+---
+
+### 5.2 同 Workflow 拉多 Registry 镜像：AuthConfig 列表顺序
+
+AuthConfig 匹配发生在 **编译阶段**（`createProcess`），不是后端 Docker 层。
+
+**匹配逻辑**：`pipeline/frontend/yaml/compiler/convert.go:131-138`
+
+```go
+authConfig := backend_types.Auth{}
+for _, registry := range c.registries {          // 按配置顺序遍历
+    if utils.MatchHostname(container.Image, registry.Hostname) {
+        authConfig.Username = registry.Username
+        authConfig.Password = registry.Password
+        break                                     // 第一个匹配即停止
+    }
+}
+```
+
+**`MatchHostname` 实现**：`pipeline/frontend/yaml/utils/image.go:98-107`
+
+```go
+func MatchHostname(image, hostname string) bool {
+    named, err := ParseNamed(image)                // 解析 image 为 reference.Named
+    if hostname == "index.docker.io" {
+        hostname = "docker.io"                     // Docker Hub 别名统一
+    }
+    return reference.Domain(named) == hostname     // 比较 domain 部分
+}
+```
+
+**列表顺序的影响**：
+- 多个 registry 配置了相同 hostname 时，**第一个配置优先**，后续被忽略
+- 如果 image 没有匹配到任何 registry，`authConfig` 为空，后端走匿名拉取
+- `step.AuthConfig` 随 Step 结构体一路传递到 Docker 后端，编码为 `RegistryAuth` 头
+
+**示例**：
+```
+registries: [
+    {Hostname: "registry.example.com", Username: "user1", Password: "pass1"},
+    {Hostname: "registry.example.com", Username: "user2", Password: "pass2"},
+]
+image: "registry.example.com/app:latest" → 匹配第一个（user1），第二个被丢弃
+```
+
+---
+
+### 5.3 OOM 时 Tmpfs 是否被优先回收
+
+**结论：Woodpecker 不管理 tmpfs 回收，由 Linux 内核 OOM Killer 统一决策。**
+
+**代码事实**：
+- Tmpfs 配置直接透传给 Docker：`convert.go:123-134` → `hostConfig.Tmpfs`
+- 没有任何针对 tmpfs 的 OOM 专属处理逻辑
+- OOM 检测只有一行：`WaitStep` 中读取 `info.Container.State.OOMKilled`
+
+**内核视角下的行为**：
+- tmpfs 内存计入容器 cgroup 的 `memory.limit_in_bytes`（v1）或 `memory.max`（v2）
+- tmpfs 写操作触发 cgroup 内存超出时，内核会触发 cgroup 级 OOM Killer
+- OOM Killer 根据 `oom_score_adj` 选择进程杀死，**不区分"普通内存" vs "tmpfs 占用"**
+- tmpfs 的内容不会被 swap 出去（除非启用 `tmpfs` swap，但 Docker 默认不配置）
+- tmpfs 数据随容器 `ContainerRemove` 清空，不是"回收"而是"丢弃"
+
+**映射到 Woodpecker**：
+```
+cgroup memory.max 超限
+    ↓
+内核 OOM Killer → 杀死容器内进程
+    ↓
+容器退出，OOMKilled = true
+    ↓
+WaitStep → info.Container.State.OOMKilled = true
+    ↓
+completeStep → pipeline_errors.OomError{UUID, Code}
+```
+
+**tmpfs 与 OOM 的实际关系**：如果 step 配置了大量 tmpfs（如 `/dev/shm`），且写入大量数据，会更快触发 OOM。但 Woodpecker 侧无法"优先回收 tmpfs"——只能通过 `WOODPECKER_BACKEND_DOCKER_LIMIT_MEM` 和 `WOODPECKER_BACKEND_DOCKER_LIMIT_SHM_SIZE` 提前限制。
+
+---
+
+### 5.4 Logs 流 Hang 时的超时控制
+
+**Woodpecker 没有为日志流单独设置超时，但有多层级联超时间接兜底。**
+
+**层级 1：Workflow 全局超时**（`agent/runner.go:80-103`）
+
+```go
+timeout := time.Hour                                        // 默认 1 小时
+if minutes := workflow.Timeout; minutes != 0 {
+    timeout = time.Duration(minutes) * time.Minute
+}
+workflowCtx, _ := context.WithTimeout(ctxMeta, timeout)     // context 级超时
+```
+
+超时后 `workflowCtx.Done()` 触发，会：
+1. 取消 `ContainerWait`（`WaitStep` 中 `<-ctx.Done()` 分支返回 `context.Canceled`）
+2. 取消 `ContainerLogs`（`TailStep` 的 ctx 被取消，流返回错误）
+3. 后续 `DestroyStep` 使用 `runnerCtx`（存活更久）清理容器
+
+**层级 2：单行大小切割**（`pipeline/utils/copy_line_by_line.go:45-107`）
+
+```go
+func CopyLineByLine(dst io.Writer, src io.Reader, maxSize int) error {
+    // 超过 maxSize 的行被强制分块写出，避免单行无限增长导致内存泄漏
+    case len(buf) >= maxSize:
+        dst.Write(buf[:maxSize])  // 即使没有 \n 也强制写出 maxSize 字节
+        buf = buf[maxSize:]
+}
+```
+
+**层级 3：Agent Healthy 检查**（`agent/state.go:62-73`）
+
+```go
+func (s *State) Healthy() bool {
+    now := time.Now()
+    buf := time.Hour                                      // 超出超时 1 小时缓冲
+    for _, item := range s.Metadata {
+        if now.After(item.Started.Add(item.Timeout).Add(buf)) {
+            return false                                  // 标记 agent 不健康
+        }
+    }
+    return true
+}
+```
+
+**Hang 场景的实际流程**：
+```
+日志流挂住（ContainerLogs 无数据返回、无 EOF）
+    ↓
+waitForLogs() 阻塞
+    ↓
+workflowCtx timeout 到期 → Cancel
+    ↓
+ContainerLogs ctx 取消 → rc 返回错误，goroutine 退出
+    ↓
+waitForLogs() 解除阻塞
+    ↓
+WaitStep 返回 ctx.Canceled → 映射为 ErrCancel
+    ↓
+DestroyStep (runnerCtx) 停止+删除容器
+```
+
+**注意**：如果是 **goroutine 卡在 `stdcopy.StdCopy`** 且底层 TCP 连接完全静默（没有 RST、没有 FIN），需要靠 TCP keepalive 或 workflow 超时兜底。`WOODPECKER_KEEPALIVE_TIME`（`cmd/agent/core/flags.go:106-109`）配置 gRPC 层 keepalive，但 Docker daemon 连接的 keepalive 取决于系统配置。
+
+---
+
+### 5.5 多 Worker 同时崩的容器留存上限
+
+**结论：没有"容器留存上限"机制，崩溃后残留 = 当时正在运行的容器数。**
+
+**正常路径**（不崩溃）：`DestroyWorkflow` 保证容器一律被清理（`docker.go:369-408`）
+
+```go
+errWG := errgroup.Group{}
+for _, stage := range conf.Stages {
+    for _, step := range stage.Steps {
+        errWG.Go(func() error { return e.DestroyStep(...) })  // 并发销毁所有 step
+    }
+}
+```
+
+**崩溃路径**（Agent 进程被杀）：
+- 若 Agent 在 workflow 执行中崩溃：`defer destroyWorkflowFunc()` 未执行 → 所有 `wp_${UUID}` 容器 + `${prefix}_default` 卷 + 网络全部残留
+- 容器名带 UUID，不会与后续 workflow 冲突，但会占用磁盘和资源
+
+**残留容器的上限 = 并行度 × 单 workflow step 数**：
+
+| 参数 | 配置项 | 默认值 | 说明 |
+|------|--------|--------|------|
+| 并行 workflow 数 | `WOODPECKER_MAX_WORKFLOWS` | 1 | `cmd/agent/core/flags.go:82-86` |
+| step 名冲突防护 | UUID → `wp_${UUID}` | - | 不依赖上限，天然隔离 |
+| 重启后清理 | ❌ 无自动扫描残留机制 | - | 重启不清理旧容器 |
+
+**防护建议（代码中缺失，需运维侧）**：
+- 定期执行 `docker container prune --filter "label=wp_step"`（容器都打了 `wp_uuid/wp_step` label）
+- 或者基于 `wp_` 前缀的命名约定清理
+
+**容器标签**（`convert.go:41-44`）是唯一残留清理线索：
+```go
+Labels: map[string]string{
+    "wp_uuid": step.UUID,
+    "wp_step": step.Name,
+}
+```
+
+---
+
+### 5.6 Cgroup v1 与 v2 兼容差异
+
+**结论：Woodpecker 代码层完全不感知 cgroup 版本差异，全部委托给 Docker/Moby 客户端适配。**
+
+**资源限制参数**（`config.go:33-40` → `convert.go:78-86`）：
+
+```go
+type resourceLimit struct {
+    MemSwapLimit int64   // WOODPECKER_BACKEND_DOCKER_LIMIT_MEM_SWAP
+    MemLimit     int64   // WOODPECKER_BACKEND_DOCKER_LIMIT_MEM
+    ShmSize      int64   // WOODPECKER_BACKEND_DOCKER_LIMIT_SHM_SIZE
+    CPUQuota     int64   // WOODPECKER_BACKEND_DOCKER_LIMIT_CPU_QUOTA
+    CPUShares    int64   // WOODPECKER_BACKEND_DOCKER_LIMIT_CPU_SHARES
+    CPUSet       string  // WOODPECKER_BACKEND_DOCKER_LIMIT_CPU_SET
+}
+```
+
+透传为 Docker `container.Resources`，Docker daemon 根据宿主机 cgroup 版本翻译：
+
+| 参数 | Cgroup v1 | Cgroup v2 | 备注 |
+|------|-----------|-----------|------|
+| `Memory` | `memory.limit_in_bytes` | `memory.max` | 语义一致 |
+| `MemorySwap` | `memory.memsw.limit_in_bytes` | `memory.swap.max` | v2 需 kernel 开启 swapaccount |
+| `CPUQuota` | `cpu.cfs_quota_us` + `cpu.cfs_period_us` | `cpu.max` | 语义一致，v2 简化为 single file |
+| `CPUShares` | `cpu.shares` | `cpu.weight` | **值范围不同**：v1=[2,262144]，v2=[1,10000]，Docker 自动换算 |
+| `CpusetCpus` | `cpuset.cpus` | `cpuset.cpus` | 语义一致 |
+| `ShmSize` | 不经过 cgroup（tmpfs mount option） | 同左 | 不涉及 cgroup 版本 |
+
+**CPUShares 换算陷阱**：
+- Woodpecker 传入原始值，如 `CPUShares=1024`（v1 常见默认）
+- Docker 在 cgroup v2 宿主机上自动按比例换算为 `cpu.weight`（1024 → ~5000）
+- 但如果显式设置了 v2 风格值（如 `5000`），在 v1 宿主机上也会被反向换算
+- Woodpecker 用户感知不到，但调优时需注意两个版本的权重语义不同
+
+**设备 cgroup 权限**（`convert.go:174-195`）：
+```go
+container.DeviceMapping{
+    PathOnHost:        parts[0],
+    PathInContainer:   parts[1],
+    CgroupPermissions: "rwm",     // 硬编码 rwm，不区分 cgroup 版本
+}
+```
+`CgroupPermissions` 在 v1 写入 `devices.allow`，v2 写入 `device.allow`，Docker 适配。
+
+---
+
+### 5.7 IPv6 Only 环境：Alias DNS 回退
+
+**结论：Woodpecker 不管理容器内 DNS 解析行为，完全依赖 Docker daemon 的网络 DNS 配置。**
+
+**网络创建流程**（`docker.go:156-175`）：
+
+```go
+networkDriver := networkDriverBridge    // Linux: bridge
+if e.info.OSType == "windows" {
+    networkDriver = networkDriverNAT    // Windows: nat
+}
+_, err = e.client.NetworkCreate(ctx, conf.Network, client.NetworkCreateOptions{
+    Driver:     networkDriver,
+    EnableIPv6: &e.config.enableIPv6,   // WOODPECKER_BACKEND_DOCKER_ENABLE_IPV6
+})
+```
+
+**Step 容器加入网络时的 Alias 设置**（`docker.go:250-271`）：
+
+```go
+for _, net := range step.Networks {
+    _, err = e.client.NetworkConnect(ctx, net.Name, client.NetworkConnectOptions{
+        EndpointConfig: &network.EndpointSettings{
+            Aliases: net.Aliases,       // 如 ["build", "app"]，来自 convert.go:58-68
+        },
+        Container: containerName,
+    })
+}
+```
+
+**Alias 的解析链路**：
+```
+容器内进程访问 http://build:8080
+    ↓
+容器内 /etc/resolv.conf → 指向 Docker 内置 DNS resolver (127.0.0.11)
+    ↓
+Docker 内置 DNS 查找网络内的 alias "build"
+    ↓
+找到对应容器的 Endpoint → 返回其 IP 地址
+    ↓
+IPv4/IPv6 双栈环境: 返回 A + AAAA 记录
+IPv6-only 环境: 只返回 AAAA 记录（如 enableIPv6=true 且容器分配了 v6 地址）
+```
+
+**Woodpecker 可配置项**：
+
+| 配置 | 作用 | 对 IPv6-only 的影响 |
+|------|------|---------------------|
+| `WOODPECKER_BACKEND_DOCKER_ENABLE_IPV6` | 给 bridge 网络分配 IPv6 子网 | 必须 `true` 才能拿到 v6 地址 |
+| `step.DNS` | 容器 `/etc/resolv.conf` 附加 nameserver | 可填 IPv6 DNS 地址，但 Docker 内置 resolver 优先级更高 |
+| `step.DNSSearch` | search domain | 不影响 A/AAAA 选择 |
+| `step.ExtraHosts` | `/etc/hosts` 硬编码 | 填 IPv6 地址（`host:[::1]`）即可绕过 DNS |
+
+**无回退机制**：
+- 如果 Docker 网络层只分配了 IPv4 地址而环境是 IPv6-only，alias 无法解析 → 连接失败
+- Woodpecker 不会在 step 侧做 `getaddrinfo` 回退，需要 Docker daemon 层面正确配置 IPv6
+- 补救：`step.ExtraHosts` 手动注入 IPv6 地址映射
+
+---
+
+### 5.8 401 Unauthorized 自动 Refresh Token 时机
+
+**结论：Woodpecker 的 registry 鉴权使用静态 Username/Password 对，没有 token refresh 机制。401 直接失败。**
+
+**AuthConfig 编码流程**（`docker.go:193-197` + `convert.go:199-205`）：
+
+```go
+// 编译阶段: 从 registries 列表匹配到 {Username, Password}
+step.AuthConfig = backend_types.Auth{Username, Password}
+
+// Docker 后端 StartStep:
+pullOpts := client.ImagePullOptions{}
+if step.AuthConfig.Username != "" && step.AuthConfig.Password != "" {
+    pullOpts.RegistryAuth, _ = encodeAuthToBase64(step.AuthConfig)
+    // encodeAuthToBase64 = base64(json.Marshal({Username, Password}))
+}
+e.client.ImagePull(ctx, config.Image, pullOpts)
+```
+
+**401 的两种场景**：
+
+| 场景 | 代码行为 | 结果 |
+|------|----------|------|
+| `step.Pull=true` 时拉取 401 + 密码非空 | `docker.go:213-215`: `if pErr != nil && Password != "" { return pErr }` | 直接报错，不重试 |
+| `step.Pull=true` 时拉取 401 + 密码为空（匿名） | 错误被吞，降级到本地镜像 | 静默继续（设计如此，见注释 drone#1917） |
+| `ContainerCreate` 触发拉取时 401 | `docker.go:229-231`: `if pErr != nil { return pErr }` | 直接报错，不区分密码是否为空 |
+
+**无 refresh 的原因**：
+- `AuthConfig` 是静态的 `{Username, Password}` 对（`pipeline/backend/types/auth.go:15-21`），没有 `RefreshToken`、`ExpiresAt` 等字段
+- `encodeAuthToBase64` 直接 JSON + base64，不获取短期 token
+- Docker 客户端 `ImagePull` 内部虽然有 token 协商（Bearer auth 挑战），但那是 Docker daemon ↔ registry 之间的协议，Woodpecker 侧不可见
+- 如果使用的是短期 password（如 AWS ECR 的 12h 密码），需要在编译 workflow 之前**外部提前刷新**，Woodpecker 不会帮你做
+
+**OAuth token refresh 的区别**：搜索到的 `server/forge/refresh.go` 是 **用户 OAuth token 刷新**（用于 forge/GitHub API 访问），与 registry 镜像拉取无关：
+```go
+// 触发时机: 30 分钟内即将过期（refresh.go:59-60）
+if time.Until(user.Expiry) < 30*time.Minute {
+    // singleflight 防止并发刷新 → Refresh() → 写回 DB
+}
+```
+
+**建议（若需自动 refresh registry token）**：在 workflow 编译前（如 API 层或 custom plugin）调用 registry API 获取新密码，然后通过 registries 列表传入最新凭证。
+
+---
+
+## 六、关键代码位置速查
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
+| **核心链路** | | |
 | Backend 接口定义 | `pipeline/backend/types/backend.go` | 60 |
 | Docker 后端主逻辑 | `pipeline/backend/docker/docker.go` | - |
 | SetupWorkflow | `pipeline/backend/docker/docker.go` | 156 |
@@ -719,3 +1093,20 @@ Docker 后端只返回原始 `ExitCode` + `OOMKilled`，但 Runtime 层将其丰
 | 错误类型定义 | `pipeline/errors/runtime.go` | - |
 | Step 结构体 | `pipeline/backend/types/step.go` | 18 |
 | State 结构体 | `pipeline/backend/types/state.go` | 18 |
+| **补充章节** | | |
+| Matrix 笛卡尔积展开 | `pipeline/frontend/yaml/matrix/matrix.go` | 70 |
+| Matrix Build 生成 Workflow | `pipeline/frontend/builder/builder.go` | 52-97 |
+| AuthConfig 匹配 registry | `pipeline/frontend/yaml/compiler/convert.go` | 131 |
+| Image hostname 匹配 | `pipeline/frontend/yaml/utils/image.go` | 98 |
+| Tmpfs 配置 | `pipeline/backend/docker/convert.go` | 123 |
+| 日志单行大小切割 | `pipeline/utils/copy_line_by_line.go` | 45 |
+| Workflow 超时设置 | `agent/runner.go` | 80 |
+| Agent 健康检查 | `agent/state.go` | 62 |
+| Agent 配置 (MAX_WORKFLOWS) | `cmd/agent/core/flags.go` | 82 |
+| Docker 资源限制配置 | `pipeline/backend/docker/config.go` | 33 |
+| Docker 后端 Flags | `pipeline/backend/docker/flags.go` | - |
+| Cgroup 设备权限 | `pipeline/backend/docker/convert.go` | 174 |
+| IPv6 网络创建 | `pipeline/backend/docker/docker.go` | 171 |
+| Network Alias 设置 | `pipeline/backend/docker/docker.go` | 250 |
+| Registry Auth 编码 | `pipeline/backend/docker/convert.go` | 199 |
+| 卷字符串解析正则 | `pipeline/backend/docker/convert.go` | 216 |
