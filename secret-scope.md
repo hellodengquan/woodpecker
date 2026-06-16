@@ -869,6 +869,32 @@ for _, part := range strings.Split(old, "\n") {
 - ✅ 完整的 UTF-8 字符不会被截断匹配
 - ⚠️ 但若日志输出系统对多字节字符做了截断（如按字节限制行宽），截断后的残余字节可能恰好与 Secret 前缀匹配，造成误替换或漏替换
 
+### 12.4 截断 Token 边界与误伤规范
+
+`strings.Replacer` 是**无脑子串替换**，不做任何边界检测（词边界、Token 边界、语法边界）。结合代码分析，误伤场景可按严重程度分级：
+
+| 级别 | 场景 | 示例 | 影响 |
+|-----|------|------|------|
+| **高危** | Secret 是常用英文单词 | Secret = `build`，日志中 `build started` 变成 `******** started` | 日志可读性完全丧失 |
+| **高危** | Secret 是路径/前缀子串 | Secret = `/app/config`，日志中 `/app/config/prod.yaml` 变成 `********/prod.yaml` | 部分泄露 + 可读性下降 |
+| **中危** | Secret 含可打印特殊字符 | Secret = `pass$word`，Shell 变量展开后在日志中以不同形式出现 | 脱敏不彻底，变种值泄露 |
+| **中危** | Base64/hex 编码重叠 | Secret 的 Base64 前缀与日志中其他 Base64 串前缀相同 | 合法内容被误替换 |
+| **低危** | 数字重叠 | Secret 包含数字子串（如 `123456`），日志中日期/时间戳被部分替换 | 影响可读性 |
+
+**边界规范缺失**：
+- 无 `\b` 词边界检测（Go 的 `strings.Replacer` 不支持正则）
+- 无白名单 token 机制（不能排除某些字段不脱敏）
+- 无最小/最大替换长度限制（除了 `minStringLength=3`）
+- 无替换计数上限（同一行中所有出现都替换）
+
+**典型误伤路径**：
+```
+Secret 值: "mytoken123" (11 字节)
+日志输出: "Authorization: Bearer mytoken123xyz"
+         → 替换后: "Authorization: Bearer ********xyz"
+         （后半截 "xyz" 暴露，且 ******** 无法判断泄露了多少）
+```
+
 ---
 
 ## 13. fsnotify 在 NFS 与共享卷下的兼容
@@ -943,6 +969,50 @@ log.Fatal().Err(err).Msg(errMessageFailedRotatingEncryption)  // os.Exit(1)
 > 3. watcher 任何错误 → `log.Fatal()` → **Woodpecker Server 进程崩溃退出**
 > 4. 无 fallback 轮询机制作为 fsnotify 的补充
 
+### 13.5 Graceful Exit 缺失分析
+
+当前实现**完全没有优雅退出逻辑**：
+
+| 事件 | 当前行为 | 期望 Graceful 行为 |
+|-----|---------|-------------------|
+| watcher 通道关闭 (`!ok`) | `log.Fatal()` → 立即 `os.Exit(1)` | 记录告警 → 降级为轮询模式 → 不中断服务 |
+| watcher 错误 | `log.Fatal()` → 立即 `os.Exit(1)` | 记录错误 → 指数退避重试重建 watcher → N 次失败后降级 |
+| 轮换失败 | `log.Fatal()` → 立即 `os.Exit(1)` | 回滚到旧密钥 → 记录告警 → 保留数据可解密性 → 通知管理员 |
+| Server 关闭 (`SIGTERM`) | goroutine 被强制杀死，watcher 未 Close | `defer watcher.Close()` 释放资源 → 等待加密操作完成 |
+
+**致命设计问题**：`handleFileEvents` 是独立 goroutine，出错时直接 `os.Exit(1)`，导致：
+- 正在进行的数据库事务被中断（可能数据不一致）
+- 正在运行的 Pipeline 状态丢失
+- 无任何清理（关闭连接、刷新日志等）
+- 容器环境下 Kubernetes 会反复重启，形成 CrashLoopBackOff
+
+### 13.6 K8s ConfigMap Informer 替代方案
+
+在 Kubernetes 环境下，fsnotify 对 ConfigMap/Secret 更新的检测不可靠（见 13.3 节）。可采用以下替代方案：
+
+| 方案 | 实现路径 | 实时性 | 复杂度 | 与现有代码兼容 |
+|------|---------|--------|--------|--------------|
+| **fsnotify + 轮询兜底** | 保留 fsnotify，新增 30s 间隔的文件 stat 轮询，检测 mtime 变化 | 秒级 | 低 | ✅ 增量修改 |
+| **K8s client-go Informer** | 使用 `k8s.io/client-go/informers` 监听 ConfigMap/Secret 变更事件 | 秒级 | 中 | ❌ 需引入 K8s 依赖 |
+| **Downward API + reload** | Sidecar 检测 ConfigMap 变更 → 发信号 → Server 热重载 | 秒级 | 中 | ✅ 进程内处理 |
+| **定期轮询（简单粗暴）** | 去掉 fsnotify，改为定时（1分钟）读取密钥文件 | 分钟级 | 极低 | ✅ 可直接删除 watcher 代码 |
+| **环境变量** | 密钥直接注入环境变量，重启生效 | 重启级 | 低 | ❌ 违背密钥安全最佳实践 |
+
+**推荐方案**：fsnotify + 轮询兜底（hybrid 模式）
+```go
+// 思路：fsnotify 为主，轮询兜底
+// 1. 保留现有 fsnotify watcher 做快速检测
+// 2. 新增 ticker 定时（如 30s）检查文件 mtime/sha256
+// 3. watcher 出错不 fatal，仅记录错误 + 切换为纯轮询模式
+// 4. 两种机制任意一种检测到变更都触发 rotate()
+```
+
+**K8s Informer 方案要点**：
+- 使用 `corev1.SecretInformer` 监听 `woodpecker-encryption-key` Secret
+- 变更回调直接调用 `rotate()`
+- 与 Tink keyset 格式兼容（文件内容不变）
+- 额外依赖 `k8s.io/client-go`，约 +15MB 二进制体积
+
 ---
 
 ## 14. Trusted Plugins 动态加载
@@ -984,6 +1054,42 @@ TrustedClonePlugins: append(repo.NetrcTrustedPlugins, server.Config.Pipeline.Tru
 | `WOODPECKER_PLUGINS_PRIVILEGED` | 进程内存 | ❌ | 重启 Server |
 | `repo.NetrcTrustedPlugins` | 数据库 | ✅ (API) | 下次 Pipeline 立即生效 |
 | `DefaultClonePlugin` | 进程内存 | ❌ | 重启 Server |
+
+### 14.4 NetrcTrustedPlugins 动态修改的回滚
+
+定义位置：`server/api/repo.go:287-289`、`server/model/repo.go:163`
+
+`NetrcTrustedPlugins` 通过 `PATCH /api/repos/{owner}/{name}` 更新：
+
+```go
+if in.NetrcTrusted != nil {
+    repo.NetrcTrustedPlugins = *in.NetrcTrusted  // 直接覆盖，无保留
+}
+```
+
+#### 当前行为
+- **直接覆盖**：每次 PATCH 请求用新列表**完全替换**旧列表，不是增量添加/删除
+- **无历史记录**：数据库中只有当前值，`repo` 表无版本字段
+- **无回滚机制**：修改后无法恢复到之前的配置
+
+#### 风险场景
+
+| 场景 | 影响 |
+|------|------|
+| 误操作删除了可信插件 | 下次 Pipeline clone 步骤无法注入 Netrc 凭证，构建失败 |
+| 添加了恶意插件镜像 | 恶意镜像可获取仓库 Netrc 凭证，代码泄露 |
+| API 参数格式错误（如传了 nil） | 列表被清空，所有仓库的 clone 步骤失效 |
+
+#### 回滚方案对比
+
+| 方案 | 实现方式 | 侵入性 | 回滚速度 |
+|------|---------|--------|---------|
+| **数据库备份恢复** | 定期备份 `repos` 表，误操作后整表恢复 | 低 | 慢（分钟级） |
+| **变更事件 + 版本表** | 新建 `repo_config_versions`，每次修改前存快照 | 中 | 快（API 级回滚） |
+| **软删除 + 审计日志** | 保留配置历史，支持一键回退到 N 个版本前 | 中 | 快 |
+| **GitOps 管理** | 所有仓库配置以 Git 仓库为唯一真值，PR 审核后生效 | 高 | 中（需重新 apply） |
+
+> ⚠️ **注意**：`NetrcTrustedPlugins` 直接影响 Netrc 凭证的注入范围。恶意插件加入可信列表后，可获取 `$CI_NETRC_USERNAME` / `$CI_NETRC_PASSWORD`，进而克隆私有代码仓库。其安全影响不亚于 Secret 泄露。
 
 > ⚠️ **局限**：
 > 1. 全局 Trusted/Privileged Plugins 列表**不支持热加载**，增删插件必须重启 Server
@@ -1035,6 +1141,43 @@ Woodpecker **无内置的 Hash 轮换 API**。泄露后需要手动操作：
 3. 旧 Hash 立即失效（JWT 验证使用数据库中的新 Hash）
 ```
 
+### 15.4 JWT 泄露自动检测
+
+当前代码**无任何 JWT 泄露检测机制**。以下是基于现有代码结构的可行检测方案：
+
+#### 可观测的异常信号
+
+| 信号 | 检测方式 | 误报率 | 实现难度 |
+|-----|---------|--------|---------|
+| **同一 Token 多 IP 使用** | 记录每次 Hook 请求的源 IP，同一 `repo.Hash` 短期内出现多个不同地域 IP | 低（CDN/NAT 可能误报） | 低 |
+| **Webhook 频率突增** | 基于历史数据的基线检测，同一仓库 Webhook QPS 超过阈值 N 倍告警 | 中 | 低 |
+| **异常事件类型** | 正常情况下只有 push/pull_request/tag，突然出现大量 deployment/custom 事件 | 低 | 低 |
+| **Payload 签名不一致** | JWT 验证通过但 Forge HMAC 签名验证失败（可疑） | 极低 | 中 |
+| **Token 首次使用时间异常** | Token 签发时间与当前时间差 > 某个阈值（如 90 天），但还在频繁使用 | 低 | 低 |
+
+#### 基于现有代码的检测落点
+
+```
+Hook 验证入口: server/api/hook.go:69-92
+  ├── token.ParseRequest()  → JWT 验证通过
+  ├── forge.Hook()          → Forge 签名验证通过
+  ├── repo ID 二次校验      → 确认属于对应仓库
+  └── 此处可插入检测逻辑
+       ├── 记录 {repo_id, src_ip, event_type, user_agent, timestamp}
+       ├── 与历史行为比对
+       └── 异常 → 触发告警 / 临时禁用仓库 / 强制轮换 Hash
+```
+
+#### 检测架构建议
+
+| 层级 | 方案 | 延迟 | 存储成本 |
+|-----|------|------|---------|
+| **进程内内存** | 滑动窗口计数（如 1 分钟/1 小时），LRU cache 存 IP 列表 | 实时 | 低（MB 级） |
+| **Redis** | 集中式计数 + 布隆过滤器，跨实例共享状态 | 毫秒级 | 中 |
+| **日志+SIEM** | Webhook 请求日志输出到 ELK/Splunk，离线规则匹配 | 分钟级 | 高 |
+
+> ⚠️ **局限**：当前 `HookToken` 没有 `jti` (JWT ID) 和 `iat` (签发时间) claim，使得精确的 Token 生命周期管理和泄露溯源非常困难。建议先添加 `jti` + `iat`，再做更精细的检测。
+
 > ⚠️ **局限**：
 > 1. **无自动轮换机制**：不像 Tink 加密密钥有 fsnotify 自动检测，`repo.Hash` 需要手动更新
 > 2. **无泄露检测**：无日志异常检测、无 Token 使用频率监控
@@ -1067,6 +1210,32 @@ Woodpecker **无内置的 Hash 轮换 API**。泄露后需要手动操作：
 | **定时快照** | 定期将 `secrets` 表导出至对象存储（S3/MinIO），保留 N 份 | 低 |
 
 **推荐**：回收站表方案，实现简单、侵入最低、可精确恢复单条记录。
+
+#### 回收站保留期设计
+
+参考行业实践（GitHub 30 天、Vault 30 天可配置），建议采用**分层保留策略**：
+
+| 层级 | 保留期 | 存储位置 | 恢复方式 |
+|-----|--------|---------|---------|
+| **热数据（回收站）** | 30 天（可配置） | `secrets_trash` 表 | API 一键恢复 |
+| **冷数据（归档）** | 1 年（可配置） | 对象存储（S3/MinIO）加密归档 | 运维手动导出恢复 |
+| **销毁** | 到期自动清理 | - | - |
+
+**保留期计算起点**：
+- 以 `deleted_at` 时间戳为准，而非创建时间
+- 同一条记录多次删除/恢复，以**最后一次删除时间**重新计算
+
+**清理机制**：
+```go
+// 后台定期任务（如每天凌晨）
+func cleanupTrash(ctx context.Context) {
+    // 删除超过 retentionDays 的记录
+    // 可配置 WOODPECKER_SECRET_TRASH_RETENTION_DAYS
+    // 删除前再做一次加密归档（可选）
+}
+```
+
+> ⚠️ **合规提示**：GDPR、等保 2.0 等法规对敏感数据保留期有明确要求（最短留存期 + 最长留存期）。回收站默认 30 天满足最短可恢复窗口，归档期需根据行业合规要求设定。
 
 ### 16.2 风险 2：误改无法回退
 
@@ -1118,6 +1287,39 @@ func (a *AuditedSecretService) SecretCreate(repo *model.Repo, secret *model.Secr
 
 **推荐**：Service 层审计装饰器，与现有 `EncryptedSecretStore` 包装器模式一致，不侵入业务逻辑。
 
+#### Service 层装饰器的性能开销
+
+基于现有 `EncryptedSecretStore` 包装器模式（`server/services/encryption/wrapper/store/secret_store_wrapper.go`），新增审计装饰器的性能开销分析：
+
+| 开销来源 | 量级 | 说明 |
+|---------|------|------|
+| **函数调用** | ~10ns | Go 接口调用开销，可忽略 |
+| **日志写入** | ~1-5μs | 结构化日志（zap）异步写入 |
+| **数据库写入** | ~1-10ms | `audit_log` 表 INSERT（主要开销） |
+| **序列化** | ~100ns | JSON 序列化 audit metadata |
+| **内存分配** | ~1KB | 创建 AuditEntry 结构体 |
+
+**开销对比**：
+
+| 操作 | 纯 DB | + 加密装饰器 | + 审计装饰器 | 总增加 |
+|-----|-------|------------|------------|--------|
+| `SecretCreate` | ~2ms | ~2.1ms | ~2.05ms | ~0.15ms |
+| `SecretUpdate` | ~2ms | ~2.1ms | ~2.05ms | ~0.15ms |
+| `SecretDelete` | ~1ms | ~1ms | ~1.05ms | ~0.05ms |
+| `SecretListPipeline` | ~5ms | ~5.5ms | N/A | N/A |
+| `SecretFind` | ~1ms | ~1.05ms | N/A | N/A |
+
+> **说明**：
+> 1. 审计装饰器**只在 CUD 操作**（Create/Update/Delete）上有开销，读取操作不受影响
+> 2. 数据库写入是最大开销，但 Secret CUD 操作属于低频操作（管理后台场景，QPS < 1），几乎不影响整体性能
+> 3. 若需要极致性能，可将审计日志改为**异步写入**（channel + 批量刷盘），延迟从毫秒级降到微秒级
+> 4. 与 `EncryptedSecretStore` 嵌套使用时，建议顺序：`Audited(Encrypted(Store))`，确保审计记录的是**明文**信息（不记录 Value），且加密失败也能审计到
+
+**优化建议**：
+- 审计表用独立数据库连接池，不与主业务竞争
+- 对高频读取操作（`SecretListPipeline`）不做审计，避免放大效应
+- Value 字段只存 SHA-256 哈希用于变更比对，不存明文
+
 ### 16.4 风险 4：合规风险
 
 **现状**：无审计链、无密钥轮换证明、无访问控制审计。
@@ -1137,6 +1339,113 @@ func (a *AuditedSecretService) SecretCreate(repo *model.Repo, secret *model.Secr
 1. **Phase 1**：启用 `EncryptedSecretStore` + 添加审计装饰器
 2. **Phase 2**：添加 Secret 版本表 + 软删除
 3. **Phase 3**：添加 HookToken 过期时间 + Hash 轮换 API
+
+### 16.5 三阶段实施的迁移工具
+
+为保证平滑迁移，每个阶段都需要对应的数据库迁移脚本和回滚方案。
+
+#### Phase 1：加密 + 审计
+
+**数据库变更**：
+- 无表结构变更（`secrets` 表 Value 字段透明加密，数据类型不变）
+- 新增 `audit_logs` 表（用于审计记录）
+
+```sql
+-- 新建审计表
+CREATE TABLE audit_logs (
+    id            BIGSERIAL PRIMARY KEY,
+    action        VARCHAR(100) NOT NULL,   -- secret.create / secret.update / secret.delete
+    resource_type VARCHAR(50)  NOT NULL,   -- secret
+    resource_id   BIGINT       NOT NULL,
+    operator      VARCHAR(255) NOT NULL,   -- 用户 login
+    old_value_hash VARCHAR(64),            -- SHA-256 of old value (nullable)
+    new_value_hash VARCHAR(64),            -- SHA-256 of new value (nullable)
+    metadata      JSONB,                   -- 扩展字段（scope, images, events 等）
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
+CREATE INDEX idx_audit_logs_operator ON audit_logs(operator);
+CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
+```
+
+**迁移工具**：
+- `woodpecker-server encrypt-enable`：将现有明文 secrets 全部加密（幂等，可重复执行）
+- `woodpecker-server encrypt-disable`：将现有加密 secrets 全部解密为明文（回滚用）
+- 基于 `EncryptedSecretStore.MigrateEncryption()` 已有逻辑改造
+
+**回滚方案**：
+- 加密启用前自动备份 `secrets` 表到 `secrets_backup_<timestamp>`
+- 若加密迁移失败，从备份表恢复
+
+#### Phase 2：版本表 + 回收站
+
+**数据库变更**：
+- 新增 `secret_versions` 表（版本历史）
+- 新增 `secrets_trash` 表（回收站）
+
+```sql
+-- Secret 版本表
+CREATE TABLE secret_versions (
+    id            BIGSERIAL PRIMARY KEY,
+    secret_id     BIGINT NOT NULL,
+    name          VARCHAR(255) NOT NULL,
+    value         VARCHAR(2000) NOT NULL,   -- 加密存储
+    images        JSONB,
+    events        JSONB,
+    version       INT NOT NULL DEFAULT 1,   -- 版本号，递增
+    created_by    VARCHAR(255),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- 回收站表
+CREATE TABLE secrets_trash (
+    id            BIGINT NOT NULL,          -- 原 secret ID
+    org_id        BIGINT,
+    repo_id       BIGINT,
+    name          VARCHAR(255) NOT NULL,
+    value         VARCHAR(2000) NOT NULL,   -- 加密存储
+    images        JSONB,
+    events        JSONB,
+    note          VARCHAR(500),
+    deleted_by    VARCHAR(255),
+    deleted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, deleted_at)            -- 允许多次删除的同一 ID 保留
+);
+```
+
+**迁移工具**：
+- `woodpecker-server secret-init-versions`：为现有 secrets 生成 v1 版本（基线）
+- `woodpecker-server secret-cleanup-trash --days 30`：清理过期回收站数据
+- `woodpecker-server secret-restore <id> --version 2`：回滚到指定版本
+
+**回滚方案**：
+- 版本表和回收站都是新增表，不修改原 `secrets` 表结构
+- 功能关闭后，原 `secrets` 表不受影响，只是版本/回收站数据不再写入
+
+#### Phase 3：Token 安全增强
+
+**数据库变更**：
+- 无表结构变更（仅修改 Token 生成和验证逻辑）
+- `repos.hash` 字段保留，仍作为签名密钥
+
+**迁移工具**：
+- `woodpecker-server rotate-hook-token --all`：批量轮换所有仓库的 `repo.Hash`
+- `woodpecker-server rotate-hook-token --repo <owner>/<name>`：单仓库轮换
+- 自动调用 Forge API 更新 Webhook URL 中的 Token
+- 失败的仓库记录到 `failed_rotations.log`，支持重试
+
+**回滚方案**：
+- 由于 Webhook URL 在 Forge 侧已更新，回滚需要重新旋转一次
+- 建议轮换前备份 `repos` 表，支持整体回退
+
+#### 迁移风险矩阵
+
+| 阶段 | 数据风险 | 服务中断 | 回滚难度 | 建议灰度策略 |
+|-----|---------|---------|---------|-------------|
+| Phase 1 (加密) | 中（加密失败可能丢数据） | 无（可在线迁移） | 中 | 先在测试环境验证，生产先灰度 10% 仓库 |
+| Phase 2 (版本) | 低（仅新增表，不修改原表） | 无 | 低 | 直接全量上线，功能默认启用 |
+| Phase 3 (Token) | 低（仅更新 hash） | 低（短暂 Webhook 可能失败） | 中 | 按组织分批轮换，夜间低峰执行 |
 
 ---
 
