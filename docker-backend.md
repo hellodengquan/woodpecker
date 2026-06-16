@@ -1070,7 +1070,530 @@ if time.Until(user.Expiry) < 30*time.Minute {
 
 ---
 
-## 六、关键代码位置速查
+## 六、边界条件补充分析
+
+### 6.1 Matrix Step 的 include 与 exclude 修饰符处理顺序
+
+Woodpecker 的 matrix 机制在两个不同层面使用了 include/exclude，处理顺序完全不同。
+
+#### 层面 1：Matrix 定义中的 include（无 exclude）
+
+**入口**：`pipeline/frontend/yaml/matrix/matrix.go:47-63`
+
+```go
+func Parse(data []byte) ([]Axis, error) {
+    axis, err := parseList(data)     // 尝试解析 matrix.include 语法
+    if err == nil && len(axis) != 0 {
+        return axis, nil             // include 语法成功则直接返回，跳过 calc()
+    }
+
+    matrix, err := parse(data)       // 回退到 map 语法
+    return calc(matrix), nil         // 笛卡尔积展开
+}
+```
+
+**parseList 只识别 include，不识别 exclude**（`matrix.go:124-135`）：
+
+```go
+func parseList(raw []byte) ([]Axis, error) {
+    data := struct {
+        Matrix struct {
+            Include []Axis                    // 只有 Include，没有 Exclude
+        }
+    }{}
+    xyaml.Unmarshal(raw, &data)
+    return data.Matrix.Include, nil
+}
+```
+
+这意味着 **matrix 定义层面不支持 exclude**，只支持两种写法：
+- `matrix.include: [{go: "1.21"}, {go: "1.22"}]` → 显式列举
+- `matrix: {go: ["1.21", "1.22"], redis: ["6", "7"]}` → 笛卡尔积自动展开
+
+两种写法互斥：如果 `parseList` 解析到非空的 `include` 列表，`calc()` 不会被调用。
+
+#### 层面 2：Step 约束中的 include/exclude（when 块）
+
+这是 step 运行时条件判断，有两类约束对象：
+
+**Path 约束**（`pipeline/frontend/yaml/constraint/path.go:100-120`）：
+
+```go
+func (c *Path) Match(v []string, message string) bool {
+    // 1. ignore_message 优先级最高 → 直接返回 true
+    if len(c.IgnoreMessage) > 0 && strings.Contains(...) { return true }
+
+    // 2. 空文件列表 → on_empty 决定
+    if len(v) == 0 { return c.OnEmpty.ValueOrDefault(true) }
+
+    // 3. exclude 先于 include 检查
+    if len(c.Exclude) > 0 && c.Excludes(v) { return false }  // 任何文件全匹配 exclude → 拒绝
+    if len(c.Include) > 0 && !c.Includes(v) { return false }  // 没有文件匹配 include → 拒绝
+    return true
+}
+```
+
+**关键语义差异**：
+- `Excludes(v)`: 所有文件都必须匹配某个 exclude 模式才返回 true（**全部命中才排除**）
+- `Includes(v)`: 任意文件匹配某个 include 模式就返回 true（**任一命中即包含**）
+
+这意味着 `include + exclude` 同时存在时，exclude 是 **全量排除**（所有文件都是被排除的文件），include 是 **存在性包含**（至少有一个文件在包含列表中）。
+
+**Map 约束**（`pipeline/frontend/yaml/constraint/map.go:27-53`，用于 `when.matrix`）：
+
+```go
+func (c *Map) Match(params map[string]string) bool {
+    // exclude 先检查
+    if len(c.Exclude) != 0 {
+        var matches int
+        for key, val := range c.Exclude {
+            if ok, _ := doublestar.Match(val, params[key]); ok {
+                matches++
+            }
+        }
+        if matches == len(c.Exclude) {  // 所有 exclude 键值都匹配 → 排除
+            return false
+        }
+    }
+    // 再检查 include
+    for key, val := range c.Include {
+        if ok, _ := doublestar.Match(val, params[key]); !ok {
+            return false                 // 任一 include 键值不匹配 → 排除
+        }
+    }
+    return true
+}
+```
+
+**统一处理顺序**：无论 Path 还是 Map 约束，都是 **exclude 先于 include**，且两者都是 **AND 语义**（所有条件都满足才生效）。
+
+#### 与 matrix 展开的衔接
+
+matrix 展开后，每个 Axis 变成独立 Workflow。Step 的 `when.matrix` 约束在编译阶段逐个 Axis 检查，决定该 step 是否出现在此 Axis 的 workflow 中：
+
+```
+matrix: {go: ["1.21", "1.22"], redis: ["6", "7"]}
+    ↓ calc() → 4 个 Axis
+    ↓
+Axis {go:1.21, redis:6} → 编译 → when.matrix: {include: {go: "1.*"}, exclude: {redis: "6"}}
+    → exclude 全匹配(redis:6 匹配 "6") → step 不出现在此 workflow
+Axis {go:1.21, redis:7} → 编译 → when.matrix: {include: {go: "1.*"}, exclude: {redis: "6"}}
+    → exclude 不全匹配(redis:7 ≠ "6") → include 全匹配(go:1.21 匹配 "1.*") → step 出现
+```
+
+---
+
+### 6.2 同 Image 多 Push 路径歧义解决
+
+**结论：Woodpecker 不感知镜像推送（push），推送由 step 内部命令完成，Docker 后端只负责拉取（pull）。**
+
+**代码证据**：
+- Docker 后端只有 `ImagePull` 调用，没有任何 `ImagePush` 调用
+- `plugins/docker`（社区常用推送插件）是一个普通 step，通过 `settings` 配置 repo/tags，在容器内部调用 Docker daemon 完成推送
+- 编译阶段 `createProcess` 对 `container.Image` 只做两件事：写入 `step.Image` 和匹配 `authConfig`
+
+**多 push 路径歧义场景**：
+```yaml
+steps:
+  publish-ghcr:
+    image: plugins/docker
+    settings:
+      repo: ghcr.io/org/app
+      registry: ghcr.io
+  publish-dockerhub:
+    image: plugins/docker
+    settings:
+      repo: org/app
+      registry: docker.io
+```
+
+**歧义解决方式**：每个 step 独立匹配 `authConfig`（`convert.go:131-138`），推送哪个 registry 由 step 的 `settings` 决定，鉴权信息通过 `MatchHostname` 分别匹配。不存在"同 image 多 push 路径"的歧义，因为推送路径是 step 内部逻辑而非 Woodpecker 编排。
+
+**但存在 AuthConfig 匹配歧义**：如果 `plugins/docker` 的 image 需要从 `docker.io` 拉取，而 step 又要推送到 `ghcr.io`：
+- `step.AuthConfig` 匹配的是 **镜像拉取** 的 registry（`plugins/docker` → `docker.io`）
+- 推送目标 registry 的鉴权通过 `settings.registry` + `settings.username/password` 传入容器内部环境变量，不走 `step.AuthConfig`
+
+**Docker config 文件的补充鉴权**（`server/services/registry/filesystem.go:39-88`）：
+
+```go
+func parseDockerConfig(path string) ([]*model.Registry, error) {
+    configFile := configfile.ConfigFile{AuthConfigs: make(map[string]types.AuthConfig)}
+    json.NewDecoder(f).Decode(&configFile)
+
+    // CredentialHelpers 优先解析
+    for registryHostname := range configFile.CredentialHelpers {
+        newAuth, _ := configFile.GetAuthConfig(registryHostname)
+        configFile.AuthConfigs[registryHostname] = newAuth
+    }
+
+    // AuthConfigs 解码 base64 auth 字段
+    for addr, ac := range configFile.AuthConfigs { ... }
+
+    // 转为 model.Registry 列表
+    for key, auth := range configFile.AuthConfigs {
+        registries = append(registries, &model.Registry{
+            Address:  key,        // hostname 作为 Address
+            Username: auth.Username,
+            Password: auth.Password,
+            ReadOnly: true,       // 标记为只读（来自文件系统）
+        })
+    }
+}
+```
+
+此文件通过 `--docker-config` 全局加载，与 DB 中的 registry 合并后传给编译器。文件中的 `CredentialHelpers` 条目会被解析后合并到 `AuthConfigs` 中，确保 cred helper 支持的 registry 也能被匹配到。
+
+---
+
+### 6.3 Tmpfs 与 Page Cache 监控区分
+
+**结论：Woodpecker 没有任何运行时监控机制区分 tmpfs 与 page cache，Docker API 也不提供这种区分。**
+
+**代码中 tmpfs 的完整生命周期**：
+
+1. **创建**：`convert.go:123-134` → `hostConfig.Tmpfs` 传给 Docker daemon
+2. **运行时**：tmpfs 挂载在容器内存中，完全透明
+3. **检测 OOM**：`WaitStep` 检查 `info.Container.State.OOMKilled`，不区分内存来源
+4. **销毁**：`DestroyStep` → `ContainerRemove` 时 tmpfs 随容器消失
+
+**Docker stats API 的局限**：
+- `ContainerStats` 返回的 `memory_stats.usage` 包含 page cache + tmpfs + anon，是**混合值**
+- Docker 不会在 stats 流中细分 tmpfs 占用
+- `memory_stats.stats` 在 cgroup v2 中可能包含 `file`（page cache）和 `shmem`（shared memory），但 Woodpecker 不读取这些字段
+
+**如果需要区分**：
+- 容器内：`df -h /tmpfs-mount-point` 查看 tmpfs 使用量
+- 宿主机 cgroup v2：`memory.current` vs `memory.stat.file` vs `memory.stat.shmem`
+- 这都需要在 step 命令中手动执行，Woodpecker 不提供结构化报告
+
+**page cache 与 tmpfs 的关系**：
+- tmpfs 写入会同时增加 `memory.current` 和 `memory.stat.shmem`
+- tmpfs 写入**不会**增加 `memory.stat.file`（file 是文件系统 page cache）
+- 但 `memory.current` = `anon` + `file` + `shmem` + ... ，所以 tmpfs 计入总内存
+- OOM Killer 看 `memory.current` > `memory.max`，不区分来源
+
+---
+
+### 6.4 Logs 流超时的动态调整
+
+**结论：Woodpecker 不支持日志流超时的动态调整，超时值在 workflow 开始时确定，中途不可变。**
+
+**超时确定的代码路径**（`agent/runner.go:79-102`）：
+
+```go
+// 超时值在 workflow 启动时一次性计算
+timeout := time.Hour                              // 默认 1 小时
+if minutes := workflow.Timeout; minutes != 0 {
+    timeout = time.Duration(minutes) * time.Minute  // 来自 YAML timeout 字段
+}
+
+// 创建不可变更的 context
+workflowCtx, _ := context.WithTimeout(ctxMeta, timeout)
+workflowCtx, cancelWorkflowCtx := context.WithCancelCause(workflowCtx)
+```
+
+**不可动态调整的原因**：
+- `context.WithTimeout` 创建的 timer 在创建时就固定了截止时间
+- Go 标准库没有提供修改已创建 context 截止时间的 API
+- Runtime 没有任何 Extend/restart context 的逻辑
+
+**队列层的 Lease 延长**（`server/queue/fifo.go:185-200`）：
+
+```go
+func (q *fifo) Extend(_ context.Context, agentID int64, taskID string) error {
+    state, ok := q.running[taskID]
+    if ok {
+        state.deadline = time.Now().Add(q.extension)  // 延长 queue 层 deadline
+        return nil
+    }
+    return ErrNotFound
+}
+```
+
+这是**队列层**的 lease 续约，防止队列认为 task 已死而重新调度。与 workflow 的日志流超时完全无关。队列层 `TaskTimeout` 默认仅 1 分钟（`shared/constant/constant.go:40-41`），agent 需要定期调用 `Extend` 续约。
+
+**三层超时的关系**：
+
+| 层次 | 超时值 | 可动态调整 | 控制对象 |
+|------|--------|-----------|---------|
+| 队列 FIFO | 1 分钟（`TaskTimeout`） | ✅ 通过 `Extend` 续约 | 队列认为 task 是否存活 |
+| Workflow context | 默认 1 小时或 YAML `timeout` | ❌ 不可变 | 日志流 + WaitStep + 整个 workflow |
+| Agent 健康 | 超时 + 1h 缓冲 | ❌ 不可变 | 标记 agent 是否健康 |
+
+**如果需要动态调整**：必须在 `runner.go` 中引入新的 Extend 机制，将 queue 层的续约信号传递到 workflow context 层，当前代码无此路径。
+
+---
+
+### 6.5 容器滚动 Evict 策略
+
+**结论：Woodpecker 没有容器级别的滚动 evict 策略，只有队列级别的 task 过期重提交。**
+
+**队列层 Evict**（`server/queue/fifo.go:338-348`）：
+
+```go
+func (q *fifo) resubmitExpiredPipelines() {
+    for taskID, taskState := range q.running {
+        if time.Now().After(taskState.deadline) {
+            log.Info().Msgf("queue: resubmitting expired task %s", taskID)
+            taskState.error = ErrTaskExpired
+            q.pending.PushFront(taskState.item)    // 重新入队（队首优先）
+            delete(q.running, taskID)
+            close(taskState.done)                  // 通知 Wait() 返回
+        }
+    }
+}
+```
+
+**关键行为**：
+- 过期 task 被重新放入 pending 队列**队首**（`PushFront`），优先重新调度
+- 但**不会主动停止已运行的容器**——只是从队列视角认为它"死了"
+- agent 侧的 workflow context 如果还没到期，容器会继续运行
+- 这导致同一 task 可能被两个 agent 同时执行（队列认为已过期重新分配 + 原始 agent 仍在跑）
+
+**Pipeline 取消时的批量 Evict**（`server/pipeline/cancel.go:42-53`）：
+
+```go
+// First cancel/evict workflows in the queue in one go
+var workflowsToCancel []string
+for _, w := range workflows {
+    if w.State == model.StatusRunning || w.State == model.StatusPending {
+        workflowsToCancel = append(workflowsToCancel, fmt.Sprint(w.ID))
+    }
+}
+server.Config.Services.Scheduler.ErrorAtOnce(ctx, workflowsToCancel, queue.ErrCancel)
+```
+
+**批量 Evict 流程**：
+1. `ErrorAtOnce` 批量标记所有 running + pending 的 workflow 为 `ErrCancel`
+2. 队列层 `finished()` 从 `q.running` 删除 + 从 `q.pending` 移除 + 通知 `Wait()` 返回
+3. Agent 侧收到取消信号 → workflow context cancel → `DestroyStep` 清理容器
+
+**没有"滚动"策略**：
+- 不存在 LRU/LFU 容器驱逐
+- 不存在基于资源压力（如磁盘满）的容器驱逐
+- 不存在优先级驱动的容器驱逐（所有 `wp_` 容器平等对待）
+- 唯一的"evict"触发条件是：队列 lease 过期 或 用户手动取消
+
+**Agent 断连时的处理**（`server/queue/fifo.go:243-253`）：
+
+```go
+func (q *fifo) KickAgentWorkers(agentID int64) {
+    for worker := range q.workers {
+        if worker.agentID == agentID {
+            worker.stop(ErrWorkerKicked)    // 取消 worker 的 Poll context
+            delete(q.workers, worker)       // 从 workers map 移除
+        }
+    }
+}
+```
+
+Kick 后 agent 的 running tasks 不会被立即清理——需要等队列 lease 过期（1 分钟无 Extend），`resubmitExpiredPipelines` 才会将它们重新入队。
+
+---
+
+### 6.6 Systemd Cgroup Driver 与 Cgroupfs 混合场景
+
+**结论：Woodpecker 代码完全不感知 cgroup driver 差异，但混合场景会导致容器创建失败。**
+
+**代码中与 cgroup 相关的所有交互**：
+
+| 代码位置 | 操作 | 是否涉及 driver |
+|----------|------|----------------|
+| `docker.go:156` VolumeCreate | 创建卷 | ❌ |
+| `docker.go:171` NetworkCreate | 创建网络 | ❌ |
+| `docker.go:178` StartStep → ContainerCreate | 创建容器 | ✅ 间接 |
+| `convert.go:78-86` Resources | 设置资源限制 | ✅ 间接 |
+| `convert.go:174-195` DeviceMapping | 设备权限 | ✅ 间接 |
+| `docker.go:278` WaitStep → ContainerInspect | 查询状态 | ❌ |
+
+所有 cgroup 交互都通过 Docker API 间接进行，Woodpecker 不直接操作 `/sys/fs/cgroup`。
+
+**混合场景的问题根源**：
+
+Docker daemon 的 cgroup driver 由 `/etc/docker/daemon.json` 的 `"exec-opts": ["native.cgroupdriver=systemd"]` 决定。当 Docker 使用 systemd driver 而宿主机某些路径仍按 cgroupfs 布局时：
+
+| 现象 | 原因 | Woodpecker 感知 |
+|------|------|-----------------|
+| `ContainerCreate` 返回 500 | Docker 尝试在 `/sys/fs/cgroup/system.slice/docker-xxx.scope/` 创建 cgroup，但路径被 cgroupfs 模式的其他进程占用 | ❌ 只看到错误 |
+| 资源限制不生效 | Docker 写入 `system.slice` 下的 cgroup 文件，但实际进程在 `cgroupfs` 树下 | ❌ 只看到 ExitCode=0 |
+| OOMKilled 检测失败 | `ContainerInspect` 读取的 cgroup 统计来自错误的 cgroup 树 | ❌ 只看到 OOMKilled=false |
+
+**Woodpecker 可以感知到的唯一信号**：
+- `ContainerCreate` 返回错误 → `StartStep` 直接返回错误
+- 但错误消息是 Docker 的内部错误，Woodpecker 不解析其含义
+
+**代码中没有 cgroup driver 探测**：
+- `Load()` 方法（`docker.go:131-155`）只获取 `e.info`（Docker 系统信息），不检查 cgroup driver
+- `e.info` 包含 `OSType`、`Architecture` 等，但不包含 `CgroupDriver`
+- 没有 cgroup driver 兼容性检查或降级逻辑
+
+**运维侧必须保证**：Docker daemon 的 cgroup driver 与宿主机 init 系统使用同一个（systemd 系统 → systemd driver，其他 → cgroupfs driver），否则 Woodpecker 无法诊断问题。
+
+---
+
+### 6.7 IPv6 反向 DNS 查询
+
+**结论：Woodpecker 不管理反向 DNS（PTR）查询，完全依赖 Docker 网络栈和容器内 glibc/musl 解析。**
+
+**代码中 DNS 相关的所有配置**：
+
+1. **网络级 IPv6**（`docker.go:171-175`）：
+```go
+_, err = e.client.NetworkCreate(ctx, conf.Network, client.NetworkCreateOptions{
+    EnableIPv6: &e.config.enableIPv6,   // 分配 IPv6 子网
+})
+```
+
+2. **容器级 DNS**（`convert.go:44` → `step.DNS` + `step.DNSSearch`）：
+```go
+config := &container.Config{...}
+hostConfig := &container.HostConfig{...}
+// step.DNS → hostConfig.DNS
+// step.DNSSearch → hostConfig.DNSSearch
+```
+
+3. **ExtraHosts**（`convert.go:70-78` → `step.ExtraHosts` → `/etc/hosts`）：
+```go
+extraHosts[i] = backend_types.HostAlias{Name: name, IP: ip}
+```
+
+**反向 DNS 查询的完整路径**：
+
+```
+容器内进程执行 gethostbyaddr("fd00:db8::1")
+    ↓
+glibc/musl 调用 getnameinfo()
+    ↓
+查询 /etc/nsswitch.conf → hosts: files dns
+    ↓
+先查 /etc/hosts → 没有 IPv6 PTR 条目（Docker 不自动写入反向映射）
+    ↓
+查 DNS nameserver（/etc/resolv.conf → 127.0.0.11）
+    ↓
+Docker 内置 DNS resolver 不支持 PTR 查询
+    ↓
+转发到宿主机 /etc/resolv.conf 的 nameserver
+    ↓
+如果上游 DNS 支持 IPv6 反向解析区域 → 返回 PTR 记录
+否则 → NXDOMAIN → 解析失败
+```
+
+**关键缺失**：
+- Docker 的 `NetworkConnect` 中 `Aliases` 只设置正向映射（name → IP），不设置反向映射
+- `/etc/hosts` 中只有 `hostname → IP` 条目，没有 `IP → hostname` 条目
+- 容器内 `gethostbyaddr()` 对 IPv6 地址几乎必然失败
+
+**对 Woodpecker 的影响**：
+- step 之间通过 alias（如 `http://build:8080`）通信 → 正向 DNS ✅
+- 日志中 IP 地址反解为主机名 → 反向 DNS ❌
+- 某些应用（如 PostgreSQL）启动时做反向 DNS 验证 → 可能失败
+
+**绕过方案**：在 step 的 `extra_hosts` 中手动写入 IPv6 反向映射（但 `extra_hosts` 的格式 `name:ip` 只写正向 `/etc/hosts`，无法写反向条目）。实际解决方案是在应用层关闭反向 DNS 检查。
+
+---
+
+### 6.8 AuthConfig Refresh 失败时全新 Login 回退
+
+**结论：Forge OAuth token refresh 失败后不会回退到全新 login，用户必须重新授权。Registry 鉴权 refresh 失败后不会重试任何操作。**
+
+#### Forge OAuth Token（用于 Forge API 访问）
+
+**Refresh 流程**（`server/forge/refresh.go:58-100`）：
+
+```go
+func Refresh(ctx context.Context, forge Forge, _store store.Store, user *model.User) {
+    if refresher, ok := forge.(Refresher); ok {
+        if time.Now().UTC().Unix() < (user.Expiry - tokenMinTTL) {
+            return                              // 未过期 → 跳过
+        }
+
+        result, err, _ := refreshGroup.Do(key, func() (any, error) {
+            userUpdated, err := refresher.Refresh(ctx, user)
+            if err != nil {
+                return nil, err                 // refresh 失败 → 返回错误
+            }
+            // ... 持久化到 DB
+        })
+
+        if err != nil {
+            log.Error().Err(err).Msgf("refresh oauth token of user '%s' failed", user.Login)
+            return                              // ← 仅打日志，不回退到 login
+        }
+
+        // 复制新 token 到调用者
+        user.AccessToken = r.AccessToken
+        user.RefreshToken = r.RefreshToken
+        user.Expiry = r.Expiry
+    }
+}
+```
+
+**GitLab Refresh 实现**（`server/forge/gitlab/gitlab.go:160-175`）：
+
+```go
+func (g *GitLab) Refresh(ctx context.Context, user *model.User) (bool, error) {
+    source := config.TokenSource(oauth2Ctx, &oauth2.Token{
+        RefreshToken: user.RefreshToken,
+    })
+    token, err := source.Token()
+    if err != nil || len(token.AccessToken) == 0 {
+        return false, err                       // OAuth2 refresh 失败 → 直接返回错误
+    }
+    // 更新 user token 字段
+}
+```
+
+**Bitbucket Refresh 实现**（`server/forge/bitbucket/bitbucket.go:124-133`）：
+
+```go
+func (c *config) Refresh(ctx context.Context, user *model.User) (bool, error) {
+    source := config.TokenSource(ctx, &oauth2.Token{RefreshToken: user.RefreshToken})
+    token, err := source.Token()
+    if err != nil || len(token.AccessToken) == 0 {
+        return false, err                       // 同样直接返回错误
+    }
+}
+```
+
+**Refresh 失败后的行为链**：
+
+```
+refresher.Refresh() 返回错误
+    ↓
+refreshGroup.Do() 返回 err
+    ↓
+log.Error() 打印日志
+    ↓
+Refresh() 函数 return（不更新 user）
+    ↓
+调用方（如 API handler）继续使用旧 token
+    ↓
+Forge API 调用使用过期/无效 token → 返回 401
+    ↓
+API handler 返回错误给前端
+    ↓
+用户必须重新登录授权
+```
+
+**没有"全新 login 回退"的原因**：
+- 全新 OAuth login 需要用户交互（浏览器重定向 → 授权页面 → 回调）
+- 服务端无法在后台自动触发用户的 OAuth 授权流程
+- `Refresh()` 在服务端 goroutine 中执行，无用户浏览器上下文
+- 代码中没有存储 OAuth client_secret 用于服务端发起授权的路径
+
+#### Registry 鉴权（用于镜像拉取）
+
+**不存在 refresh 机制**，更不存在"refresh 失败 → login 回退"的路径。
+
+- `step.AuthConfig` 是静态 `{Username, Password}`，一次写入不再变更
+- `ImagePull` 失败直接返回错误或降级到本地镜像（见 5.8 节分析）
+- 没有任何重新获取 registry 凭证的逻辑
+
+**唯一的外部刷新路径**：`server/services/registry/filesystem.go:39-88` 的 `parseDockerConfig` 在服务启动时读取 `--docker-config` 指向的文件。如果该文件内容更新（如外部 cron 刷新了 ECR 密码），需要**重启 Woodpecker server** 才能生效，没有热加载机制。
+
+---
+
+## 七、关键代码位置速查
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
@@ -1110,3 +1633,20 @@ if time.Until(user.Expiry) < 30*time.Minute {
 | Network Alias 设置 | `pipeline/backend/docker/docker.go` | 250 |
 | Registry Auth 编码 | `pipeline/backend/docker/convert.go` | 199 |
 | 卷字符串解析正则 | `pipeline/backend/docker/convert.go` | 216 |
+| **边界条件章节** | | |
+| Matrix Parse (include 语法) | `pipeline/frontend/yaml/matrix/matrix.go` | 47 |
+| Matrix parseList (仅 include) | `pipeline/frontend/yaml/matrix/matrix.go` | 124 |
+| Path 约束 Match (exclude→include) | `pipeline/frontend/yaml/constraint/path.go` | 100 |
+| Path Includes (任一命中) | `pipeline/frontend/yaml/constraint/path.go` | 123 |
+| Path Excludes (全量命中) | `pipeline/frontend/yaml/constraint/path.go` | 135 |
+| Map 约束 Match (when.matrix) | `pipeline/frontend/yaml/constraint/map.go` | 27 |
+| Registry 文件系统解析 | `server/services/registry/filesystem.go` | 39 |
+| 队列 FIFO Extend | `server/queue/fifo.go` | 185 |
+| 队列 FIFO resubmitExpired | `server/queue/fifo.go` | 338 |
+| 队列 FIFO finished | `server/queue/fifo.go` | 133 |
+| 队列 FIFO KickAgentWorkers | `server/queue/fifo.go` | 243 |
+| Pipeline 批量取消 | `server/pipeline/cancel.go` | 42 |
+| TaskTimeout 常量 | `shared/constant/constant.go` | 40 |
+| Forge Refresh | `server/forge/refresh.go` | 58 |
+| GitLab Refresh 实现 | `server/forge/gitlab/gitlab.go` | 160 |
+| Bitbucket Refresh 实现 | `server/forge/bitbucket/bitbucket.go` | 124 |
