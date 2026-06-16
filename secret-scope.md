@@ -1489,3 +1489,261 @@ CREATE TABLE secrets_trash (
 │     → LineWriter.Write() 每行日志脱敏后上报 Server                   │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 18. 深化补充：边界风险与实施细节
+
+### 18.1 4 种回滚方案的切换成本
+
+针对 §14.4 `NetrcTrustedPlugins` 动态修改回滚的 4 种方案，补充切换成本分析：
+
+| 方案 | 代码变更 | 数据库变更 | 部署变更 | 运维学习成本 | 总切换成本 |
+|------|---------|-----------|---------|-------------|-----------|
+| **数据库备份恢复** | 0 行 | 0 张表 | 配置备份计划（cronjob） | DBA 熟悉备份工具 | **极低** |
+| **变更事件 + 版本表** | ~300 行（新表+API） | `repo_config_versions` 表 + 索引 | 无需 | 后端开发熟悉回滚流程 | **中** |
+| **软删除 + 审计日志** | ~200 行（软删字段+恢复 API） | `repos` 表加 `deleted_at` + 索引 | 无需 | 前端需展示"已删除"列表 | **中** |
+| **GitOps 管理** | ~0 行（流程变更） | 0 张表 | ArgoCD/Flux + 代码仓库 + PR 流程 | 全团队学习 GitOps 工作流 | **高** |
+
+**切换路径建议**：
+1. 先启用**数据库定时备份**（即时生效，0 代码）作为兜底
+2. 再上线**版本表+回滚 API**（2 周开发周期）
+3. 长期演进到**GitOps 管理**（1-2 个月流程改造）
+
+> 参考现有 `EncryptedSecretStore` 的两阶段回滚模式（§5.5），版本表方案可复用其事务处理模式。
+
+### 18.2 JWT 5 信号阈值动态化
+
+针对 §15.4 的 5 个异常检测信号，补充阈值动态化设计：
+
+| 信号 | 静态阈值 | 动态阈值算法 | 实现复杂度 |
+|-----|---------|------------|-----------|
+| 多 IP 使用 | >5 个不同 IP/小时 | **EWMA 动态基线**：历史均值 + 3σ | 中 |
+| Webhook 频率 | >100 QPS/仓库 | **自回归预测**：AR(1) 模型，超出 99 分位告警 | 高 |
+| 异常事件类型 | deployment 事件 >5/小时 | **稀疏事件检测**：按仓库历史事件分布加权 | 中 |
+| 签名不一致 | >1 次/天 | **硬阈值**（极低误报） | 低 |
+| Token 龄期异常 | >90 天 | **分级阈值**：生产环境 30 天，测试 90 天 | 低 |
+
+**动态阈值落地**：
+```go
+// 参考现有 log.Warn() 模式（§15.4 检测落点），新增动态阈值配置：
+type AnomalyThreshold struct {
+    MultiIP          int     `envconfig:"WOODPECKER_JWT_ANOMALY_MULTI_IP" default:"5"`
+    QPSThreshold     float64 `envconfig:"WOODPECKER_JWT_ANOMALY_QPS" default:"100"`
+    TokenAgeDays     int     `envconfig:"WOODPECKER_JWT_ANOMALY_TOKEN_AGE_DAYS" default:"90"`
+    UseDynamicBaseline bool  `envconfig:"WOODPECKER_JWT_ANOMALY_DYNAMIC" default:"false"`
+}
+
+// 动态基线数据存储在现有 xorm 模型中可扩展：
+// server/model/repo.go:160 ApprovalAllowedUsers 已有 JSONB 模式，可新增 AnomalyBaseline JSONB
+```
+
+### 18.3 三级保留策略 GDPR 区域差异
+
+针对 §16.1 的三级保留策略，补充 GDPR 与全球主要法规差异：
+
+| 法规 | 适用区域 | 最短留存要求 | 最长留存限制 | 数据主体权利 | 特殊要求 |
+|-----|---------|-------------|-------------|-------------|---------|
+| **GDPR** | EU/EEA | 无（但需有理由） | 「必要期限」原则，通常 12 个月 | 删除权、可携带权 | 跨境传输需 SCC/充分性认定 |
+| **CCPA/CPRA** | 加州 | 无 | 商业数据 3 年 | 删除权、拒绝权 | 敏感个人信息需额外同意 |
+| **等保 2.0** | 中国 | 网络日志 ≥6 个月 | 无明确上限 | 删除权（个人信息） | 关键基础设施数据需境内存储 |
+| **HIPAA** | 美国医疗 | 6 年 | 无 | 访问权、修正权 | PHI 数据需端到端加密 |
+| **PCI DSS** | 全球支付 | 1 年 | 3 年（审计数据） | N/A | 禁止存储磁条/CVV 数据 |
+
+**区域化配置示例**：
+```yaml
+# 不同部署区域的默认配置
+EU (GDPR):
+  WOODPECKER_SECRET_TRASH_RETENTION_DAYS: 30
+  WOODPECKER_SECRET_ARCHIVE_RETENTION_DAYS: 365
+  WOODPECKER_SECRET_GEO: EU
+  WOODPECKER_SECRET_CROSS_BORDER: false
+
+US (HIPAA):
+  WOODPECKER_SECRET_TRASH_RETENTION_DAYS: 30
+  WOODPECKER_SECRET_ARCHIVE_RETENTION_DAYS: 2190  # 6 years
+  WOODPECKER_SECRET_END_TO_END_ENCRYPTION: true
+
+CN (等保):
+  WOODPECKER_SECRET_TRASH_RETENTION_DAYS: 30
+  WOODPECKER_SECRET_ARCHIVE_RETENTION_DAYS: 365
+  WOODPECKER_SECRET_IN_STORAGE_ONLY: true  # 禁止跨境
+```
+
+### 18.4 Service 层装饰器写放大
+
+针对 §16.3 的审计装饰器，补充写放大分析：
+
+**写放大倍数**：
+```
+原操作：1 次 secrets 表 INSERT / UPDATE / DELETE
++ 加密装饰器：1 次加密计算（CPU，无 IO）
++ 审计装饰器：1 次 audit_logs 表 INSERT
++ 版本装饰器：1 次 secret_versions 表 INSERT
++ 回收站装饰器：1 次 secrets_trash 表 INSERT（仅 DELETE）
+─────────────────────────────────────────────────
+总计：1 次原操作 + 2~3 次额外表 INSERT
+写放大倍数 ≈ 3x ~ 4x
+```
+
+**各层写放大拆解**：
+
+| 装饰器 | 额外写入 | 触发条件 | 写放大 | 数据量增长 |
+|-------|---------|---------|--------|-----------|
+| `EncryptedSecretStore` | 0 次表写入 | 每次 CUD | 1x（仅 CPU） | 0% |
+| `AuditedSecretStore` | 1 次 audit_logs INSERT | 每次 CUD | ~2x | ~50%（审计表数据量小） |
+| `VersionedSecretStore` | 1 次 secret_versions INSERT | 每次 UPDATE | ~2x | ~100%（与 secrets 表同量级） |
+| `TrashableSecretStore` | 1 次 secrets_trash INSERT | 仅 DELETE | ~2x（仅删除） | 低（删除是低频操作） |
+
+> 结合现有 `server/services/secret/db.go:41-72` 的查询性能，3-4x 写放大对 QPS < 1 的管理场景完全可接受。
+>
+> **风险点**：若未来引入 Secret 自动同步（如每小时从 Vault 同步一次所有 secrets），UPDATE 操作从每日 <10 次变为每小时 N 次，写放大将被放大 100-1000 倍。此时需：
+> 1. 只在 Value 真正变化时才创建新版本（SHA-256 比对）
+> 2. 审计日志降级为采样记录
+
+### 18.5 异步批量的丢失窗口
+
+针对 §16.3 审计日志异步批量写入优化，补充丢失窗口分析：
+
+**同步 vs 异步写入对比**：
+
+| 模式 | 延迟 | 吞吐量 | 丢失窗口 | 适用场景 |
+|-----|------|--------|---------|---------|
+| **同步写入** | 1-10ms/条 | ~100 TPS | 0 秒（事务内写入，无丢失） | 合规要求高 |
+| **异步批量** | 10-1000ms/批次 | ~1000-5000 TPS | **批量窗口 + 进程崩溃** | 高并发场景 |
+
+**丢失窗口计算**：
+```
+配置：WOODPECKER_AUDIT_FLUSH_INTERVAL=1s
+      WOODPECKER_AUDIT_BATCH_SIZE=100
+
+最坏丢失窗口 = 1s (flush 间隔) + 进程崩溃 → 最后一个未刷盘批次丢失
+              ≈ 1-5 秒内的审计记录
+```
+
+**丢失风险与缓解**：
+
+| 崩溃场景 | 丢失记录数 | 缓解措施 |
+|---------|-----------|---------|
+| **正常 `SIGTERM`** | 0（flush 协程捕获信号，退出前刷盘） | 信号处理器 + `defer flush()` |
+| **OOM Kill / `kill -9`** | 未刷盘批次全部丢失 | 写入前先写 WAL（write-ahead log）到本地磁盘 |
+| **数据库宕机** | 内存中所有未刷盘记录 | 降级为本地文件缓冲，数据库恢复后重放 |
+
+> 参考现有 `server/services/utils/http.go:97-207` 的重试模式，审计日志异步批量可复用其指数退避重试逻辑。
+
+### 18.6 嵌套顺序 `Audited(Encrypted(Store))` 的事务边界
+
+针对 §16.3 的装饰器嵌套顺序，补充事务边界分析：
+
+```
+调用栈：
+  AuditedSecretService.SecretCreate()
+    ├── 1. 记录审计日志（audit_logs INSERT）
+    │       └── ❌ 若此处成功但后续失败，审计记录中缺少 failure 状态
+    ├── 2. EncryptedSecretStore.SecretCreate()
+    │       ├── a. 明文 INSERT 到 secrets 表
+    │       ├── b. encrypt() 加密计算
+    │       └── c. UPDATE 为密文（失败则 DELETE 回滚明文）
+    └── 3. 返回 error 或 nil
+```
+
+**错误路径分析**：
+
+| 失败点 | 事务状态 | 审计记录 | 数据一致性 | 风险 |
+|-------|---------|---------|-----------|------|
+| 2a（明文 INSERT 失败） | 回滚 | 缺失（审计在步骤 1 未执行） | ✅ 一致 | 低 |
+| 2b（encrypt 失败） | 回滚（DELETE 明文） | ❌ 审计已记录 CREATE 成功 | ⚠️ 审计记录与实际不符 | 中 |
+| 2c（密文 UPDATE 失败） | 回滚（DELETE 明文） | ❌ 审计已记录 CREATE 成功 | ⚠️ 同上 | 中 |
+| 数据库崩溃在 2a 之后 | 自动回滚 | ❌ 审计记录可能已提交 | ⚠️ 同上 | 低 |
+
+**修正方案**：调整嵌套顺序为 `Encrypted(Audited(Store))` 或在最外层包裹数据库事务：
+
+```go
+// 推荐：最外层用数据库事务确保一致性
+func (tx *TransactionalSecretService) SecretCreate(repo *model.Repo, secret *model.Secret) error {
+    return session.DB(ctx).Transaction(func(tx *xorm.Session) error {
+        // 事务内所有操作原子成功或失败
+        if err := tx.inner.SecretCreate(repo, secret); err != nil {
+            return err  // 回滚，包括审计记录
+        }
+        return nil
+    })
+}
+
+// 装饰顺序：Transactional(Encrypted(Audited(Versioned(Trashable(Store)))))
+```
+
+> 参考现有 `server/services/encryption/wrapper/store/secret_store.go:52-71` 的两阶段写入回滚模式，事务包装器可复用其错误处理模式。
+
+### 18.7 三阶段迁移回退窗口
+
+针对 §16.5 的三阶段迁移，补充各阶段回退窗口分析：
+
+| 阶段 | 回退窗口时长 | 回退操作 | 数据丢失风险 | 业务影响 |
+|-----|-------------|---------|-------------|---------|
+| **Phase 1 (加密)** | **永久**（只要有备份） | 运行 `woodpecker-server encrypt-disable` 全量解密 | ❌ 加密后的新 Secrets 需要重新输入 | 低（加密/解密透明） |
+| **Phase 2 (版本/回收站)** | **永久** | 删除 `secret_versions` / `secrets_trash` 表 | ✅ 无丢失（原表不动） | 零（功能降级） |
+| **Phase 3 (Token 轮换)** | **7 天**（Forge 侧 Webhook 可能需人工重配） | 从备份恢复 `repos.hash` 字段 + 通知 Forge 侧回滚 | ⚠️ 已签发的新 Token 全部失效 | 中（Webhook 临时不可用） |
+
+**回退窗口的时间敏感性**：
+
+```
+Phase 1 加密启用 Timeline:
+T0: 备份 secrets 表 → 开始加密迁移
+T1: 迁移完成，所有 Secret 以密文存储
+T2: 有新的 Secrets 被创建（密文）
+T3: 决定回退 → 运行 encrypt-disable
+     ↓
+     已加密的 Secrets → 解密恢复（✅）
+     T2 之后新增的 Secrets → 仍为密文（encrypt-disable 可处理）
+     ↓
+     ✅ 无数据丢失，但需要一次完整的解密遍历
+```
+
+**不可逆点**：
+- Phase 2 可随时关闭（DROP TABLE 即可），无不可逆点
+- Phase 1 加密启用后，若丢失解密密钥（Tink keyset），**全部数据永久不可读**
+- Phase 3 Token 轮换后，若 Forge 侧无法更新 Webhook URL，**该仓库永久无法触发 Pipeline**
+
+### 18.8 夜间分批窗口监控
+
+针对 §16.5 Phase 3 的「夜间低峰执行」策略，补充分批窗口的监控设计：
+
+**分批策略**：
+```
+总仓库数：10,000
+每批大小：100 个仓库/批
+批间隔：60 秒（避免触发 Forge API 限流）
+总窗口：10,000 / 100 * 60s ≈ 100 分钟 ≈ 1.7 小时
+执行窗口：02:00 - 04:00（夜间低峰）
+```
+
+**监控指标**（参考现有 `log.Warn()` / `log.Error()` 模式）：
+
+| 指标 | 采集点 | 阈值告警 | 对应代码参考 |
+|-----|--------|---------|-------------|
+| 轮换成功率 | 每批结束后统计 | <95% → P1 告警 | `server/api/repo.go:730-737` Activate API |
+| 失败重试数 | 失败仓库记录 | >10 次/批 → P2 告警 | §16.5 Phase 3 `failed_rotations.log` |
+| Forge API 限流 | 429/403 状态码 | >5% 请求限流 → 增大批间隔 | `server/services/utils/http.go:97-207` 重试逻辑 |
+| Webhook 成功率 | 轮换后 Forge 侧测试推送 | <99% → P1 告警 | `server/api/hook.go:69-92` Hook 入口 |
+| 批处理耗时 | 每批执行时间 | >5 分钟/批 → P2 告警 | 新增 BatchProcessor 组件 |
+| 回滚窗口剩余 | 距离窗口结束时间 | <30 分钟未完成 → 自动暂停 | 可配置 `WOODPECKER_ROTATION_WINDOW_END=04:00` |
+
+**监控面板示例**：
+```
+[02:00-04:00 轮换进度]
+  进度: ████████░░░░░░░░░░ 42% (4200/10000)
+  当前批: 42 (100 repos)
+  本批耗时: 45s
+  成功率: 98.7% (4145/4200)
+  失败数: 55
+  失败原因:
+    - Forge API 超时: 32
+    - 网络错误: 18
+    - 权限不足: 5
+  预计完成: 03:27
+  窗口剩余: 33 分钟
+```
+
+> 监控实现可复用现有 `server/log` 组件的结构化日志能力，输出到 Prometheus / ELK。
+> 若窗口结束前未完成，自动暂停未轮换的批次，次日夜间继续，避免影响白天业务。
