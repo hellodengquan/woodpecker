@@ -440,7 +440,227 @@ Goroutine 3 ─┘         │                                        │
 
 ---
 
-## 7. 关键代码路径索引
+## 7. 深度分析：singleflight 调度、Token 继承与刷新风暴
+
+> 本章节基于 `server/forge/refresh.go`、`server/forge/refresh_test.go`、`server/router/middleware/token/token.go`、`server/services/utils/http.go`、`server/pipeline/create.go` 及各下游 API handler 的实际代码逐行核对得出结论。
+
+---
+
+### 7.1 singleflight 如何调度等待者
+
+**核心代码**: `server/forge/refresh.go:70-86`
+
+```go
+key := fmt.Sprintf("refresh-%d", user.ID)
+result, err, _ := refreshGroup.Do(key, func() (any, error) {
+    userUpdated, err := refresher.Refresh(ctx, user)
+    // ...构造 refreshResult 并返回
+})
+```
+
+#### 调度机制详解
+
+使用 `golang.org/x/sync/singleflight` 包，按 **用户维度**（`key = "refresh-<userID>"`）做去重：
+
+1. **Winner 选举**：当多个 goroutine（通常来自不同的并发 HTTP 请求 / Webhook / Pipeline 调度）在同一时刻以相同 key 调用 `Do` 时，**第一个到达的 goroutine 成为 Winner**，负责真正执行传入的闭包函数（即调用 `refresher.Refresh(ctx, user)` + `store.UpdateUser(user)`）。
+
+2. **Waiter 阻塞**：其他 goroutine 在 `Do()` 调用内部被阻塞——挂在 singleflight 内部 `call` 结构的 `wg.Wait()` 上，直到 Winner 执行完毕。
+
+3. **结果广播**：Winner 执行完闭包后，singleflight 将返回值 `(v interface{}, err error)` 通过 `call.val` / `call.err` 字段共享给 **所有 Waiter**，并唤醒所有阻塞的 Waiter，让它们从 `Do()` 调用中返回。
+
+4. **共享标识被忽略**：`Do` 的第三个返回值 `shared bool` 被用 `_` 显式丢弃（第 71 行）。该标识本来可以区分"我是 Winner（false）"还是"我是 Waiter（true）"，但当前代码不需要此信息，因为 Winner 和 Waiter 都走完全相同的后续逻辑（`refreshResult → user.AccessToken/RefreshToken/Expiry` 字段复制）。
+
+#### 调用时序图
+
+```
+t0 ─── Goroutine A (HTTP /repos) ───► refreshGroup.Do("refresh-42", fn)  ──► 成为 Winner，开始执行 fn
+       Goroutine B (HTTP /pipeline) ─► refreshGroup.Do("refresh-42", fn)  ──► Waiter，阻塞在 wg.Wait()
+       Goroutine C (Webhook PR)    ─► refreshGroup.Do("refresh-42", fn)  ──► Waiter，阻塞在 wg.Wait()
+
+t1 ─── Winner A 完成: refresher.Refresh() → store.UpdateUser() → 构造 &refreshResult{...}
+       singleflight 内部 wg.Done()
+
+t2 ─── Goroutine A 从 Do() 返回
+       Goroutine B 从 Do() 返回，拿到 A 的 result & err
+       Goroutine C 从 Do() 返回，拿到 A 的 result & err
+
+t3 ─── 所有 3 个 goroutine 都执行 95-99 行：refreshResult → 各自 user 对象字段赋值
+```
+
+**测试验证**: `server/forge/refresh_test.go:120-168` `TestRefresh_ConcurrentRefreshSerialized`
+- 10 个 goroutine 并发调用 `forge.Refresh`（同 user.ID=42）
+- `refreshCount` 原子计数器的值最终为 1（只执行了一次真正的刷新）
+- 全部 10 个独立的 `*model.User` 对象最终都包含新 token
+
+---
+
+### 7.2 旧请求（Waiter）是否能继承新 token
+
+**结论：✅ 完全可以继承，并且是显式设计的。**
+
+#### 传播机制——两级拷贝
+
+```
+Level 1 (Winner 内部闭包内):
+  refresher.Refresh(ctx, user_A)
+    ↳ user_A.AccessToken = "new-access-token"   // 修改 Winner 自己的 user 对象
+    ↳ user_A.RefreshToken = "new-refresh-token"
+    ↳ user_A.Expiry = new_expiry
+
+  store.UpdateUser(user_A)                      // 持久化 Winner 对象的新 token 到 DB
+
+  return &refreshResult{                         // 构造"独立副本"放入 singleflight 结果通道
+      AccessToken:  user_A.AccessToken,
+      RefreshToken: user_A.RefreshToken,
+      Expiry:       user_A.Expiry,
+  }
+
+Level 2 (Do() 返回后，所有 goroutine 共享):
+  result, err, _ := refreshGroup.Do(...)         // A、B、C 都拿到同一个 *refreshResult 指针
+
+  if r, ok := result.(*refreshResult); ok {
+      user.AccessToken = r.AccessToken            // A: 从 refreshResult 拷回自己的 user（冗余）
+      user_A.RefreshToken = r.RefreshToken        // B: Waiter，通过 refreshResult 继承新 token ✓
+      user_B.Expiry       = r.Expiry              // C: Waiter，通过 refreshResult 继承新 token ✓
+  }                                               // user_C...
+```
+
+#### 为什么需要 `refreshResult` 中间结构体？
+
+**关键代码注释** (`refresh.go:92-94`):
+
+> waiting goroutines have their own `*model.User` copies that weren't passed to `refresher.Refresh()`
+
+每个调用方（goroutine）都持有自己独立的 `*model.User` 指针副本（来自不同的中间件调用路径，如 session.User() 返回、store.GetUser() 查询）。Winner 的闭包只会修改 **Winner 自己传入的那份** user 对象。如果没有 `refreshResult`，Waiter 从 `Do()` 返回后，自己持有的 user 对象仍是旧值。
+
+`refreshResult` 起到了"跨 goroutine 广播"的作用：把刷新结果从 Winner 传播给所有 Waiter。
+
+---
+
+### 7.3 刷新失败时旧请求如何降级/返回 401
+
+**结论：❌ 没有 401 返回，也没有中间件层面的降级；刷新失败是静默的，请求继续执行，由下游 Forge API 调用自然失败并被包装成业务错误（通常是 500）。**
+
+#### 失败时的完整执行路径
+
+**核心代码**: `server/forge/refresh.go:87-89`
+
+```go
+if err != nil {
+    log.Error().Err(err).Msgf("refresh oauth token of user '%s' failed", user.Login)
+    return  // ← 直接 return，不修改 user 对象，不 panic，不返回 error 给调用方
+}
+```
+
+注意：`forge.Refresh()` 签名是 **无返回值**（`func Refresh(...)`），调用方无法知道刷新是否成功。失败只表现为一条 error log。
+
+#### 各路径的具体表现
+
+| 调用场景 | 中间件/入口 | 刷新失败后 | 最终用户可见结果 |
+|----------|------------|-----------|----------------|
+| HTTP API（用户浏览器请求） | `token.Refresh` 中间件 (`token/token.go:28-41`) | 中间件始终调用 `c.Next()`，不 `AbortWithError(401)` | 下游 handler 用过期 token 调 Forge API → Forge 返回 401/403 → handler 包装成 **500** 业务错误返回。例：`api/repo.go:81 "Could not fetch repository from forge."` |
+| Pipeline 创建（Webhook 触发） | `pipeline.Create()` 内调用 (`pipeline/create.go:62`) | 刷新静默失败，继续执行后续代码 | ① `configService.Fetch()` 取配置时若拿到部分结果 → **唯一降级点**：使用旧 pipeline 配置（`pipeline/create.go:87-93`）<br>② 否则 → pipeline 被标为 error，错误信息写入 DB |
+| Webhook 内部二次 API 调用 | 各 Forge Hook 内，如 GitHub `loadChangedFilesFromPullRequest` | 刷新静默失败，继续创建 Forge 客户端 | Forge API 返回 401 → PR 变更文件无法获取 → 可能导致 step condition 过滤失败或 pipeline 被错误触发 |
+
+#### 测试验证: `TestRefresh_ConcurrentRefreshError` (`refresh_test.go:170-205`)
+
+- 模拟刷新返回错误 `fmt.Errorf("token was already used")`
+- 全部 5 个 goroutine 的 user 对象 token 保持原值 `"old-access-token"`
+- `mockStore.AssertNotCalled(t, "UpdateUser", mock.Anything)` 验证数据库持久化未被调用
+
+#### 为什么不直接返回 401？
+
+当前设计隐含的假设是：
+1. **Token 过期 ≠ 会话失效**：用户的 Woodpecker 会话 Cookie（`user_sess`）仍然有效，只是需要一个新的 Forge Access Token
+2. **刷新可能是临时故障**：如 Forge 暂时不可用，几秒后下一次请求可能成功
+3. **部分操作不依赖 Forge**：如查看历史 pipeline 记录、查看用户信息等，根本不需要访问 Forge，强行 401 会误杀合法请求
+
+**潜在问题**：刷新持续失败（如 refresh token 已被吊销/过期）时，用户不会被踢回登录页，而是持续看到 500 错误。
+
+---
+
+### 7.4 Forge 速率限制（429）下的刷新风暴与回退路径
+
+**结论：⚠️ 不存在排队处理、熔断器或显式回退路径；遇到速率限制是直接报错，且串行请求可能形成刷新风暴，进一步加剧 Forge 侧的 429。**
+
+#### 逐层检查现有机制
+
+##### 第 1 层：`forge.Refresh()` 内部 — 完全无防护
+
+```go
+// server/forge/refresh.go:70-100
+// ✗ 无指数退避（exponential backoff）
+// ✗ 无重试（refresh 内部不 retry）
+// ✗ 无熔断器（circuit breaker）—— 连续 N 次失败后停止 M 秒尝试
+// ✗ 无失败冷却期标记（如 "该用户最近 30s 刷新失败，跳过"）
+// ✓ 只有 singleflight：同一用户 **并发** 去重，但 **串行** 请求不受限
+```
+
+**问题场景**：
+```
+t=0s   Request-1 到达 → refresh 失败（Forge 429）→ 记日志，请求继续走下游（500）
+t=0.5s Request-2 到达 → token 仍过期 → 再次进入 refreshGroup.Do → 再次刷新 → 再次 429
+t=1s   Request-3 到达 → 同上 → 429
+...（每次都 hammer Forge token endpoint）
+```
+
+因为 `Expiry` 字段从未被更新（刷新失败不写 DB），每次新请求进入时，`time.Now() > Expiry - 1800` 的条件都成立，从而无限次尝试刷新。
+
+##### 第 2 层：通用 HTTP 重试 — **对 429 无效**
+
+**文件**: `server/services/utils/http.go:236-240`
+
+```go
+func isRetryableStatusCode(statusCode int) bool {
+    // Retry on server errors (5xx) only
+    return statusCode >= http.StatusInternalServerError &&
+           statusCode < http.StatusNetworkAuthenticationRequired
+}
+```
+
+- 仅 retry **5xx**
+- 429（`http.StatusTooManyRequests` = 429）是 4xx，在 `http.go:176-178` 被标记为 `backoff.Permanent(err)`，**不 retry**
+- 且这条 retry 路径属于通用 HTTP 客户端，OAuth token endpoint 的刷新走的是各 Forge SDK（如 `oauth2.Config.Exchange`），根本不经过 utils/http.go 的 `Send()` 函数
+
+##### 第 3 层：各 Forge 内部 Refresh 实现 — 无额外防护
+
+如 GitLab Refresh (`gitlab.go`)、GitHub Refresh (`github.go`) 等直接调用各自 SDK 的 `TokenSource.Token()`，没有包装任何 rate limit 处理。
+
+##### 第 4 层：配置文件拉取 — 唯一存在重试的降级路径
+
+**文件**: `server/services/config/forge.go:65-73`
+
+```go
+for i := 0; i < int(f.retryCount); i++ {
+    files, err = ffc.fetch(ctx, strings.TrimSpace(repo.Config))
+    if err == nil { break }
+}
+```
+
+这是 **Pipeline 配置文件获取**（而非 OAuth token 刷新），重试次数由 `WOODPECKER_FORGE_RETRY`（默认 3）控制。同样只针对 Forge API 文件读取端点，不涉及 OAuth token endpoint。
+
+#### 回退路径总结表
+
+| 故障场景 | 是否排队 | 是否重试 | 是否降级 | 实际表现 |
+|---------|---------|---------|---------|---------|
+| 同一用户 **并发** 请求同时刷新（如多个浏览器 tab） | ✅ singleflight 排队，只执行 1 次 | ✗ | ✗ （失败则全部失败） | 由 Winner 执行 + 结果广播 |
+| 同一用户 **串行** 请求（间隔>刷新耗时） | ✗ 不排队，各自独立触发 | ✗ | ✗ | 反复执行 refresh，持续 429 |
+| **不同用户** 同时到 TTL 期 | ✗ 完全不排队（key 含 userID） | ✗ | ✗ | 并发 N 个刷新，可能触发 Forge 全局 rate limit |
+| Forge 返回 500/502/503（token endpoint） | ✗ （OAuth2.Exchange 本身通常不 retry） | 视 SDK 而定 | ✗ | 单次失败，请求继续 |
+| Forge 返回 429（token endpoint） | ✗ | ✗ | ✗ | 立即失败，下一个请求继续踩坑 |
+| 配置文件拉取失败（Pipelines） | ✗ | ✅ `retryCount` 次指数退避 | ✅ （部分结果时用旧配置） | `services/config/forge.go` 与 `pipeline/create.go:87-93` |
+
+#### 应对刷新风暴的缺失机制清单（当前代码不存在）
+
+1. **失败冷却期**：刷新失败后 N 秒内不再尝试（可通过 `user.ForgeID + user.ID` 在内存中记一个"失败直到"的时间戳）
+2. **熔断器（Circuit Breaker）**：连续 M 次失败后自动打开，冷却期内所有刷新跳过
+3. **429 Retry-After 尊重**：解析 Forge 响应的 `Retry-After` header，在该时间之前不再次尝试
+4. **持久化最近刷新时间**：即使刷新失败，也把 `Expiry` 向后推移一小段时间（如 60s），避免下一次请求立即再次触发
+5. **刷新失败时的前端反馈**：中间件检测到刷新持续失败时，将特定 header 写入响应，前端据此引导用户重新授权
+
+---
+
+## 8. 关键代码路径索引
 
 | 功能 | 文件 | 行号/函数 |
 |------|------|-----------|
@@ -466,3 +686,7 @@ Goroutine 3 ─┘         │                                        │
 | 通用 Token 查找 | `server/forge/common/utils.go` | `UserToken()`, `RepoUser()` |
 | JWT Token 类型 | `shared/token/token.go` | `OAuthStateToken`, `SessToken` |
 | Netrc 凭据 | `server/model/netrc.go` | `Netrc struct` |
+| Token 刷新单元测试 | `server/forge/refresh_test.go` | `TestRefresh_ConcurrentRefreshSerialized`, `TestRefresh_ConcurrentRefreshError` |
+| Pipeline 创建降级 | `server/pipeline/create.go:62,87-93` | `forge.Refresh()` + config fallback |
+| 通用 HTTP 重试 | `server/services/utils/http.go:236-240` | `isRetryableStatusCode()` (仅 5xx) |
+| Config Fetcher 重试 | `server/services/config/forge.go:65-73` | `retryCount` 次循环 |
