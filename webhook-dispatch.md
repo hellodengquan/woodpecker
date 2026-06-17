@@ -81,6 +81,22 @@ _, err := token.ParseRequest([]token.Type{token.HookToken}, c.Request, func(t *t
    - 通过回调 `SecretFunc` 获取 `repo.Hash` 作为 HMAC 密钥验证签名
 3. 从 token claims 中提取 `forge-id` + `repo-forge-remote-id`（或兼容的 `repo-id`），在数据库中定位仓库
 
+**Token 签发位置**：`server/api/repo.go:155-165`
+
+```go
+t := token.New(token.HookToken)
+t.Set("repo-forge-remote-id", string(forgeRemoteID))
+t.Set("forge-id", strconv.FormatInt(repo.ForgeID, 10))
+sig, err := t.Sign(repo.Hash)  // Sign() = SignExpires(secret, 0)
+```
+
+> **关键观察：无 jti 防重放**
+>
+> - `Sign()` 调用 `SignExpires(secret, 0)`，`exp=0` 表示**永不过期**（`token.go:140-142`）
+> - 签发时未设置 `jti` (JWT ID) claim，`keyFunc` 中仅**跳过**了标准 claim (`iss/sub/aud/exp/nbf/iat/jti`) 而不做任何校验（`token.go:182`）
+> - 没有 nonce 存储或时间窗校验：HookToken 一旦签发就是长期静态凭证，捕获后可无限重放
+> - 实际防护依赖于 HTTPS 传输加密 + 每仓库独立 `repo.Hash`（密钥轮换通过重新激活仓库触发）
+
 **安全设计要点**：
 
 | 要点 | 位置 | 说明 |
@@ -89,23 +105,31 @@ _, err := token.ParseRequest([]token.Type{token.HookToken}, c.Request, func(t *t
 | Token 类型白名单 | `token.go:59` | `slices.Contains(allowedTypes, token.Type)`，只允许 `HookToken` |
 | 密钥绑定仓库 | `hook.go:79-85` | 每个仓库有独立 Hash，签名密钥互不干扰 |
 | 仓库 ID 双重验证 | `hook.go:144` | token 中的 `ForgeRemoteID` 必须与 forge 返回的匹配 |
+| **无 jti / 无过期** | `token.go:123` | `Sign()` = `SignExpires(secret, 0)`，永不过期无重放防护 |
 
-### 2.2 Forge 层：Payload 签名校验
+### 2.2 Forge 层：Payload 签名校验 —— 兜底分析
 
-各 Forge 驱动的 `Hook()` 方法可自行做载荷签名验证：
+Forge 接口契约在 `server/forge/forge.go:163` 明确要求：**Must verify webhook signature to prevent spoofing**。
+但实际只有 Bitbucket DataCenter 严格兑现了契约，其余 Forge 均**退回依赖入口层 JWT**：
 
-| Forge | 签名校验方式 | 代码位置 |
-|-------|-------------|---------|
-| **Bitbucket DataCenter** | `bitbucket.ValidateSignature(r, hook.Payload, []byte(repo.Hash))` | `bitbucketdatacenter.go:510` |
-| **GitLab** | 通过 `X-Gitlab-Token` 头传递的 token（在入口层 `ParseRequest` 中已解析为 JWT） | `token.go:81-83` |
-| **GitHub** | 依赖入口层 JWT 校验；`github.ParseWebHook` 使用官方 SDK 解析 | `github/parse.go:71` |
-| **Gitea / Forgejo** | 依赖入口层 JWT 校验；Webhook URL 中嵌入 `access_token` 参数 | `gitea/gitea.go:370-374` |
-| **Bitbucket Cloud** | 依赖入口层 JWT 校验 | `bitbucket/bitbucket.go` |
+| Forge | Forge 层签名校验 | 实现方式 | 兜底机制 |
+|-------|----------------|---------|---------|
+| **Bitbucket DataCenter** | ✅ 完整 HMAC 校验 | `bitbucket.ValidateSignature(r, hook.Payload, []byte(repo.Hash))` | 入口层 JWT（双保险） |
+| **GitHub** | ❌ 未实现 | `github.ParseWebHook(github.WebHookType(r), raw)` 无 secret 参数 | **依赖 JWT** + 官方 SDK 格式校验 |
+| **GitLab** | ⚠️ 间接实现 | `X-Gitlab-Token` 头的值=JWT，在 `ParseRequest` 统一解析 | JWT 本身=签名校验 |
+| **Gitea** | ❌ 未实现 | Webhook URL 直接嵌入 `access_token=<jwt>` | **纯依赖 JWT** |
+| **Forgejo** | ❌ 未实现 | 同 Gitea，URL 携带 `access_token=<jwt>` | **纯依赖 JWT** |
+| **Bitbucket Cloud** | ❌ 未实现 | 无签名校验代码分支 | **纯依赖 JWT** |
 
-**Bitbucket DataCenter 的签名验证**是 Forge 层最完整的实现：
-- 先用 `ParsePayloadWithoutSignature` 解析载荷（`parse.go:35`）
-- 再用 `ValidateSignature` 对原始 payload + `repo.Hash` 做 HMAC 校验
-- 签名不匹配直接返回错误，拒绝处理
+**Bitbucket DataCenter 完整签名流程**（`bitbucketdatacenter.go:506-514`）：
+1. `bitbucket.ParsePayloadWithoutSignature(r)` 先用非校验路径解析
+2. `bitbucket.ValidateSignature(r, hook.Payload, []byte(repo.Hash))` 对原始 HTTP payload 做 HMAC
+3. 不匹配直接返回错误，拒绝处理
+
+**其余 Forge 的隐性兜底**：
+- 入口层 JWT 已做 HMAC-SHA256 签名校验，token 伪造不通过
+- 但这意味着 **payload 与 token 的绑定不强制**：若攻击者拿到合法 JWT，可替换 payload body 任意内容（除了 Bitbucket DC 有二次校验）
+- `hook.go:144` 的 `repo.ForgeRemoteID != repoFromForge.ForgeRemoteID` 交叉校验提供了部分防护——payload 中伪造的仓库 ID 必须与 token 中的一致
 
 ---
 
@@ -176,7 +200,7 @@ Create()
   ├─ ⑧ publishPipeline → 推送状态到 PubSub + Forge
   ├─ ⑨ setApprovalState → 门控检查 (gated)
   │     └─ StatusBlocked → 直接返回, 等待审批
-  └─ ⑩ start → 投递队列
+  └─ ⑩ start → cancelPreviousPipelines + queuePipeline
 ```
 
 ### 4.2 YAML 编译流水线
@@ -218,10 +242,10 @@ Create()
 
 ### 5.1 单飞刷新（OAuth Token singleflight）
 
-**代码**：`server/forge/refresh.go:43-48`
+**代码**：`server/forge/refresh.go:23-101`
 
 ```go
-var refreshGroup singleflight.Group
+var refreshGroup singleflight.Group  // 包级变量，进程内单例
 ```
 
 **问题**：多个并发 webhook 同时触发 `forge.Refresh`，可能导致：
@@ -232,22 +256,34 @@ var refreshGroup singleflight.Group
 
 - 使用 `golang.org/x/sync/singleflight`，以 `refresh-{userID}` 为 key
 - 第一个请求执行刷新，后续请求等待共享结果
-- 刷新结果通过 `refreshResult` 结构体传递给等待的 goroutine
+- 刷新结果通过 `refreshResult` 结构体传递给等待的 goroutine，后者将新鲜 token 拷贝到自己的 `*model.User` 副本
 
 ```go
+key := fmt.Sprintf("refresh-%d", user.ID)
 result, err, _ := refreshGroup.Do(key, func() (any, error) {
     userUpdated, err := refresher.Refresh(ctx, user)
-    // ... 更新 DB
-    return &refreshResult{...}, nil
+    if userUpdated {
+        _store.UpdateUser(user)  // 写入 DB
+    }
+    return &refreshResult{AccessToken, RefreshToken, Expiry}, nil
 })
-// 等待的 goroutine 从 result 拷贝 token 到自己的 user 对象
+// 等待方：把结果写入自己的 user 对象副本
+user.AccessToken = r.AccessToken
 ```
 
 **TTL 策略**：仅在 token 过期前 30 分钟（`tokenMinTTL = 1800s`）才触发刷新。
 
+> **跨 instance 限制**：
+>
+> `singleflight.Group` 是 **纯内存结构**，无分布式协调。在多副本部署（HA / K8s replicas > 1）下：
+> - 每个 server 实例有独立的 `refreshGroup`，实例间不共享去重状态
+> - 同一用户的并发请求若落到不同实例，仍会触发**并发刷新**
+> - 对 Forgejo（一次性 refresh token）尤其危险：实例 A 刷新成功后 token 作废，实例 B 的刷新会拿到 401
+> - 无 Redis / 数据库级分布式锁兜底，依赖请求层负载均衡的粘性（sticky session）缓解
+
 ### 5.2 取消先前流水线（Cancel Previous Pipelines）
 
-**代码**：`server/pipeline/cancel.go:100-158`
+**代码**：`server/pipeline/cancel.go:32-159`
 
 **触发条件**：仓库配置了 `CancelPreviousPipelineEvents` 且当前事件匹配
 
@@ -258,22 +294,48 @@ pipelineNeedsCancel := func(active *model.Pipeline) bool {
     if active.Event != pipeline.Event { return false }
     switch pipeline.Event {
     case model.EventPush:
-        return pipeline.Branch == active.Branch  // 同分支 push 取消同分支
+        return pipeline.Branch == active.Branch   // 同分支 push 取消同分支
     default:
-        return pipeline.Refspec == active.Refspec // 同 refspec 互斥
+        return pipeline.Refspec == active.Refspec  // 同 refspec 互斥
     }
 }
 ```
 
-**执行**：
-1. `store.GetActivePipelineList(repo)` 获取所有活跃流水线
-2. 对匹配的旧流水线调用 `Cancel()`
-3. `Cancel()` 先通过 `Scheduler.ErrorAtOnce` 批量驱逐队列中的 workflow
-4. 再更新 DB 中 pending workflow 为 skipped
+**执行路径（Cancel 函数）**：
+
+```
+Cancel()
+  │
+  ├─ ① 校验：pipeline.Status 必须是 Running/Pending/Blocked
+  ├─ ② store.WorkflowGetTree → 拉取 workflow + step 完整树
+  ├─ ③ ErrorAtOnce → 从队列中**批量驱逐** in-flight task
+  │     (workflowsToCancel = 所有 Running + Pending 的 workflow ID)
+  │
+  ├─ ④ 更新 DB 中 Pending workflow → StatusSkipped
+  ├─ ⑤ 更新 DB 中 Pending step → StatusSkipped (StatusCanceled)
+  │
+  ├─ ⑥ 判断 hasPendingOnly：
+  │     · 全部 Pending → pipeline.Status = StatusCanceled
+  │     · 含 Running → pipeline.Status = StatusKilled
+  │
+  ├─ ⑦ UpdateToStatusKilled → 写 pipeline 最终状态
+  ├─ ⑧ updatePipelineStatus → 推送给 Forge （commit status）
+  └─ ⑨ publishToTopic → PubSub 广播
+```
+
+> **in-flight task 清理的语义分层**：
+>
+> | 状态 | 队列侧（ErrorAtOnce） | 数据库侧 | 实际执行侧 |
+> |------|---------------------|---------|-----------|
+> | **Pending**（在 pending/waitingOnDeps 队列中） | `removeFromPendingAndWaiting` 直接移除 | 立即写 `StatusSkipped` | 不涉及 |
+> | **Running**（在 running map 中，已分配给 Agent） | 设置 `entry.error = ErrCancel`，关闭 `done` channel | **DB 不立即更新** | Agent 侧 gRPC `Wait()` 检测到 `ErrCancel` → 停止执行 → 回调 `Done(canceled=true)` |
+> | **已执行完毕的 workflow** | 不在队列，ErrorAtOnce 无操作 | 不更新 | —— |
+>
+> **关键延迟窗口**：Running workflow 在队列中已标记 cancel，但 Agent 必须等到下一次 `Wait()` 调用才检测到信号。这期间步骤可能仍在执行容器中运行，属于 **best-effort 取消**而非硬终止。
 
 ### 5.3 队列互斥（FIFO Lock）
 
-`fifo` 结构体内嵌 `sync.Mutex`（`queue/fifo.go:46`），所有队列操作（入队、出队、状态更新）都在锁保护下进行，保证并发安全。
+`fifo` 结构体内嵌 `sync.Mutex`（`queue/fifo.go:46`），所有队列操作（入队、出队、状态更新、KickAgentWorkers）都在锁保护下进行，保证并发安全。
 
 ### 5.4 Agent 过滤匹配（Worker Filter）
 
@@ -291,9 +353,81 @@ if matched && score > bestScore {
 
 ---
 
-## 6 重试与死信回收
+## 6 FIFO 优先级队列实现细节
 
-### 6.1 过期任务自动重入队（Resubmit Expired Pipelines）
+**代码**：`server/queue/fifo.go`
+
+Woodpecker 的队列名虽为 FIFO，但实际是**带优先级的双向链表**，底层数据结构为 Go 标准库 `container/list`：
+
+```go
+type fifo struct {
+    sync.Mutex
+    workers       map[*worker]struct{}
+    running       map[string]*entry       // taskID → 运行中条目
+    pending       *list.List               // 待执行，双向链表
+    waitingOnDeps *list.List               // 等待依赖满足
+    extension     time.Duration            // TaskTimeout
+}
+```
+
+### 6.1 优先级语义
+
+| 操作 | 入队位置 | 含义 |
+|------|---------|------|
+| 新 task `PushAtOnce` | `pending.PushBack(task)` | 队尾，FIFO 语义 |
+| 过期 task 重入队 | `pending.PushFront(task)` | **队首**，重试优先于新任务 |
+| `filterWaiting` 依赖满足 | `pending.PushBack(task)` | 队尾，重新参与调度 |
+
+> **不是真正的优先级队列**：
+> - 没有最小堆/最大堆，只有链表头尾两个插入点
+> - 同一优先级内严格 FIFO
+> - 唯一优先级区分：「重试 task」>「新 task」（通过 PushFront vs PushBack 实现）
+> - 无法按 pipeline 紧急程度 / 仓库权重 / 调度公平性做细粒度优先级
+> - `assignToWorker` 从头遍历 `pending` 队列，先到先匹配 worker
+
+### 6.2 100ms 轮询时钟与漂移
+
+**代码**：`server/queue/fifo.go:57-73, 257-287`
+
+```go
+const processTimeInterval = 100 * time.Millisecond
+
+func (q *fifo) process() {
+    for {
+        select {
+        case <-time.After(processTimeInterval):  // 相对延迟，非绝对时钟
+        case <-q.ctx.Done():
+            return
+        }
+        q.Lock()
+        if q.paused { q.Unlock(); continue }
+        q.resubmitExpiredPipelines()   // deadline 检查用 time.Now()
+        q.filterWaiting()
+        for pending, worker := q.assignToWorker(); ... { ... }
+        q.Unlock()
+    }
+}
+```
+
+**漂移来源分析**：
+
+| 因素 | 影响 | 代码位置 |
+|------|------|---------|
+| `time.After` 是**相对**延迟 | 若 `process()` 本体执行 30ms，则下一轮在 130ms 后，而非整点 100ms。高负载下 GC 或锁竞争导致单次 200ms，累计漂移严重 | `fifo.go:260` |
+| `sync.Mutex` 等待时间不计入 tick | 高并发时 Lock() 可能阻塞几十 ms，tick 从拿到锁后才开始算 | `fifo.go:265` |
+| `time.Now()` 墙钟依赖 | `resubmitExpiredPipelines` 用墙钟比较 deadline，NTP 校时跳变会误判过期/不过期 | `fifo.go:340` |
+| Agent `Extend` 心跳间隔 1 分钟 | `updateAgentLastWorkDelay = 1m`，若 100ms tick 漏跑几轮（如 GC STW），task 可能被判过期误回收 | `rpc.go:51` |
+
+> **实际影响**：
+> - 正常情况下调度延迟约 **100ms 量级**（task 入队后最多等一个 tick 才被分配）
+> - 注释 `as the agent pull in 10 milliseconds we should also give them work asap` 与实际 `100ms` 不符（Agent gRPC `Poll` 是阻塞长连接，不是 10ms 轮询）
+> - 死信回收的延迟：task 过期后最多再等一个 100ms tick 才能被 `resubmitExpiredPipelines` 捡回
+
+---
+
+## 7 重试与死信回收
+
+### 7.1 过期任务自动重入队（Resubmit Expired Pipelines）
 
 **代码**：`server/queue/fifo.go:338-348`
 
@@ -302,7 +436,7 @@ func (q *fifo) resubmitExpiredPipelines() {
     for taskID, taskState := range q.running {
         if time.Now().After(taskState.deadline) {
             taskState.error = ErrTaskExpired
-            q.pending.PushFront(taskState.item)  // 重新放回队首
+            q.pending.PushFront(taskState.item)  // 重新放回队首（优先级最高）
             delete(q.running, taskID)
             close(taskState.done)
         }
@@ -317,7 +451,7 @@ func (q *fifo) resubmitExpiredPipelines() {
 - 若 Agent 崩溃或网络中断，deadline 过期后 task 自动从 `running` 移回 `pending` 队首
 - 等待的 `Wait()` 会收到 `ErrTaskExpired`
 
-### 6.2 持久化恢复（Task Store Recovery）
+### 7.2 持久化恢复（Task Store Recovery）
 
 **代码**：`server/queue/persistent.go:32-38`
 
@@ -332,7 +466,25 @@ func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
 - Server 重启后，数据库中残留的 task 会被重新加载到内存队列
 - 相当于「死信回收」：本来应执行但 server crash 导致丢失的任务被恢复
 
-### 6.3 任务错误处理
+> **TaskList 大量加载延迟问题**：
+>
+> 实现位于 `server/store/datastore/task.go:21-24`：
+> ```go
+> func (s storage) TaskList() ([]*model.Task, error) {
+>     tasks := make([]*model.Task, 0, perPage)  // perPage=50 仅预分配容量
+>     return tasks, s.engine.Find(&tasks)       // SELECT * FROM tasks，全量加载
+> }
+> ```
+>
+> - 无分页、无 WHERE 过滤、无状态筛选（`store.go:152` TODO 注释：`// TaskList TODO: paginate & opt filter`）
+> - 数据库中若有数千条积压 task（例如 server 长时间宕机），**启动时全量加载会阻塞**：
+>   - SQL 查询传输延迟
+>   - ORM 反序列化大量对象
+>   - `PushAtOnce` 逐个 `PushBack` 到链表
+> - `persistentQueue.PushAtOnce` 也是逐条 `TaskInsert`（无事务、无 batch），见 `persistent.go:47-57`
+> - **无去重**：重启后可能与正常 Agent 回传的 `Done/Error` 竞争，同 task 既在 DB 中又被 Poll 过一次，可能产生重复执行（Agent 侧 gRPC `checkWorkflowState` 做二次校验兜底）
+
+### 7.3 任务错误处理
 
 **代码**：`server/queue/fifo.go:133-160`
 
@@ -343,16 +495,68 @@ func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
 3. 更新依赖此 task 的其他 task 的 `DepStatus`
 4. 错误被包装为 `ErrExternal`，`Wait()` 时会过滤掉外部错误
 
-### 6.4 Agent 踢出（Kick Agent Workers）
+### 7.4 Agent 踢出（KickAgentWorkers）与优雅退出
 
-**代码**：`server/queue/fifo.go:243-253`
+**代码**：`server/queue/fifo.go:242-253, 87-111`
 
-当 Agent 断连时，`KickAgentWorkers(agentID)` 被调用：
-- 遍历所有 worker，踢出匹配 agentID 的 worker
-- 被踢的 worker 的 `context.CancelCauseFunc` 被触发，Poll 返回 `ErrWorkerKicked`
-- 该 Agent 正在运行的 task 会在 deadline 过期后被 `resubmitExpiredPipelines` 回收
+四个触发场景（`server/api/agent.go`）：
 
-### 6.5 流水线重启（Restart）
+| 场景 | 代码位置 | 说明 |
+|------|---------|------|
+| 管理员设置 `NoSchedule=true` | `agent.go:145` | 阻止该 Agent 接收新任务 |
+| 删除 Agent | `agent.go:225` | 删除前先踢 worker（但先检查无 running task） |
+| 组织 Agent 设置 NoSchedule | `agent.go:348` | 同场景 1 |
+| 用户 Agent 设置 NoSchedule | `agent.go:400` | 同场景 1 |
+
+**执行流程**：
+
+```go
+func (q *fifo) KickAgentWorkers(agentID int64) {
+    q.Lock()
+    defer q.Unlock()
+    for worker := range q.workers {
+        if worker.agentID == agentID {
+            worker.stop(ErrWorkerKicked)   // context.WithCancelCause
+            delete(q.workers, worker)
+        }
+    }
+}
+```
+
+Worker 侧 Poll 检测到取消：
+
+```go
+func (q *fifo) Poll(c context.Context, agentID int64, filter FilterFn) (*model.Task, error) {
+    ctx, stop := context.WithCancelCause(c)
+    w := &worker{agentID, filter, make(chan *model.Task, 1), stop}
+    q.workers[w] = struct{}{}
+    for {
+        select {
+        case <-ctx.Done():
+            q.Lock(); delete(q.workers, w); q.Unlock()
+            return nil, ctx.Err()          // 返回 context.Canceled
+        case t := <-w.channel:
+            return t, nil
+        }
+    }
+}
+```
+
+> **优雅退出的不完整性**：
+>
+> 1. **Poll 中等待的 worker**：被踢后 `ctx.Done()` 触发，`Poll` 返回 `context.Canceled`。Agent 侧 gRPC `Next()` 检测到 error 后重连（`rpc.go:93`）
+>
+> 2. **已分配 task（running map 中）**：`KickAgentWorkers` **只删 worker，不动 running 条目**！
+>    - 这些 task 继续留在 `q.running` 中，`deadline` 正常倒计时
+>    - Agent 侧 gRPC `Wait()` 会最终收到断连错误，但 **Agent 端运行的容器不会被强杀**
+>    - 等 `TaskTimeout`（默认 1 分钟）到期后，`resubmitExpiredPipelines` 才把 task 放回 `pending.PushFront`
+>    - 这期间 task 被**悬空**：DB 里仍被标记为运行中，无任何 Agent 心跳续约
+>
+> 3. **TODO 注释佐证**：`rpc.go:62` 标注 `// TODO (6038): Server does not release waiting agents on graceful shutdown.`
+>
+> 4. **Cause 丢失**：`worker.stop(ErrWorkerKicked)` 设置了 cause，但 `ctx.Err()` 只返回通用 `context.Canceled`，调用方无法区分「被踢」和「普通取消」
+
+### 7.5 流水线重启（Restart）
 
 **代码**：`server/pipeline/restart.go:32`
 
@@ -363,7 +567,7 @@ func WithTaskStore(ctx context.Context, q Queue, s store.Store) Queue {
 
 ---
 
-## 7 门控拦截（Gated Pipeline）
+## 8 门控拦截（Gated Pipeline）
 
 **代码**：`server/pipeline/gated.go:23-30`
 
@@ -392,13 +596,14 @@ func setApprovalState(repo *model.Repo, pipeline *model.Pipeline) {
 
 ---
 
-## 8 关键代码索引
+## 9 关键代码索引
 
 | 模块 | 文件 | 核心函数/结构体 |
 |------|------|----------------|
 | Webhook 入口 | `server/api/hook.go` | `PostHook()` |
-| JWT 校验 | `shared/token/token.go` | `ParseRequest()`, `keyFunc()` |
-| Forge 接口 | `server/forge/forge.go` | `Forge.Hook()` |
+| JWT 校验 | `shared/token/token.go` | `ParseRequest()`, `keyFunc()`, `Sign()`, `SignExpires()` |
+| JWT HookToken 签发 | `server/api/repo.go` | `PostRepo()` 中 `token.New(HookToken) + t.Sign()` |
+| Forge 接口 | `server/forge/forge.go` | `Forge.Hook()` 契约 |
 | GitHub 解析 | `server/forge/github/parse.go` | `parseHook()`, `parsePushHook()` |
 | GitLab 解析 | `server/forge/gitlab/gitlab.go` | `Hook()` |
 | Gitea 解析 | `server/forge/gitea/parse.go` | `parseHook()` |
@@ -407,27 +612,52 @@ func setApprovalState(repo *model.Repo, pipeline *model.Pipeline) {
 | Pipeline 创建 | `server/pipeline/create.go` | `Create()` |
 | YAML 编译 | `server/pipeline/items.go` | `parsePipeline()`, `createPipelineItems()` |
 | 入队 | `server/pipeline/queue.go` | `queuePipeline()` |
-| FIFO 队列 | `server/queue/fifo.go` | `fifo`, `process()`, `resubmitExpiredPipelines()` |
+| FIFO 队列 | `server/queue/fifo.go` | `fifo`, `process()`, `resubmitExpiredPipelines()`, `KickAgentWorkers()` |
+| FIFO 链表调度 | `server/queue/fifo.go` | `PushAtOnce()`, `assignToWorker()`, `filterWaiting()` |
 | 持久化队列 | `server/queue/persistent.go` | `WithTaskStore()`, `persistentQueue` |
-| Token 刷新 | `server/forge/refresh.go` | `Refresh()`, `refreshGroup` |
-| 取消/去重 | `server/pipeline/cancel.go` | `Cancel()`, `cancelPreviousPipelines()` |
+| Task 全量加载 | `server/store/datastore/task.go` | `TaskList()` |
+| Token 刷新 singleflight | `server/forge/refresh.go` | `Refresh()`, `refreshGroup` |
+| 取消/去重 + in-flight 清理 | `server/pipeline/cancel.go` | `Cancel()`, `cancelPreviousPipelines()` |
 | 门控 | `server/pipeline/gated.go` | `setApprovalState()`, `needsApproval()` |
 | 重启 | `server/pipeline/restart.go` | `Restart()` |
 | 状态管理 | `server/pipeline/pipeline_status.go` | `UpdateToStatusError()`, `UpdateToStatusKilled()` |
 | Task 模型 | `server/model/task.go` | `Task`, `ShouldRun()` |
 | 超时常量 | `shared/constant/constant.go` | `TaskTimeout` |
+| Agent gRPC 协议 | `server/rpc/rpc.go` | `Next()`, `Wait()`, `Extend()` |
+| Agent 踢出触发 | `server/api/agent.go` | `PatchAgent()`, `DeleteAgent()` |
 | 调度器 | `server/scheduler/scheduler.go` | `Scheduler` = `Queue` + `PubSub` |
 
 ---
 
-## 9 总结
+## 10 总结
 
-Woodpecker 的 webhook 调度采用 **双层校验 + 单入口 + 内存队列 + 持久化兜底** 的架构：
+Woodpecker 的 webhook 调度采用 **双层校验 + 单入口 + 内存队列 + 持久化兜底** 的架构，关键节点的设计取舍归纳如下：
 
-1. **签名校验**：入口层 JWT（每个仓库独立密钥）+ Forge 层可选的 payload 签名（BDC 已实现），确保请求来源可信
+### 10.1 已实现的安全与可靠性
+
+1. **签名校验**：入口层 JWT-HS256（每个仓库独立密钥）+ 算法白名单防 `alg:none`；Bitbucket DC 额外做 payload HMAC 双保险
 2. **载荷解析**：统一通过 `Forge.Hook()` 接口分发，各驱动按平台格式解析 push/PR/tag/release 事件
-3. **仓库匹配**：token 中的 `ForgeRemoteID` 与载荷返回的交叉校验，加上 IsActive/UserID/AllowPull 等状态检查
+3. **仓库匹配**：token 中的 `ForgeRemoteID` 与 forge 返回值交叉校验，防止 token 跨仓库滥用
 4. **流水线编译**：YAML → `PipelineBuilder.Build()` → `builder.Item` → `model.Task`，注入 secrets/registries/envs
-5. **并发拦截**：`singleflight` 防 OAuth token 并发刷新；`cancelPreviousPipelines` 做同分支/同 refspec 去重；`sync.Mutex` 保护队列状态
-6. **死信回收**：过期 task 自动重入队（`resubmitExpiredPipelines`）；server 重启从 DB 恢复（`WithTaskStore`）；Agent 断连踢出后 task 自然过期回收
-7. **门控**：按仓库策略拦截需审批的事件，`StatusBlocked` 状态不入队
+5. **并发拦截**：
+   - `singleflight` 防同一实例内 OAuth token 并发刷新
+   - `cancelPreviousPipelines` 做同分支/同 refspec 去重，Pending 立删、Running 发取消信号
+   - `sync.Mutex` 保护所有队列状态变更
+6. **死信回收**：
+   - 过期 task 自动重入队（`resubmitExpiredPipelines`，PushFront 优先级最高）
+   - server 重启从 DB `TaskList()` 全量恢复
+   - Agent 断连踢出后 running task 靠 deadline 超时自然回收
+
+### 10.2 已知风险 / 改进空间
+
+| 节点 | 现状 | 风险 |
+|------|------|------|
+| **JWT 防重放** | HookToken `Sign()` 无 `exp`、无 `jti`、无 nonce | 凭证被捕获可无限重放，只能靠重新激活仓库轮换密钥 |
+| **Forge 签名兜底** | 仅 BDC 做 payload HMAC，其余纯依赖 JWT | 攻击者持合法 JWT 可伪造 payload（仓库 ID 交叉校验提供部分防护） |
+| **singleflight 跨实例** | 纯内存去重，无分布式协调 | HA 部署下同一用户并发刷新仍可能冲突，Forgejo 一次性 token 尤甚 |
+| **Running task 取消** | 仅关闭 done channel，Agent 靠 Wait() 轮询检测 | 取消信号传播延迟，容器可能已执行大半，best-effort 而非硬终止 |
+| **FIFO 队列粒度** | 双向链表仅头尾两点插入 | 无真正优先级调度，无法按紧急度/权重做公平性控制 |
+| **100ms 时钟漂移** | `time.After` 相对延迟 + 墙钟比较 deadline | 高负载下调度延迟放大，NTP 跳变可能误判 task 过期 |
+| **TaskList 启动加载** | 无分页全量 `SELECT *` | 宕机恢复时大量积压 task 导致启动阻塞，无批量入库 |
+| **KickAgentWorkers** | 只删 worker，不动 running task | 被踢 Agent 的 task 悬空 1 分钟靠超时回收，无任务优雅移交 |
+| **优雅关闭** | `rpc.go:62` TODO(6038) 明确标注未实现 | Server 关机时阻塞中的 Poll 不会被释放，gRPC 连接硬断 |
