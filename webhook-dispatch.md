@@ -1204,53 +1204,245 @@ P4 全 Forge 签名 ─── 独立，按平台逐一落地
 
 **目标**：shutdown 或 Agent 被踢时，将 running task 从源 Agent 转移到目标 Agent，无需重新拉取镜像、重新 clone 代码。
 
+**强依赖兼容矩阵（真实版本号）**：
+
+基于当前 `rpc/proto/version.go:19` 的 `Version = 16`（proto 第 16 版），迁移协议引入时将 bump 到 v17：
+
+| 组件 | 最低版本 | 版本兼容策略 | 代码位置 |
+|------|---------|-------------|---------|
+| **gRPC proto** | v16（当前）→ v17（新增方法） | 新增 `TransferTask` RPC 为纯增量，不删字段不改编号 | `rpc/proto/version.go` 中 `const Version int32` |
+| **Server** | v3.x（当前主版本） | Server 同时支持 v16 和 v17 Agent，缺能力位自动降级 | `server/rpc/server.go:193 RegisterAgent()` |
+| **Agent** | v3.x 新 Agent | 新 Agent 支持 v16 Server（不发 TransferTask 调用） | `agent/rpc/client_grpc.go:44 ClientGrpcVersion` |
+| **协议号规则** | 每次 proto 修改 +1 | 历史：v1→v16 共 16 次变更，全部向前兼容 | `rpc/proto/version.go` 顶部注释 |
+
+> protobuf 字段号规则：`AgentInfo` 当前用到字段 1-7/9-14（`Version=1`, `Platform=2`, `Backend=3`, `Capacity=4`, `CustomLabels=5` 等），`supports_task_transfer` 取 field 15 避开已有字段，老客户端反序列化时自动忽略未知字段（proto3 默认行为）。
+
 **兼容性分层（老 Agent 新 Server、新 Agent 老 Server、混合部署）**：
 
 | 场景 | 兼容策略 | 实现方式 |
 |------|---------|---------|
-| **新 Server + 老 Agent** | 降级为「Kick + 超时重入队」 | gRPC `TransferTask` 方法未实现，老 Agent 收到 `Unimplemented`，Server 走旧逻辑 |
-| **老 Server + 新 Agent** | Agent 忽略迁移信号，按断连处理 | Agent 检测不到 `TransferTask` 调用，维持现有行为 |
-| **新 Server + 新 Agent** | 完整迁移流程 | 三步走握手 |
-| **混合版本 Agent** | 逐 Agent 协商能力位 | `RegisterAgent` 时上报 `supports_task_transfer` 标志位 |
+| **新 Server (v17) + 老 Agent (v16)** | 降级为「Kick + 超时重入队」 | 老 Agent 注册时 `supports_task_transfer` 字段缺失=默认 false，Server 不走迁移流程 |
+| **老 Server (v16) + 新 Agent (v17)** | Agent 忽略迁移信号，按断连处理 | Server 不发起 TransferTask 调用，Agent 维持现有 Next/Wait 循环 |
+| **新 Server + 新 Agent** | 完整迁移流程 | 三步走握手 + 幂等键保障 |
+| **混合版本 Agent 集群** | 逐 Agent 协商能力位 | `RegisterAgent` 时 Server 记录每个 Agent 的 `supports_task_transfer` 标志 |
+
+**能力位默认值与启用条件**：
+
+| 能力位 | proto 字段号 | 默认值 | 启用条件 | 对应配置项 |
+|--------|------------|--------|---------|-----------|
+| `supports_task_transfer` | 15 | **false**（零值） | 1. Agent 版本 ≥ v17 proto<br>2. Agent 后端支持（如 k8s backend 可迁移 pod，docker backend 不支持）<br>3. 环境变量 `WOODPECKER_AGENT_ENABLE_TRANSFER=true`（默认关闭，灰度） | `WOODPECKER_AGENT_ENABLE_TRANSFER` |
+| `supports_workflow_checkpoint` | 16 | **false** | 迁移 + backend 支持容器快照（如 CRIU） | 预留，暂未实现 |
+
+> **零值语义**：proto3 中 `bool` 字段默认值为 false，老 Agent 不发该字段等价于 false。新 Agent 即便升级了 proto 版本，也需显式设置为 true 才启用迁移——保证升级不引入新行为，属「opt-in」安全策略。
 
 **三步走迁移握手**（gRPC protobuf 增量设计）：
 
 ```protobuf
-// 版本 1：现有协议
+// 版本 1：现有协议（v16）
 rpc Next(NextRequest) returns (NextResponse);
 rpc Wait(WaitRequest) returns (WaitResponse);
 
-// 版本 2：新增迁移方法（向后兼容）
+// 版本 2：新增迁移方法（v17，向后兼容）
 message TransferTaskRequest {
-  string task_id = 1;
-  string target_agent_id = 2;
-  int64 deadline_extension_seconds = 3;  // 给迁移过程的额外时间
-  bytes checkpoint = 4;  // 源 Agent 可选：当前 step 进度快照
+  string task_id = 1;                    // 幂等键组成部分 1：task ID = workflow.ID 字符串
+  int64 pipeline_rerun_count = 2;        // 幂等键组成部分 2：Pipeline.RerunCount
+  int32 workflow_pid = 3;                // 幂等键组成部分 3：Workflow.PID（同 pipeline 内序号）
+  string source_agent_id = 4;            // 源 Agent ID
+  string target_agent_id = 5;            // 目标 Agent ID
+  int64 deadline_extension_seconds = 6;  // 给迁移过程的额外时间
+  bytes checkpoint = 7;                  // 源 Agent 可选：当前 step 进度快照
 }
 message TransferTaskResponse {
   enum Status {
     ACCEPTED = 0;       // 目标 Agent 接受了任务
     REJECTED_BUSY = 1;  // 目标 Agent 已满，换一个
     REJECTED_MISMATCH = 2;  // 能力不匹配（如标签/平台不符）
+    REJECTED_IDEMPOTENT_HIT = 3;  // 幂等命中：该迁移已执行过
   }
   Status status = 1;
   string reason = 2;
+  int64 accepted_at_unix = 3;  // 接受时间戳，幂等去重时返回上次接受时间
 }
 rpc TransferTask(TransferTaskRequest) returns (TransferTaskResponse);
 
 // Agent 注册时上报能力位
 message AgentInfo {
-  // ... 已有字段
-  bool supports_task_transfer = 15;  // 新增字段，老 Agent 默认为 false
+  // ... 已有字段 1-14
+  bool supports_task_transfer = 15;   // 新增字段，零值=false
+  bool supports_checkpoint = 16;      // 预留，零值=false
 }
 ```
+
+**TransferTask 幂等键设计（任务编号 + 重试号组合）**：
+
+基于现有数据模型 `server/model/` 的三层标识：
+
+```
+幂等键 = {pipeline_id}:{workflow_pid}:{rerun_count}
+         ──┬──      ───┬───        ───┬───
+           │            │              └─ Pipeline.RerunCount (int64, model/pipeline.go:41)
+           │            └─ Workflow.PID (int, model/workflow.go:22) —— 同 pipeline 内序号
+           └─ Pipeline.ID (int64) —— 全局唯一
+```
+
+设计理由（结合现有代码结构）：
+1. **`task.ID` = `fmt.Sprint(item.Workflow.ID)`**（`pipeline/queue.go:33`）——task ID 即 workflow.ID 字符串，但 workflow.ID 是 autoincr 主键，每次 Restart 会生成新的 workflow ID，不适合做幂等键
+2. **`workflow.PID`** 是同 pipeline 内的逻辑序号（1、2、3...），Restart 后保持不变，稳定可靠
+3. **`pipeline.RerunCount`**（`model/pipeline.go:41`）每次 Restart +1，精确标识第几次重试
+4. **跨 Restart 幂等**：同一 pipeline 第 N 次 rerun 的第 M 个 workflow，迁移请求只生效一次
+
+幂等存储方案：
+- 内存侧：`map[string]time.Time` 记录已接受的迁移键，10 分钟 TTL
+- DB 侧：新增 `task_transfers` 表，唯一键 = 上述三元组，迁移执行前先 INSERT 冲突检测
 
 **与现有机制的协同**：
 1. 迁移失败（如目标 Agent 拒绝、超时未响应）——自动回退到「Kick + 60s deadline 重入队」旧逻辑
 2. 迁移成功后，原 Agent 的 running entry 直接转给新 Agent ID，deadline 延长 60s 做交接
 3. 迁移中的 task 持久化队列仍由 `WithTaskStore` 管理，双写保障
+4. 幂等键写入 `task_transfers` 表与 task 状态更新在同一事务，保证原子性
 
-### 10.6 核心设计哲学总结
+### 10.6 零值优雅退出窗口数据丢失三类场景
+
+> 「零值」指 gRPC 协议中 bool/int 的默认零值，老客户端未显式设置时与「显式设置为 false/0」语义相同，可能导致错误降级。
+
+| 场景编号 | 描述 | 触发条件 | 数据丢失量 | 恢复方式 |
+|---------|------|---------|-----------|---------|
+| **场景 1** | 新 Agent 升级到 v17 proto 但未开 `supports_task_transfer`，Server 误以为不支持迁移 | Agent 版本升级到 v17 + 配置遗漏 `WOODPECKER_AGENT_ENABLE_TRANSFER` | 无直接数据丢失，但迁移功能失效，回退到 Kick + 60s 重入队 | 重新配置并重启 Agent |
+| **场景 2** | Server 降级回 v16，正在迁移中的 task 断流 | 版本回滚时有 task 在迁移途中（transfer 已发但未完成） | **可能重复执行**：源 Agent 可能还在跑，目标 Agent 也开始跑 | 目标 Agent 侧 `checkWorkflowState` 二次校验兜底（`rpc/rpc.go:104` 已有 Done 前检查） |
+| **场景 3** | `estimated_shutdown_in_seconds = 0` 被误解为「立即关」 vs 「未知」 | proto3 中 int64 零值=0，Server 未设置时 Agent 无法区分「未设置」和「0 秒」 | **轻微丢失**：Agent 可能立即放弃 task 而非等待优雅迁移 | 改用 `google.protobuf.Int64Value` wrapper 或加 `has_shutdown_eta` bool 标志 |
+
+> 场景 3 是典型的 proto3 零值语义陷阱。修复方式：`shutdown_eta` 字段用 `Int64Value`（nullable），未设置时 Agent 走默认 30s 延迟策略。
+
+### 10.7 K8s 镜像回滚滚动更新与并发上限
+
+**滚动更新参数（Helm chart 推荐值）**：
+
+| 参数 | 推荐值 | 理由 |
+|------|--------|------|
+| `maxSurge` | **25%** | 先启新 Pod 再删旧的，保证容量不下降 |
+| `maxUnavailable` | **25%** | 最多 1/4 旧 Pod 同时下线，避免 task 大规模悬空 |
+| `progressDeadlineSeconds` | **600s** | 10 分钟超时，超过则标记更新失败触发回滚 |
+| `minReadySeconds` | **30s** | Pod Ready 后等 30s 再继续，给 Agent 注册和探活留时间 |
+
+**并发上限与 task 悬空的关系**：
+
+```
+假设：10 个 Server Pod，每个关联 20 个 Agent，每个 Agent 跑 4 个 task
+      → 总 running task = 800
+
+maxUnavailable = 25% → 一次滚动最多下线 2 个 Server Pod
+  → 约 40 个 Agent 被踢 → 约 160 个 task 悬空
+  → 1 分钟后 deadline 过期重入队
+  → 重入队 task 需重新分配，镜像/容器需重新拉取
+
+若调 maxUnavailable = 10%：
+  → 每次只下线 1 个 Pod → 80 个 task 重入队
+  → 但滚动更新总时间从 10 分钟 → 25 分钟
+```
+
+**回滚触发阈值**：
+- 滚动更新期间 `task_resubmitted_total` 速率 > 基线 3 倍 → 自动回滚
+- Agent 重连成功率 < 95% 持续 5 分钟 → 自动回滚
+- 手动 `kubectl rollout undo deployment/woodpecker-server`
+
+### 10.8 5 分钟观察窗自动化探测脚本
+
+每级回滚之间留 5 分钟观察窗，配合自动化探针脚本验证：
+
+```bash
+#!/bin/bash
+# woodpecker-rollout-check.sh — 5 分钟观察窗探测脚本
+# 配合 Prometheus + kubectl 使用，每 30s 采样一次，共 10 个采样点
+
+NAMESPACE="${NAMESPACE:-woodpecker}"
+DEPLOYMENT="${DEPLOYMENT:-woodpecker-server}"
+PROM_URL="${PROM_URL:-http://prometheus:9090}"
+
+# 告警阈值（可调）
+THRESHOLD_RECONNECT_RATE=3     # Agent 重连速率倍数（相对基线）
+THRESHOLD_RESUBMIT_RATE=3      # Task 重入队速率倍数（相对基线）
+THRESHOLD_ERROR_RATE=5         # gRPC 错误率倍数（相对基线）
+THRESHOLD_PIPELINE_DURATION=2  # pipeline 平均时长倍数
+
+baseline_reconnect=$(curl -s "$PROM_URL/api/v1/query?query=rate(woodpecker_agent_reconnect_total[1h])" | jq '.data.result[0].value[1]')
+baseline_resubmit=$(curl -s "$PROM_URL/api/v1/query?query=rate(woodpecker_queue_task_resubmitted_total[1h])" | jq '.data.result[0].value[1]')
+
+for i in $(seq 1 10); do
+    echo "=== 采样点 $i/10 ==="
+
+    # 1. 检查 rollout 状态
+    kubectl rollout status deployment/$DEPLOYMENT -n $NAMESPACE --timeout=10s || {
+        echo "ALERT: rollout not progressing"
+        exit 1
+    }
+
+    # 2. 检查 Agent 重连率
+    reconnect_rate=$(curl -s "$PROM_URL/api/v1/query?query=rate(woodpecker_agent_reconnect_total[5m])" | jq '.data.result[0].value[1]')
+    reconnect_ratio=$(echo "$reconnect_rate / $baseline_reconnect" | bc -l)
+    if (( $(echo "$reconnect_ratio > $THRESHOLD_RECONNECT_RATE" | bc -l) )); then
+        echo "ALERT: Agent reconnect rate ${reconnect_ratio}x baseline"
+        exit 1
+    fi
+
+    # 3. 检查 task 重入队率
+    resubmit_rate=$(curl -s "$PROM_URL/api/v1/query?query=rate(woodpecker_queue_task_resubmitted_total[5m])" | jq '.data.result[0].value[1]')
+    resubmit_ratio=$(echo "$resubmit_rate / $baseline_resubmit" | bc -l)
+    if (( $(echo "$resubmit_ratio > $THRESHOLD_RESUBMIT_RATE" | bc -l) )); then
+        echo "ALERT: Task resubmit rate ${resubmit_ratio}x baseline"
+        exit 1
+    fi
+
+    # 4. 检查 pipeline 成功率（不应下降）
+    success_rate=$(curl -s "$PROM_URL/api/v1/query?query=woodpecker_pipeline_success_rate" | jq '.data.result[0].value[1]')
+    if (( $(echo "$success_rate < 0.95" | bc -l) )); then
+        echo "ALERT: Pipeline success rate $success_rate < 0.95"
+        exit 1
+    fi
+
+    # 5. 检查 running task 数量（不应骤降）
+    running_tasks=$(curl -s "$PROM_URL/api/v1/query?query=woodpecker_queue_running_tasks" | jq '.data.result[0].value[1]')
+    echo "  running_tasks=$running_tasks, reconnect=${reconnect_ratio}x, resubmit=${resubmit_ratio}x"
+
+    sleep 30  # 30s 采样间隔 × 10 次 = 5 分钟观察窗
+done
+
+echo "OK: All metrics within thresholds after 5 minutes"
+exit 0
+```
+
+**4 级告警阈值**：
+
+| 级别 | 指标 | 阈值 | 触发动作 |
+|------|------|------|---------|
+| **INFO** | 重连速率 1.5x 基线 | 1.5x | 仅记录日志，观察 |
+| **WARN** | 重连速率 2x 基线 / 重入队 2x 基线 | 2x | 发送通知，准备回滚 |
+| **CRITICAL** | 重连速率 3x 基线 / pipeline 成功率 < 95% | 3x | 自动触发 P1 回滚（版本降级） |
+| **FATAL** | running task 数量 5 分钟内下降 > 50% | -50% | 紧急 P0 回滚 + 切流量 |
+
+### 10.9 并行开发组按 P0-P4 优先级人员分配
+
+按改造规模和依赖关系，建议 4 个开发小组并行推进：
+
+| 小组 | 负责人 | 负责改造项 | 预计人日 | 依赖 |
+|------|--------|-----------|---------|------|
+| **小队 A（协议组）** | 张工 | P0 ctx.Cause 修复<br>P1 KickAgentWorkers(-1) 全量踢出<br>P3 running task 回滚<br>P4 task 迁移协议 v17 | 12 人日 | A 的输出供 C 组消费 |
+| **小队 B（队列组）** | 李工 | P0 Ticker 替换<br>P2 事件驱动唤醒<br>P3 FIFO → heap 多优先级<br>P2 TaskList 分页加载 | 15 人日 | 独立推进，与其他组无强依赖 |
+| **小队 C（可靠性组）** | 王工 | P1 Cancel 补偿任务（30s timer + jitter）<br>P1 Prometheus 指标体系<br>P2 DB 乐观锁 singleflight | 10 人日 | 依赖 A 组 cause 修复（日志区分错误类型） |
+| **小队 D（安全组）** | 赵工 | P4 JWT exp + jti 防重放<br>P4 全 Forge 平台签名校验 | 18 人日 | 完全独立，可与其他组并行 |
+
+**关键路径（Critical Path）**：
+```
+P0 cause 修复 (A) → P1 KickAgentWorkers(-1) (A) → P3 running task 回滚 (A) → P4 task 迁移 (A)
+```
+关键路径总工期 ~12 人日，是整条路线图的瓶颈。B 组和 D 组完全并行，不拖慢关键路径。
+
+**迭代节奏建议**：
+- **Sprint 1（2 周）**：交付全部 P0 + P1 项（cause 修复、Ticker、补偿任务、Prometheus 指标、Kick 全量）
+- **Sprint 2（2 周）**：交付全部 P2 项（事件驱动、乐观锁、TaskList 分页）
+- **Sprint 3（2 周）**：交付 P3 项（heap 优先级、running task 回滚）
+- **Sprint 4（2 周）**：交付 P4 项（task 迁移、JWT 防重放、全 Forge 签名）
+
+### 10.10 核心设计哲学总结
 
 Woodpecker 的调度架构体现了三个明确的取舍：
 
