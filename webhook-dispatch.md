@@ -395,6 +395,56 @@ Cancel()
 > | **补偿任务** | 利用持久化队列 + 死信语义，写一条「cancel_compensation」task 到延迟队列，到期检查并补偿 | `queue/` 新增延迟队列接口 |
 >
 > **最小可行补偿**：在 `pipeline/cancel.go` 的 `Cancel()` 末尾加一个 30 秒的 goroutine，到期后检查 DB 状态，若仍是 Running 则强制写 StatusKilled 并记录告警日志。利用 `UpdateToStatusKilled` 已有的幂等性保证安全性。
+>
+> **30s timer 兜底 jitter 设计**：
+>
+> 若大量流水线同时被 Cancel（如 100 条流水线同分支 push 触发 cancelPreviousPipelines），不加 jitter 会导致 30s 后 100 个 goroutine 同时写 DB，形成「惊群效应」。
+>
+> **jitter 方案**（使用 Go 标准库 math/rand）：
+> ```go
+> // cancel.go 补偿 goroutine
+> baseDelay := 30 * time.Second
+> jitter := time.Duration(rand.Int63n(int64(10 * time.Second)))  // ±5s 抖动
+> totalDelay := baseDelay + jitter
+>
+> timer := time.NewTimer(totalDelay)
+> defer timer.Stop()
+> ```
+>
+> 与项目现有实践对齐：`github.com/cenkalti/backoff/v5` 已在 `server/store/datastore/pipeline.go:140` 使用指数退避，可复用 `backoff.NewExponentialBackOff()` 的 jitter 逻辑。
+>
+> **参数建议**：
+> | 参数 | 值 | 理由 |
+> |------|---|------|
+> | 基础延迟 | 30s | 给 Agent 正常回传 Done(canceled=true) 留足时间窗口 |
+> | Jitter 范围 | ±5s | 避免同秒 DB 尖峰 |
+> | 最大并发补偿 goroutine | 可配置（默认 100） | 防止内存泄漏（cancel 风暴） |
+>
+> **三补偿方案幂等键设计**：
+>
+> 三种补偿方案各自的幂等键，确保重复执行补偿不破坏状态：
+>
+> | 方案 | 幂等键 | 幂等保障 |
+> |------|--------|---------|
+> | **超时兜底（goroutine） | `workflow_id`（DB 行级锁 |
+> | **ack 通道 | `cancel_ack:{workflow_id}`（内存 map + CAS） |
+> | **延迟补偿队列** | `compensation:{workflow_id}:{cancel_trigger_ts}`（DB 唯一索引 |
+>
+> **超时兜底幂等实现**（30s timer 方案）：
+> 利用 `UpdateToStatusKilled` 的幂等性——它只在当前状态属于 `Pending/Running/Blocked` 时才执行变更，否则直接返回。
+> ```go
+> // pipeline/pipeline_status.go: UpdateToStatusKilled 已有状态前置检查
+> func UpdateToStatusKilled(s store.Store, p model.Pipeline, finished int64) (*model.Pipeline, error) {
+>     // 只有 Pending/Running/Blocked → Killed，其余直接返回
+> }
+> ```
+> 即便多个补偿 goroutine 同时到期写，只有第一个真正执行 UPDATE，后续都是快速返回。
+>
+> **ack 通道幂等**：
+> 内存中 `atomic.Bool` 标记 `cancelAcked`，Agent 回传 ack 后 CAS 设置为 true，补偿 goroutine 退出前检查该标记。
+>
+> **延迟补偿队列幂等**：
+> 新增表 `pipeline_compensations`，唯一键 `(workflow_id, cancel_trigger_timestamp)`，补偿执行前先 INSERT，唯一键冲突说明已补偿则跳过。
 
 ### 5.3 队列互斥（FIFO Lock）
 
@@ -815,6 +865,40 @@ func (q *fifo) Poll(c context.Context, agentID int64, filter FilterFn) (*model.T
 > - Poll 返回 `context.Canceled`（当调用方 context 取消时）
 > - gRPC 层将 cause 正确映射为 gRPC Status（可复用 `codes.Canceled`，但 message 带 cause 信息）
 > - Agent 侧日志可明确区分「被踢出」「任务取消」「网络断开」三种场景
+>
+> **ctx.Cause 修复的单元测试矩阵**：
+>
+> 对应现有测试文件 `server/queue/fifo_test.go`，需新增/修正以下用例：
+>
+> | # | 测试场景 | 触发方式 | 预期返回错误 | 现有断言 | 修复后断言 |
+> |---|---------|---------|-------------|---------|-----------|
+> | 1 | Poll 调用方 context 取消 | `pollCancel(nil)` | `context.Canceled` | `assert.ErrorIs(err, context.Canceled)` ✅ | 不变 |
+> | 2 | Poll 中 Agent 被 KickAgentWorkers | `q.KickAgentWorkers(42)` | `queue.ErrWorkerKicked` | `assert.ErrorIs(err, context.Canceled)` ❌ 需改 | `assert.ErrorIs(err, queue.ErrWorkerKicked)` |
+> | 3 | Poll 中调用方 Cancel 带 cause | `pollCancel(customErr)` | `customErr` | 未覆盖 | `assert.ErrorIs(err, customErr)` |
+> | 4 | Wait 中 task 被 Cancel | `q.ErrorAtOnce(ids, queue.ErrCancel)` | `queue.ErrCancel` | 已有覆盖 ✅ | 不变 |
+> | 5 | Wait 中 task 过期重入队 | deadline 超时 | `queue.ErrTaskExpired` | 未覆盖 | `assert.ErrorIs(err, queue.ErrTaskExpired)` |
+> | 6 | Wait 中 Agent worker 被 Kick | `KickAgentWorkers` + Wait 阻塞 | Wait 仍用 task 级别 cause，不触发 worker 级 cause | 未覆盖 | 验证 Wait 不受 worker kick 影响（Wait 绑 task 不绑 worker） |
+> | 7 | cause 为 `context.Canceled` 本身（兼容） | `pollCancel(context.Canceled)` | 返回 `context.Canceled` | 未覆盖 | 防死循环：cause == context.Canceled 时不走 cause 分支 |
+> | 8 | wrapped cause | `pollCancel(fmt.Errorf("wrap: %w", queue.ErrWorkerKicked))` | unwrap 后仍能 `errors.Is(err, ErrWorkerKicked)` | 未覆盖 | `assert.ErrorIs(err, queue.ErrWorkerKicked)` |
+>
+> **测试代码骨架**（对应用例 #2）：
+> ```go
+> t.Run("poll returns ErrWorkerKicked on kick", func(t *testing.T) {
+>     pollResults := make(chan error, 1)
+>     go func() {
+>         _, err := q.Poll(ctx, 42, filterFnTrue)
+>         pollResults <- err
+>     }()
+>     time.Sleep(50 * time.Millisecond)
+>     q.KickAgentWorkers(42)
+>     select {
+>     case err := <-pollResults:
+>         assert.ErrorIs(t, err, queue.ErrWorkerKicked)  // 修复前是 context.Canceled
+>     case <-time.After(time.Second):
+>         t.Fatal("Poll should return when worker is kicked")
+>     }
+> })
+> ```
 
 ### 7.5 rpc.go 6038 graceful shutdown 影响半径
 
@@ -858,6 +942,83 @@ Server 优雅关闭
 2. **恢复慢**：Agent 的指数退避重连从 0 开始，多等好几秒
 3. **重复执行风险**：running task 没有在 shutdown 时主动回写状态，重启后 `TaskList` 重新加载，可能与 Agent 回传的 `Done` 竞争
 4. **不符合 k8s 滚动更新最佳实践**：滚动更新期间 Agent 连接频繁断连，影响流水线稳定性
+
+**6 受影响模块的依赖图**：
+
+```
+cmd/server/server.go (stopServerFunc)
+  │
+  ├─ ctxCancel()  ──── 根 context 取消
+  │     │
+  │     ├─ cron_scheduler.Run(ctx)   ← 独立 goroutine
+  │     ├─ runGrpcServer(ctx)        ← 独立 goroutine
+  │     │     │
+  │     │     └─ server/rpc/serve.go (Serve)
+  │     │           │
+  │     │           ├─ grpcCtx, cancel := WithCancelCause(ctx)
+  │     │           │     │
+  │     │           │     └─ <-grpcCtx.Done() → GracefulStop()
+  │     │           │
+  │     │           └─ RPC (WoodpeckerServer)
+  │     │                 ├─ Next() → scheduler.Poll() → fifo.Poll()
+  │     │                 ├─ Wait() → scheduler.Wait() → fifo.Wait()
+  │     │                 ├─ Extend() → scheduler.Extend() → fifo.Extend()
+  │     │                 └─ Done/Update/Init/Log/ReportHealth/RegisterAgent/UnregisterAgent
+  │     │
+  │     ├─ TLS/HTTP/Redirect/Metrics Server
+  │     │     └─ <-ctx.Done() → Shutdown(shutdownCtx)
+  │     │
+  │     └─ (fifo.process goroutine, 由 queue.NewMemoryQueue 启动)
+  │           └─ <-q.ctx.Done() → return   ★ 此 ctx 独立创建，不随根 ctx 走！
+  │
+  └─ shutdownCtx, shutdownCancelFunc = WithTimeout(Background, 5s)
+        └─ HTTP Server Shutdown 参数
+
+依赖断裂点：
+  ★ fifo.process 的 ctx 由 NewMemoryQueue 内部创建，不挂在根 ctx 上
+  ★ Poll/Wait 阻塞在内部 worker channel/done channel 上，根 ctx 取消无法穿透
+  ★ Logger stream 的 ctx 是 stream-specific，不受根 ctx 控制
+```
+
+**ServerStatus 探活频率设计**：
+
+| 参数 | 建议值 | 理由 |
+|------|--------|------|
+| 初始探活间隔 | **15s** | Agent 启动时检查 server 版本兼容性，无需太频繁 |
+| 稳态探活间隔 | **30s** | 平衡探活开销（gRPC RTT ~ms 级）和发现延迟 |
+| 连续失败阈值 | **2 次** | 避免网络抖动误判 |
+| 失败后退避 | 指数退避，最大 2min | 与 Agent gRPC 重连退避一致（`retry-timeout` 默认 15min） |
+| shutdown 信号后间隔 | **5s** | 即将关机时提高频率，让 Agent 尽快感知 |
+
+对齐现有参数：
+- `updateAgentLastWorkDelay = 1m`（Agent 心跳）
+- `grpc-keepalive-time`（默认 2h，gRPC 保活）
+- `shutdownTimeout = 5s`（HTTP 优雅关闭超时）
+
+探活 gRPC 方法设计：
+```protobuf
+message ServerStatusRequest {}
+message ServerStatusResponse {
+  bool healthy = 1;
+  bool shutting_down = 2;   // true = 正在 graceful shutdown
+  string message = 3;
+  int64 estimated_shutdown_in_seconds = 4;  // 预估剩余关机窗口
+  string grpc_version = 5;
+  string server_version = 6;
+}
+rpc ServerStatus(ServerStatusRequest) returns (ServerStatusResponse);
+```
+
+**4 路 graceful shutdown 回滚预案**：
+
+| 回滚预案 | 触发条件 | 执行动作 | 验证方式 |
+|----------|---------|---------|---------|
+| **P0：特性开关回滚** | KickAgentWorkers(-1) 引发 Agent 大量重连风暴 | 环境变量 `WOODPECKER_GRACEFUL_KICK=false` 关闭新逻辑 | 观察 Agent 连接数恢复到基线 |
+| **P1：gRPC 版本降级** | ServerStatus 探活协议引发 Agent 旧版本兼容问题 | Server 端卸载 `ServerStatus` RPC 注册，保留老方法 | Agent 无法再调用新方法，回退到被动断连 |
+| **P2：配置降级** | 30s timer 补偿引发 DB 写压力骤增 | 调大补偿超时 `WOODPECKER_CANCEL_GRACE_PERIOD=120s` 或设 0 禁用 | DB 写 QPS 回落，补偿 goroutine 数量为 0 |
+| **P3：二进制回滚** | shutdown 时数据不一致或进程 hang | K8s 回滚 deployment 到上一版本镜像 | 所有 Pod 恢复旧代码，task 从 DB 重新加载 |
+
+**回滚依赖链**：P0 → P1 → P2 → P3，逐级升级，每步留 5 分钟观察窗口。
 
 **修复路线图**：
 1. **短期（最小改动）**：在 `Serve()` 的 `<-grpcCtx.Done()` 分支，先调用 `scheduler.Queue.KickAgentWorkers(-1)`（特殊 ID = 全部踢掉），再 `GracefulStop()`
@@ -996,7 +1157,100 @@ Woodpecker 的 webhook 调度采用 **双层校验 + 单入口 + 内存队列 + 
 | **P4** | JWT HookToken 加 exp + jti 防重放 | ~100 行 + DB 表 | 凭证安全等级提升 | 高，涉及 token 格式变更 | 需 token 轮换机制 + 向下兼容 |
 | **P4** | 全 Forge 平台 payload HMAC 签名校验 | ~200 行/平台 | 完全阻断 JWT + payload 伪造攻击 | 高，需各 Forge 适配测试 | 各平台 webhook 配置需同步 |
 
-### 10.4 核心设计哲学总结
+### 10.4 12 项 P0-P4 改造的依赖关系图
+
+```
+P0 cause 修复 ──────┐
+                     ├─→ P1 graceful shutdown KickAgentWorkers(-1)
+P0 Ticker 替换 ──────┤                     │
+                                          │
+P1 Cancel 补偿任务（30s timer + jitter）  │
+                                          │
+P1 Prometheus 指标                        │
+                                          │
+P2 TaskList 分页 ─────┐                    │
+                       ├─→ P3 running task 回滚
+P2 事件驱动唤醒 ──────┤                    │
+                                          │
+P2 DB 乐观锁 singleflight                 │
+                                          │
+P3 FIFO → heap ───────────────────────────┘
+     │
+     └─→ 调度公平性（多优先级后才有意义）
+
+P3 running task 回滚
+     │
+     └─→ P4 task 迁移协议（长期演进）
+
+P4 JWT exp + jti ─── 独立，与其他改造无依赖
+P4 全 Forge 签名 ─── 独立，按平台逐一落地
+```
+
+**强依赖对（必须按顺序）**：
+
+| 前置 | 依赖项 | 原因 |
+|------|--------|------|
+| P0 cause 修复 | P1 KickAgentWorkers(-1) | 修复后 Agent 才能区分「被踢走」和「网络断开」，否则重连逻辑无差别 |
+| P3 running task 回滚 | P2 TaskList 分页 | 回滚逻辑需遍历 running map，需确保启动时 task 加载不阻塞 |
+| P4 task 迁移协议 | P3 running task 回滚 | 优雅移交是强制回滚的超集，先实现强制再做优雅 |
+
+**可并行**：
+- P0 cause 修复 || P0 Ticker 替换（完全无关）
+- P1 Cancel 补偿任务 || P1 Prometheus 指标（可并行开发）
+- P2 DB 乐观锁 || P2 事件驱动唤醒（一个在 forge/refresh.go，一个在 queue/fifo.go）
+- P4 JWT 防重放 || P4 全 Forge 签名（安全改造互不影响）
+
+### 10.5 task 迁移协议兼容性设计
+
+**目标**：shutdown 或 Agent 被踢时，将 running task 从源 Agent 转移到目标 Agent，无需重新拉取镜像、重新 clone 代码。
+
+**兼容性分层（老 Agent 新 Server、新 Agent 老 Server、混合部署）**：
+
+| 场景 | 兼容策略 | 实现方式 |
+|------|---------|---------|
+| **新 Server + 老 Agent** | 降级为「Kick + 超时重入队」 | gRPC `TransferTask` 方法未实现，老 Agent 收到 `Unimplemented`，Server 走旧逻辑 |
+| **老 Server + 新 Agent** | Agent 忽略迁移信号，按断连处理 | Agent 检测不到 `TransferTask` 调用，维持现有行为 |
+| **新 Server + 新 Agent** | 完整迁移流程 | 三步走握手 |
+| **混合版本 Agent** | 逐 Agent 协商能力位 | `RegisterAgent` 时上报 `supports_task_transfer` 标志位 |
+
+**三步走迁移握手**（gRPC protobuf 增量设计）：
+
+```protobuf
+// 版本 1：现有协议
+rpc Next(NextRequest) returns (NextResponse);
+rpc Wait(WaitRequest) returns (WaitResponse);
+
+// 版本 2：新增迁移方法（向后兼容）
+message TransferTaskRequest {
+  string task_id = 1;
+  string target_agent_id = 2;
+  int64 deadline_extension_seconds = 3;  // 给迁移过程的额外时间
+  bytes checkpoint = 4;  // 源 Agent 可选：当前 step 进度快照
+}
+message TransferTaskResponse {
+  enum Status {
+    ACCEPTED = 0;       // 目标 Agent 接受了任务
+    REJECTED_BUSY = 1;  // 目标 Agent 已满，换一个
+    REJECTED_MISMATCH = 2;  // 能力不匹配（如标签/平台不符）
+  }
+  Status status = 1;
+  string reason = 2;
+}
+rpc TransferTask(TransferTaskRequest) returns (TransferTaskResponse);
+
+// Agent 注册时上报能力位
+message AgentInfo {
+  // ... 已有字段
+  bool supports_task_transfer = 15;  // 新增字段，老 Agent 默认为 false
+}
+```
+
+**与现有机制的协同**：
+1. 迁移失败（如目标 Agent 拒绝、超时未响应）——自动回退到「Kick + 60s deadline 重入队」旧逻辑
+2. 迁移成功后，原 Agent 的 running entry 直接转给新 Agent ID，deadline 延长 60s 做交接
+3. 迁移中的 task 持久化队列仍由 `WithTaskStore` 管理，双写保障
+
+### 10.6 核心设计哲学总结
 
 Woodpecker 的调度架构体现了三个明确的取舍：
 
