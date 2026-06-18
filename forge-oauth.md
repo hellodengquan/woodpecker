@@ -937,7 +937,348 @@ T=30s
 
 ---
 
-## 9. 关键代码路径索引
+## 9. 深度分析（续二）：部署层超时 vs 应用层刷新等待的匹配关系与最小代价补救
+
+> 本章基于 `cmd/server/server.go`、`docker/Dockerfile.server.alpine.multiarch.rootless`、`cmd/server/health.go`、`server/api/z.go`、`server/forge/refresh.go`、`server/forge/refresh_test.go`、`server/router/middleware/token/token.go`、`server/rpc/rpc.go:550-572`、`server/pipeline/create.go:35-62`、[Woodpecker Helm chart values.yaml](https://github.com/woodpecker-ci/helm) 的代码逐行核对。
+
+---
+
+### 9.1 仓库代码中的部署超时配置——逐层盘点
+
+#### 第 1 层：Docker HEALTHCHECK（非 K8s 部署场景）
+
+**文件**: `docker/Dockerfile.server.alpine.multiarch.rootless:20`
+
+```dockerfile
+HEALTHCHECK CMD ["/bin/woodpecker-server", "ping"]
+```
+
+`ping` 子命令的实现位于 `cmd/server/health.go:29-63`：
+
+```go
+const pingTimeout = 1 * time.Second
+
+func pinger(_ context.Context, c *cli.Command) error {
+    // ...
+    client := http.Client{Timeout: pingTimeout}
+    resp, err := client.Get(healthURL)
+    // ...
+}
+```
+
+Docker HEALTHCHECK 默认参数：`--interval=30s --timeout=30s --start-period=0s --retries=3`
+
+| 参数 | Docker 默认 | 实际效果 |
+|------|------------|---------|
+| interval | 30s | 每 30s 执行一次 `woodpecker-server ping` |
+| timeout | 30s | 但 ping 内部 `http.Client.Timeout = 1s`，所以实际超时 1s |
+| retries | 3 | 连续 3 次失败后标记 unhealthy |
+| **最大容忍时间** | | **30s × 3 = 90s**（从第一个失败到 unhealthy） |
+
+**healthz 端点**（`server/api/z.go:37-43`）：只检查 `store.Ping()`（DB 连通性），不检查 Forge 连通性。即使 Forge 全部 429，`/healthz` 仍返回 204。
+
+**结论**：Docker HEALTHCHECK **无法检测** Forge 刷新阻塞，因为 `/healthz` 不检查 Forge 状态。
+
+#### 第 2 层：K8s Liveness / Readiness Probe（Helm Chart 部署场景）
+
+Helm chart 位于独立仓库 `woodpecker-ci/helm`，仓库内不含 manifests。以下来自 [Helm values.yaml](https://github.com/woodpecker-ci/helm/blob/main/charts/woodpecker/values.yaml)：
+
+```yaml
+server:
+  probes:
+    liveness:
+      timeoutSeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      failureThreshold: 3
+    readiness:
+      timeoutSeconds: 10
+      periodSeconds: 10
+      successThreshold: 1
+      failureThreshold: 3
+```
+
+Helm chart 的 statefulset 模板对 probe 的实现使用 `httpGet` 指向 `/healthz` 端口 8000。
+
+| 参数 | Liveness | Readiness |
+|------|----------|-----------|
+| httpGet.path | `/healthz` | `/healthz` |
+| timeoutSeconds | 10 | 10 |
+| periodSeconds | 10 | 10 |
+| failureThreshold | 3 | 3 |
+| **最大容忍时间** | **10s × 3 = 30s** | **10s × 3 = 30s** |
+
+**关键问题**：Liveness 和 Readiness 都指向 `/healthz`，而 `/healthz` 只检查 DB 连通性。当 Forge 刷新阻塞导致 goroutine 堆积时：
+- **Readiness**：不会 fail（DB 仍连通）→ Pod 仍接收流量 → 请求继续堆积
+- **Liveness**：不会 fail（进程不死、DB 通）→ 不会重启 → goroutine 泄漏持续积累
+
+**结论**：K8s probe 配置与 Forge 刷新阻塞**完全解耦**，无法通过现有探针触发自愈。
+
+#### 第 3 层：Go HTTP Server 超时
+
+**文件**: `cmd/server/server.go:183-189, 249-252`
+
+```go
+// TLS server
+tlsServer := &http.Server{
+    Addr:    server.Config.Server.PortTLS,
+    Handler: handler,
+    TLSConfig: &tls.Config{...},
+    // ← 无 ReadTimeout / WriteTimeout / IdleTimeout 设置
+}
+
+// HTTP server
+httpServer := &http.Server{
+    Addr:    c.String("server-addr"),
+    Handler: handler,
+    // ← 同样无任何超时设置
+}
+```
+
+**Go `http.Server` 零值行为**：`ReadTimeout=0` / `WriteTimeout=0` / `IdleTimeout=0`，意味着 **无超时**。当一个请求进入 `token.Refresh` 中间件后阻塞在 singleflight 上时，HTTP server 永远不会主动断开该连接。
+
+**结论**：应用层 HTTP Server **无任何请求级超时**，goroutine 可无限期存活。
+
+#### 第 4 层：Nginx 反向代理超时（典型部署拓扑）
+
+仓库内无 nginx 配置。以下为典型 K8s nginx-ingress 默认值：
+
+| 参数 | Nginx Ingress 默认 | 含义 |
+|------|-------------------|------|
+| `proxy_connect_timeout` | 5s | 与上游建立 TCP 连接的超时 |
+| `proxy_send_timeout` | 60s | 向上游发送请求体的超时 |
+| `proxy_read_timeout` | 60s | **等待上游响应的超时** |
+
+**关键**：`proxy_read_timeout = 60s` 是最外层有实际约束力的超时。当 Woodpecker 的请求因 Forge 刷新阻塞超过 60s 时：
+1. nginx 返回 504 Gateway Timeout 给客户端
+2. **但 Woodpecker 端的 goroutine 仍在运行**——nginx 断开连接不会触发 `c.Request.Context()` 的 cancel（除非 Woodpecker 显式使用 `http.CloseNotifier` 或 `c.Request.Context()` 监听连接关闭，当前代码没有）
+3. goroutine 泄漏直到 Forge 响应或永远
+
+---
+
+### 9.2 超时匹配关系总图
+
+```
+                  客户端              Nginx Ingress          Woodpecker Server          forge.Refresh
+                  ┌──────┐          ┌───────────┐          ┌───────────────┐          ┌──────────────┐
+  请求发出 ──────►│      │────────►│            │────────►│               │────────►│              │
+                  │      │          │ proxy_read │          │ http.Server   │          │ oauth2 POST  │
+  等待响应 ◄──────│      │◄────────│ _timeout=  │◄────────│ 无超时(0)     │◄────────│ 无超时(0)    │
+                  └──────┘          │   60s      │          │               │          │              │
+                                    └───────────┘          └───────────────┘          └──────────────┘
+                                     ↑                        ↑                          ↑
+                               60s 后返回 504            goroutine 不死             单次 HTTP POST
+                               客户端看到 504             继续等 Forge              等 Forge 响应
+                               但 Woodpecker             直到 Forge 响应            可能无限期
+                               goroutine 仍在跑           或进程被 kill              阻塞
+
+  ── K8s Probe ──────────────────────────────────────────────────────────────────────────────────────
+  liveness/readiness → GET /healthz → 检查 DB → DB 通 → 204 → 不触发任何动作
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+  ── Docker HEALTHCHECK ──────────────────────────────────────────────────────────────────────────────
+  woodpecker-server ping → GET /healthz → 1s 超时 → DB 通 → 204 → healthy
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+```
+
+**核心矛盾**：
+
+| 层级 | 超时值 | 覆盖范围 |
+|------|--------|---------|
+| nginx `proxy_read_timeout` | 60s | 客户端 ↔ nginx 连接 |
+| K8s liveness probe timeout | 10s | 仅 DB 连通性 |
+| K8s readiness probe timeout | 10s | 仅 DB 连通性 |
+| Docker HEALTHCHECK | 1s (http.Client) | 仅 DB 连通性 |
+| Go `http.Server` | ∞ (0) | 请求级无超时 |
+| `forge.Refresh` → `oauth2.TokenSource.Token()` | ∞ (取决于 ctx) | Forge token endpoint 调用无超时 |
+
+**结论**：Forge token endpoint 刷新的**假设等待时长是无上限**，而部署层唯一有约束力的超时是 nginx 的 60s（但只切断了客户端连接，不杀 goroutine）。两层之间**严重不匹配**。
+
+---
+
+### 9.3 最小代价补救方案：context cancel 透传 + 刷新超时上限
+
+#### 设计目标
+
+1. `forge.Refresh` 内部为 token 刷新设置**硬性超时上限**（如 15s）
+2. 当 winner goroutine 的 ctx 被 cancel 时，oauth2 HTTP 请求能及时终止
+3. waiter goroutine 不无限期阻塞——如果 winner 长时间无响应，waiter 也应能超时退出
+4. 改动**最小化**，不改变 `forge.Refresh` 的函数签名，现有调用方无需修改
+
+#### 方案详解
+
+**修改文件 1**: `server/forge/refresh.go`
+
+```go
+// 新增常量：token 刷新最大等待时间
+const tokenRefreshTimeout = 15 * time.Second
+
+func Refresh(ctx context.Context, forge Forge, _store store.Store, user *model.User) {
+    const tokenMinTTL = 1800
+
+    if refresher, ok := forge.(Refresher); ok {
+        if time.Now().UTC().Unix() < (user.Expiry - tokenMinTTL) {
+            return
+        }
+
+        key := fmt.Sprintf("refresh-%d", user.ID)
+
+        // ★ 改动点 1：为 winner 创建带超时的独立 ctx
+        //   不用传入的 ctx，因为 winner 的刷新可能比调用方 ctx 的生命周期更长
+        //   （调用方的 ctx 可能因为客户端断连而 cancel，但我们不希望因此中断正在进行的刷新）
+        refreshCtx, refreshCancel := context.WithTimeout(context.WithoutCancel(ctx), tokenRefreshTimeout)
+        defer refreshCancel()
+
+        result, err, _ := refreshGroup.Do(key, func() (any, error) {
+            // ★ 改动点 2：winner 使用 refreshCtx 而非原始 ctx
+            userUpdated, err := refresher.Refresh(refreshCtx, user)
+            if err != nil {
+                return nil, err
+            }
+            if userUpdated {
+                if err := _store.UpdateUser(user); err != nil {
+                    log.Error().Err(err).Msg("fail to save user to store after refresh oauth token")
+                }
+            }
+            return &refreshResult{
+                AccessToken:  user.AccessToken,
+                RefreshToken: user.RefreshToken,
+                Expiry:       user.Expiry,
+            }, nil
+        })
+        if err != nil {
+            log.Error().Err(err).Msgf("refresh oauth token of user '%s' failed", user.Login)
+            return
+        }
+
+        if r, ok := result.(*refreshResult); ok {
+            user.AccessToken = r.AccessToken
+            user.RefreshToken = r.RefreshToken
+            user.Expiry = r.Expiry
+        }
+    }
+}
+```
+
+**关键设计决策解释**：
+
+1. **为什么用 `context.WithoutCancel(ctx)` 而非直接用传入的 `ctx`？**
+
+   当前的 3 个调用方传入的 ctx 来源不同：
+   - `token/token.go:37`：`c.Request.Context()`——客户端断连时 ctx 会被 cancel
+   - `pipeline/create.go:62`：hook handler 的 `c.Request.Context()`——同上
+   - `rpc/rpc.go:563`：gRPC stream 的 ctx——agent 断连时 ctx 会被 cancel
+
+   如果 winner 使用调用方的 ctx，当第一个到达的请求的客户端断连时，刷新会立即中止，但其他 waiter 仍在等待结果——形成死锁（winner 被取消，singleflight 永远不会返回给 waiter）。
+
+   使用 `context.WithoutCancel(ctx)` 继承值（trace ID、logger 等）但不受父 ctx cancel 影响，确保 winner 总是能完成或超时。
+
+2. **为什么 15s？**
+
+   - Forge token endpoint 正常响应时间 < 1s
+   - 429 排队时 Forge 可能在 10-30s 后返回
+   - 15s < nginx `proxy_read_timeout`（60s），给下游 handler 留 45s 余量
+   - 15s 内至少可以尝试一次完整的 token exchange
+
+3. **waiter 的超时如何保障？**
+
+   `singleflight.Do()` 会阻塞直到 winner 的闭包返回。winner 闭包受 `refreshCtx` 的 15s 超时约束，因此 waiter 最多阻塞 15s + 几微秒（singleflight 内部唤醒开销）。不需要为 waiter 单独设置超时。
+
+**修改文件 2**: `server/forge/refresh_test.go`
+
+新增测试用例：
+
+```go
+func TestRefresh_ContextTimeout(t *testing.T) {
+    mockForge := forge_mocks.NewMockForge(t)
+    mockRefresher := forge_mocks.NewMockRefresher(t)
+    mockStore := store_mocks.NewMockStore(t)
+
+    f := &refresherForge{MockForge: mockForge, MockRefresher: mockRefresher}
+    user := expiredUser(1)
+
+    // 模拟 Forge 响应极慢（超过 tokenRefreshTimeout）
+    mockRefresher.On("Refresh", mock.Anything, mock.Anything).Return(false, context.DeadlineExceeded).Run(func(_ mock.Arguments) {
+        time.Sleep(20 * time.Second) // 超过 15s 上限
+    })
+
+    start := time.Now()
+    forge.Refresh(context.Background(), f, mockStore, user)
+    elapsed := time.Since(start)
+
+    // 应在 ~15s 内返回，而非无限阻塞
+    assert.Less(t, elapsed, 20*time.Second, "refresh should timeout within tokenRefreshTimeout")
+    // Token 应保持不变
+    assert.Equal(t, "old-access-token", user.AccessToken)
+    mockStore.AssertNotCalled(t, "UpdateUser", mock.Anything)
+}
+```
+
+**修改文件 3**: `cmd/server/server.go`
+
+为 HTTP server 添加基础超时（与 tokenRefreshTimeout 配合，形成双层保护）：
+
+```go
+httpServer := &http.Server{
+    Addr:    c.String("server-addr"),
+    Handler: handler,
+    // ★ 新增：请求级超时，兜底任何单个请求的无限阻塞
+    ReadHeaderTimeout: 10 * time.Second,
+    IdleTimeout:       120 * time.Second,
+    // 不设 ReadTimeout/WriteTimeout，因为 webhook 和 SSE 等长连接场景需要
+    // 由 refresh.go 内部的 tokenRefreshTimeout 精确控制刷新时长
+}
+```
+
+同样对 `tlsServer` 做相同修改。
+
+---
+
+### 9.4 对现有调用方的影响评估
+
+| 调用方 | 文件 | 传入 ctx | 当前行为 | 修改后行为 | 影响程度 |
+|--------|------|---------|---------|-----------|---------|
+| HTTP API 中间件 | `token/token.go:37` | `c.Request.Context()` | 刷新无超时，客户端断连后 ctx cancel 但 winner 继续跑 | winner 最多 15s，不受客户端断连影响 | **零**：中间件调用 `forge.Refresh()` 签名不变 |
+| Pipeline 创建 | `pipeline/create.go:62` | hook handler ctx | 同上 | 同上 | **零** |
+| gRPC Agent 回调 | `rpc/rpc.go:563` | gRPC stream ctx | agent 断连后 ctx cancel 但 winner 继续跑 | winner 最多 15s，不受 agent 断连影响 | **零** |
+| 单元测试 | `refresh_test.go` | `context.Background()` | 所有测试通过 | 需新增 context timeout 测试 | **低**：仅新增测试，不改已有测试 |
+
+**函数签名变更**：`forge.Refresh()` 签名完全不变（`func Refresh(ctx context.Context, forge Forge, _store store.Store, user *model.User)`），所有调用方无需修改。
+
+**行为变更**：
+
+| 行为 | 修改前 | 修改后 |
+|------|--------|--------|
+| Forge token endpoint 正常响应（<1s） | 刷新成功，token 更新 | **无变化** |
+| Forge 返回 429/5xx（立即失败） | 记日志，请求继续用旧 token | **无变化** |
+| Forge 挂起不响应（无限期） | goroutine 永久阻塞 | **15s 后超时返回，goroutine 释放** |
+| 客户端断连但 winner 正在刷新 | winner 继续跑完（使用调用方 ctx 则会中断） | winner 仍继续跑完（用独立 ctx），最多 15s |
+| 多个 waiter 等待同一个 winner | 等到 winner 完成（可能无限期） | 最多等 15s |
+| 刷新失败后的下一个请求 | 立即再次尝试刷新 | **无变化**（仍无冷却期，但每次至少有 15s 上限） |
+
+**剩余风险（本方案未解决）**：
+
+1. **串行刷新风暴**：用户 A 的 token 过期，每 15s 就会有一个新请求触发刷新尝试（15s 失败 → 下一个请求进入 → 又 15s → 循环）。需要额外的"失败冷却期"机制，但代价更高（需改 `forge.Refresh` 签名或引入内存缓存标记）。
+2. **不同用户并发刷新**：100 个用户同时到期 → 100 个独立 winner 并行执行，仍可能触发 Forge 全局 rate limit。需要全局 semaphore，但代价更高。
+3. **`/healthz` 不反映 Forge 状态**：需要增加 `/healthz` 对 Forge 连通性的检查，但需谨慎——Forge 暂时不可用不应触发 liveness kill（会级联重启所有 Pod）。
+
+---
+
+### 9.5 方案代价总结
+
+| 维度 | 代价 |
+|------|------|
+| 修改文件数 | 3（`refresh.go`、`refresh_test.go`、`cmd/server/server.go`） |
+| 函数签名变更 | 0 |
+| 调用方代码变更 | 0 |
+| 新增依赖 | 0（`context.WithoutCancel` 是 Go 1.21+ 标准库） |
+| 新增配置项 | 0（`tokenRefreshTimeout` 是硬编码常量，可后续改为 flag） |
+| 回归风险 | 极低：正常路径行为不变，仅对"Forge 挂起"场景增加超时上限 |
+| 测试覆盖 | 新增 1 个测试用例（`TestRefresh_ContextTimeout`） |
+
+---
+
+## 10. 关键代码路径索引
 
 | 功能 | 文件 | 行号/函数 |
 |------|------|-----------|
@@ -975,3 +1316,7 @@ T=30s
 | GitLab Refresh 实现 | `server/forge/gitlab/gitlab.go:160-179` | `Refresh()` |
 | GitHub Refresh 实现 | `server/forge/github/github.go:158-181` | `Refresh()` |
 | Gitea/Forgejo/Bitbucket Refresh 实现 | 各 forge 目录下的主文件 | `Refresh()`，模式与 GitLab 完全一致 |
+| HTTP Server 启动 | `cmd/server/server.go:183-189, 249-252` | `http.Server{}`（无超时设置） |
+| Docker HEALTHCHECK | `docker/Dockerfile.server.alpine.multiarch.rootless:20` | `HEALTHCHECK CMD ping` |
+| Ping 子命令 | `cmd/server/health.go:29-63` | `pingTimeout = 1s` |
+| /healthz 端点 | `server/api/z.go:37-43` | `Health()`（仅检查 DB） |
