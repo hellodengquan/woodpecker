@@ -660,7 +660,284 @@ for i := 0; i < int(f.retryCount); i++ {
 
 ---
 
-## 8. 关键代码路径索引
+## 8. 深度分析（续）：OAuth Token Endpoint 重试耗尽后的响应路径
+
+> 本章节基于 `golang.org/x/oauth2 v0.36.0` 源码行为、各 Forge 的 `Refresh` 实现、`server/router/middleware/token/token.go`、`server/api/hook.go`、`server/pipeline/create.go`、`web/src/lib/api/client.ts`、`web/src/App.vue`、`web/src/router.ts` 的代码逐行核对。
+
+---
+
+### 8.1 OAuth TokenSource.Token() 内部：是否存在重试？
+
+所有 Forge 的 `Refresh` 方法都遵循同一模式（以 GitLab 为例，`server/forge/gitlab/gitlab.go:160-179`）：
+
+```go
+func (g *GitLab) Refresh(ctx context.Context, user *model.User) (bool, error) {
+    config, oauth2Ctx := g.oauth2Config(ctx)
+    source := config.TokenSource(oauth2Ctx, &oauth2.Token{
+        AccessToken:  user.AccessToken,
+        RefreshToken: user.RefreshToken,
+        Expiry:       time.Unix(user.Expiry, 0),
+    })
+    token, err := source.Token()   // ← 实际发起 HTTP POST 到 Forge token endpoint
+    // ...
+}
+```
+
+#### oauth2 库内部 `Token()` 的行为（`golang.org/x/oauth2 v0.36.0`）
+
+`oauth2.TokenSource.Token()` 在 token 过期时会调用内部 `tokenRefresher.RefreshToken()`，底层走 `oauth2.RetrieveToken()`，其核心特征：
+
+| 特征 | 行为 |
+|------|------|
+| **HTTP 客户端** | 使用 `context.Context` 关联的 `http.Client`（即 Forge 配置中带 TLS skipVerify 的那个），**不经过** `server/services/utils/http.go` 的 backoff 重试逻辑 |
+| **重试次数** | **无任何重试**。HTTP 请求是单发的：一次 `http.Client.Do()`，成功返回 token，失败直接把 error 往上抛 |
+| **超时控制** | 完全依赖传入的 `ctx`。在 Woodpecker 中：<br>• HTTP API 请求：由 gin 的 `c.Request.Context()` 传入，默认无显式超时，仅依赖 `http.Server.ReadTimeout`/`WriteTimeout`（未在 Woodpecker 中显式配置，默认无限制）<br>• Webhook / Pipeline：同上，无显式 `context.WithTimeout` 包裹 token 刷新<br>• **唯一有超时的是 config fetcher**（`services/config/forge.go:90`），但那是文件读取端点不涉及 token endpoint |
+| **错误传播** | 原始错误原样返回，无封装、无降级标记。典型返回值如 `&oauth2.RetrieveError{Response: *http.Response, Body: []byte}`，内部包含 HTTP 状态码和响应体 |
+| **429 处理** | oauth2 库本身不识别 429、不解析 `Retry-After`、不 backoff。429 与 400、401、500 同样对待：直接 `return nil, err` |
+
+#### 结论 1：OAuth Token 刷新是 **单次同步 HTTP POST，无重试、无内建超时、无 backoff**。
+
+---
+
+### 8.2 调用方最终拿到什么？—— 401 自动重登 / 5xx 透传 / 死循环？
+
+按三条独立调用路径分别追踪：
+
+#### 路径 A：用户浏览器发起的 HTTP API 请求（最常见场景）
+
+完整调用链：
+
+```
+浏览器 fetch() ──► gin.Engine
+  ├─ session.SetUser() 中间件         (session/user.go:42-75)
+  │    └─ 解析 user_sess Cookie → 查 DB 取 *model.User
+  │       若 session 本身失效（过期 JWT）→ c.Next() 继续（user=nil）
+  │
+  ├─ token.Refresh() 中间件           (token/token.go:28-41)
+  │    └─ forge.Refresh(c, _forge, store, user)   (refresh.go:58-101)
+  │         ├─ 类型断言 Refresher
+  │         ├─ 过期判断（TTLX）
+  │         ├─ singleflight.Do(key, fn)
+  │         │    └─ refresher.Refresh() → oauth2.TokenSource.Token()
+  │         │         └─ Forge 返回 401/429/500 → err != nil
+  │         ├─ err != nil 分支:
+  │         │    log.Error(...)         ← 仅写日志
+  │         │    return                 ← 直接 return，无错误上报，无 c.Abort
+  │         └─ user token 保持旧值（过期/无效）不变
+  │
+  ├─ MustUser / MustAdmin 中间件       (session/user.go:77-121)
+  │    └─ user != nil → 通过（因为 session 本身仍有效）
+  │
+  └─ Handler（如 api/repo.go:49 PostRepo）
+       ├─ forge.Refresh(c, _forge, _store, user)    ← 有些 handler 再调一次
+       └─ _forge.Repo(c, user, ...) / _forge.Repos(c, user, ...)
+            └─ go-github/gitlab-sdk/gitea-sdk 内部 http.Do()
+                 └─ Forge API 返回 401 Unauthorized
+                      └─ err != nil
+                           └─ c.String(http.StatusInternalServerError, "...")
+                                ← 实际返回 **500**，不是 401
+```
+
+**前端接收**（`web/src/lib/api/client.ts:54-68` + `web/src/App.vue:37-43`）：
+
+```typescript
+// client.ts:54-68
+if (!res.ok) {
+    const error: ApiError = { status: res.status, message: `${res.statusText}: ${resText}` };
+    if (this.onerror) { this.onerror(error); }
+    throw new Error(message);
+}
+
+// App.vue:37-43
+apiClient.setErrorHandler((err) => {
+  if (err.status === 404) {
+    notify({ title: i18n.t('errors.not_found'), type: 'error' });
+    return;
+  }
+  notify({ title: err.message || i18n.t('unknown_error'), type: 'error' });
+});
+```
+
+关键：**onerror handler 对 401 没有特殊处理**（不跳登录页、不清 session），只做 toast 通知。router 的认证 guard 仅在页面跳转时检查 `isAuthenticated`（来自 localStorage 的 token），不会主动失效。
+
+**最终用户可见表现**：
+- 用户页面上弹出一个红底 toast，内容类似 "Internal Server Error: Could not fetch repository from forge."
+- 用户仍显示为已登录状态（Navbar 头像、用户名仍在）
+- 无自动跳转登录页
+- 刷新页面、点击其他页面都会反复触发相同的 500 + toast
+
+**结论 2A：HTTP API 路径下，调用方拿到的是 **业务层封装的 500**，前端仅弹 toast，**不会自动重登，也不会死循环**（每个请求独立触发一次刷新 → 一次失败 → 一次 500）。**
+
+#### 路径 B：Webhook 触发的 Pipeline 创建
+
+完整调用链（`server/api/hook.go:69-213`）：
+
+```
+Forge POST /hook ──► PostHook(c)
+  ├─ 解析 HookToken → 获取 repo
+  ├─ _forge.Hook(c, c.Request)         ← 解析 hook payload（不需要 OAuth token）
+  ├─ _store.GetUser(repo.UserID)       ← 取仓库关联用户
+  ├─ forge.Refresh(c, _forge, _store, user)
+  │    └─ (同路径 A) 失败：仅记日志，静默返回
+  ├─ _store.UpdateRepo(repo)
+  └─ pipeline.Create(c, _store, repo, pipelineFromForge)   (pipeline/create.go:35)
+       ├─ forge.Refresh(ctx, _forge, _store, repoUser)     ← 再调一次刷新
+       ├─ configService.Fetch(ctx, _forge, repoUser, repo, pipeline, ...)
+       │    └─ _forge.File(c, repoUser, repo, pipeline, ".woodpecker.yml")
+       │         └─ Forge API 返回 401 → err != nil
+       │              └─ retryCount 次重试（仅对文件读取端点，非 token endpoint）
+       │
+       ├─ 如果 fetch 返回 (部分结果, err):
+       │    └─ 唯一降级点 → "will fallback to old config" (create.go:87-93)
+       ├─ 如果 fetch 返回 (nil, err):
+       │    └─ updatePipelineWithErr(...) → pipeline.Status = "error"，错误写 DB
+       └─ 返回给 Forge: 200 OK（hook 本身处理完成）或 500（DB 失败等）
+```
+
+**最终表现**：
+- hook 调用向 Forge 返回 200（hook 本身解析成功）
+- Woodpecker 内部该 pipeline 被标为 error 状态
+- 错误信息保存在 pipeline 记录中，用户在 Web UI 上看到红色失败标记
+- 不影响其他 pipeline 和用户
+
+**结论 2B：Webhook 路径下，失败被吸收进 pipeline error 状态，**不对外抛 401/5xx**，无死循环风险。**
+
+#### 路径 C：后台定时任务（cron、membership sync 等）
+
+这些任务直接调 `forge.Refresh()` + Forge API，失败仅记日志并跳过当前任务，由下一次 cron tick 再触发。属于"静默失败 + 延迟重试"模式，非用户可见。
+
+---
+
+### 8.3 上层 Middleware 如何把失败转成用户可见状态
+
+#### 中间件层：token.Refresh 的设计缺陷
+
+`server/router/middleware/token/token.go:28-41`：
+
+```go
+func Refresh(c *gin.Context) {
+    user := session.User(c)
+    if user != nil {
+        _forge, err := server.Config.Services.Manager.ForgeFromUser(user)
+        if err != nil {
+            _ = c.AbortWithError(http.StatusInternalServerError, err)  // ← Forge 查不到才 Abort
+            return
+        }
+        forge.Refresh(c, _forge, store.FromContext(c), user)
+        // ← forge.Refresh() 返回后，无论成败都 c.Next()
+    }
+    c.Next()
+}
+```
+
+关键观察：
+1. **Forge 查不到** 会 `AbortWithError(500)` — 但这不是 token 过期导致的
+2. **token 刷新失败**（Forge 返回 401/429/500）：`forge.Refresh()` **无 error 返回值**，中间件无法感知，直接 `c.Next()`
+3. **无机制**：刷新失败后没有设置响应 header（如 `X-Woodpecker-Token-Refresh-Failed: true`）、没有写 context、没有调用 `c.Set("token_refresh_failed", true)`
+
+因此 **middleware 层完全没有将刷新失败转成用户可见状态的任何机制**。
+
+#### 用户可见状态的唯一转换路径：前端 router guard
+
+`web/src/router.ts:376-399`：
+
+```typescript
+router.beforeEach(async (to, _, next) => {
+  if (authenticationMode === 'required' && !isAuthenticated) {
+    config.setUserConfig('redirectUrl', to.fullPath);
+    next({ name: 'login' });   // ← 跳转登录页
+    return;
+  }
+  // ...
+});
+```
+
+`isAuthenticated` 来自 `useAuthentication.ts`，检查的是 localStorage 中的 **Woodpecker 会话 token**，与 Forge Access Token 是否有效完全解耦。因此：
+
+| 情况 | isAuthenticated | 页面跳转行为 |
+|------|-----------------|-------------|
+| user_sess Cookie 有效 + Forge token 已过期但刷新失败 | `true` | 正常进入页面，后续 API 调返回 500 + toast |
+| user_sess Cookie 失效 / 被清 | `false` | 任何 `authentication: 'required'` 路由跳 `/login` |
+
+**结论 3：刷新失败没有中间件级别的用户可见状态转换。用户可见的"登出"仅发生在 Woodpecker 会话本身失效时，与 Forge token 是否有效完全无关。**
+
+---
+
+### 8.4 并发用户都撞 Forge 限速时 goroutine 是否被撑爆
+
+#### 关键代码事实
+
+**事实 1：无 bounded goroutine pool / semaphore**
+
+全项目搜索 `worker.*pool`、`goroutine.*pool`、`semaphore`、`ants` 均无命中。Woodpecker server 端没有任何全局 goroutine 池限制。HTTP 请求由 `net/http` server 默认行为处理：**每请求一个 goroutine**，并发上限取决于 `net/http` 的 `MaxHeaderBytes`、TCP backlog、文件描述符限制，而非应用层限制。
+
+**事实 2：singleflight 仅做用户维度并发去重**
+
+`refreshGroup.Do(key, fn)` 的 key 是 `"refresh-<userID>"`：
+- 同一用户的 N 个并发请求 → 只产生 **1 个** 正在执行刷新的 goroutine + **N-1 个** 在 `singleflight.call.wg.Wait()` 上阻塞的 goroutine
+- **不同用户** 同时触发刷新 → 每个用户各自一个 winner goroutine，完全并行
+
+**事实 3：刷新 goroutine 的阻塞时间取决于 Forge token endpoint 的响应时间**
+
+oauth2 `RetrieveToken()` 是同步 HTTP POST，无超时（8.1 节已验证）。当 Forge 对 token endpoint 做 429 限速且请求未被立即拒绝时（如 Forge 侧做了排队 + 长超时），winner goroutine 会长时间阻塞。
+
+#### 撑爆路径推演
+
+```
+假设 Forge token endpoint 出现异常，响应时间从 100ms → 30s（或无限挂起）：
+
+T=0s
+  100 个活跃用户同时有请求到达，各自 token 都过期
+  → 100 个 winner goroutine 并行执行 oauth2 HTTP POST
+  → 每个 winner 阻塞 30s
+
+T=0.5s
+  第 2 批 100 个请求到达（同一批用户的新操作）
+  → 100 个 waiter goroutine 挂在 singleflight.wg.Wait() 上
+  → goroutine 总数 ≈ 200
+
+T=1s
+  第 3 批 100 个请求到达
+  → goroutine 总数 ≈ 300
+
+...
+T=10s
+  goroutine 总数 = 100 winner + 1900 waiter = 2000（仍在增长）
+
+T=30s
+  第一批 winner 返回（假设成功或失败）
+  waiter 全部唤醒并退出等待
+  但 30s 内新请求还在继续进入...
+```
+
+每 goroutine 初始栈 ~2KB，堆上 `*model.User`、`*refreshResult`、singleflight 内部 `call` 结构等 ~数百字节。**2000 goroutine 的内存占用约数 MB，本身不会直接 OOM**。真正的风险在于：
+
+1. **文件描述符耗尽**：每个 winner goroutine 持有一个到 Forge token endpoint 的 TCP 连接。Go `http.Transport` 默认 `MaxIdleConnsPerHost=2`，但并发请求会创建新连接不回收。1000 并发 → 1000 个 FDs，超过 `ulimit -n` 后新连接全部失败（`"too many open files"`），连 DB 连接也受影响。
+
+2. **上游反向代理（nginx）超时**：waiter goroutine 阻塞在 singleflight 上时，其对应的 HTTP 请求尚未写响应。nginx `proxy_read_timeout`（默认 60s）到期后会切断连接，客户端收到 504 Gateway Timeout，但 Woodpecker 端 goroutine 仍在跑，形成"连接已断但 goroutine  leaked"。
+
+3. **singleflight 无超时泄漏**：`singleflight.Group` 的 `call` 结构在 `wg.Done()` 之前不会被回收。如果 winner goroutine 因网络问题永久挂起（对方不回 RST、`http.Client.Timeout=0`），则所有相关 waiter 永久阻塞，形成真正的 goroutine 泄漏。
+
+#### 保护机制盘点
+
+| 保护机制 | 是否存在 | 说明 |
+|---------|---------|------|
+| Goroutine 池 / Semaphore 限制 | ✗ | 无应用层限制 |
+| oauth2 HTTP 请求超时 | ✗ | 未显式设置 `context.WithTimeout` 包裹 token 刷新 |
+| 同一用户刷新失败冷却期 | ✗ | 失败后下一个请求立即再次尝试 |
+| 熔断器（连续失败后暂停刷新） | ✗ | 无 |
+| Gin HTTP Server 超时 | ? | Woodpecker 代码中未见显式 `srv.ReadTimeout` / `WriteTimeout` 设置，依赖部署环境 |
+| singleflight 继承 context cancel | ⚠️ 部分 | `singleflight.Do` 内部 fn 使用的是 **winner 传入的 ctx**。如果 winner 的 HTTP 请求被取消（如客户端断开），fn 中 `refresher.Refresh(ctx, user)` 的 ctx 会被取消，oauth2 HTTP 请求会失败，fn 返回 error，所有 waiter 拿到同一个 error。但如果 winner 已进入 `http.Client.Do()` 且对方不处理 RST，cancel 不会立即释放 goroutine。 |
+
+**结论 4：并发限速时存在 goroutine 堆积和 FD 耗尽的真实风险。** 当前代码依赖部署层（nginx 超时、ulimit、K8s livenessProbe）兜底，应用层无任何主动防护。大规模部署且 Forge 不稳定时，需额外补：
+- `context.WithTimeout` 包裹 token 刷新（如 10s 上限）
+- 失败后用户级冷却期
+- HTTP server 显式超时设置
+- 可选：全局 semaphore 限制并发刷新总数
+
+---
+
+## 9. 关键代码路径索引
 
 | 功能 | 文件 | 行号/函数 |
 |------|------|-----------|
@@ -690,3 +967,11 @@ for i := 0; i < int(f.retryCount); i++ {
 | Pipeline 创建降级 | `server/pipeline/create.go:62,87-93` | `forge.Refresh()` + config fallback |
 | 通用 HTTP 重试 | `server/services/utils/http.go:236-240` | `isRetryableStatusCode()` (仅 5xx) |
 | Config Fetcher 重试 | `server/services/config/forge.go:65-73` | `retryCount` 次循环 |
+| HTTP API 客户端 | `web/src/lib/api/client.ts` | `_request()`, ApiClient.onerror |
+| 前端全局错误处理 | `web/src/App.vue:37-43` | `apiClient.setErrorHandler()`（仅 404 特殊处理） |
+| 前端认证 Router Guard | `web/src/router.ts:376-399` | `router.beforeEach()` |
+| Webhook 入口 | `server/api/hook.go:69-213` | `PostHook()` |
+| Pipeline 创建 | `server/pipeline/create.go:35-93` | `Create()` |
+| GitLab Refresh 实现 | `server/forge/gitlab/gitlab.go:160-179` | `Refresh()` |
+| GitHub Refresh 实现 | `server/forge/github/github.go:158-181` | `Refresh()` |
+| Gitea/Forgejo/Bitbucket Refresh 实现 | 各 forge 目录下的主文件 | `Refresh()`，模式与 GitLab 完全一致 |
