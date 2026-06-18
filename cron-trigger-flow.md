@@ -375,19 +375,330 @@ api/CreatePipeline()
 
 ---
 
-## 七、关键文件索引
+## 七、Cron 表达式解析与时区处理
+
+### 7.1 第三方库选型
+
+Woodpecker 使用 `github.com/gdgvda/cron v0.7.0`，这是 `robfig/cron` 的独立 fork，由 Google Developers Group Valle d'Aosta 维护。
+
+**与 robfig/cron 的关键区别**：
+- 新增 `Clock` 接口抽象，可注入自定义时钟（便于测试）
+- `NewDefaultClock(location, nopTimer)` 支持在时钟层设置时区
+- `DefaultSchedule.WithLocation(loc)` 可程序化修改已解析 Schedule 的时区
+- 支持 `CRON_TZ=Asia/Tokyo` 前缀语法在单条表达式内覆盖时区
+- 保留 `StandardOptions`（5 字段标准格式，不含秒）
+
+### 7.2 解析挂载点
+
+Cron 表达式的解析仅在 **两个地方** 触发，均调用同一个 `CalcNewNext()` 函数：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  CalcNewNext(schedule, tzLoc, now)  ←  唯一解析入口              │
+│  位置: server/cron/cron.go:68                                    │
+│                                                                  │
+│  内部流程:                                                       │
+│    1. time.LoadLocation(tzLoc)     → 时区对象（失败则报错）       │
+│    2. now = now.In(zone)           → 将基准时间转到目标时区       │
+│    3. cron.NewDefaultParser(       → 创建标准 5 字段解析器        │
+│         cron.StandardOptions)                                    │
+│    4. parser.Parse(schedule)       → 解析表达式 → Schedule 对象   │
+│    5. schedule.Next(now)           → 计算下一次触发时刻           │
+│                                                                  │
+│  返回: time.Time (带时区信息)                                     │
+└──────────────────────────────────────────────────────────────────┘
+         ▲                              ▲
+         │                              │
+    ┌────┴────┐                    ┌────┴────┐
+    │ 调用点 1 │                    │ 调用点 2 │
+    │ runCron  │                    │ API CRUD │
+    └─────────┘                    └─────────┘
+```
+
+#### 调用点 1：`runCron()` — 自动调度时
+
+```go
+// server/cron/cron.go:91
+newNext, err := CalcNewNext(cron.Schedule, cron.Timezone, now)
+```
+
+- `cron.Schedule`：用户在创建时指定的表达式（如 `0 3 * * *`）
+- `cron.Timezone`：用户指定的时区（如 `Europe/Bucharest`），默认 `UTC`
+- `now`：当前服务器时间 `time.Now()`
+- 用途：**计算 next_exec 并推进 CronGetLock**
+
+#### 调用点 2：API CRUD — 创建/更新 Cron 时
+
+```go
+// server/api/cron.go:146 — PostCron (创建)
+nextExec, err := cron_scheduler.CalcNewNext(cron.Schedule, cron.Timezone, time.Now())
+cron.NextExec = nextExec.Unix()
+
+// server/api/cron.go:226 — PatchCron (更新时区)
+nextExec, err := cron_scheduler.CalcNewNext(cron.Schedule, tz, time.Now())
+cron.NextExec = nextExec.Unix()
+
+// server/api/cron.go:237 — PatchCron (更新 schedule)
+nextExec, err := cron_scheduler.CalcNewNext(schedule, cron.Timezone, time.Now())
+cron.NextExec = nextExec.Unix()
+
+// server/api/cron.go:255 — PatchCron (重新启用)
+nextExec, err := cron_scheduler.CalcNewNext(cron.Schedule, cron.Timezone, time.Now())
+cron.NextExec = nextExec.Unix()
+```
+
+- 用途：**校验表达式合法性** + **计算首次 NextExec 存入数据库**
+- 如果 `CalcNewNext` 返回错误，API 直接返回 400/422，Cron 不会被持久化
+
+### 7.3 时区处理详解
+
+#### 数据模型
+
+```go
+// server/model/cron.go
+type Cron struct {
+    Schedule  string  `xorm:"schedule NOT NULL"`               // 表达式
+    Timezone  string  `xorm:"timezone NOT NULL DEFAULT 'UTC'"` // 时区名
+    NextExec  int64   `xorm:"next_exec"`                       // Unix 时间戳（无时区）
+}
+```
+
+- `Timezone` 存 IANA 时区名（如 `UTC`、`Asia/Shanghai`、`Europe/Bucharest`）
+- `NextExec` 存 Unix 时间戳，**与时区无关**（绝对时刻）
+- 创建时若 `Timezone` 为空，默认设为 `"UTC"`
+
+#### 时区生效路径
+
+```
+用户创建 Cron (Schedule="0 3 * * *", Timezone="Asia/Shanghai")
+    │
+    ├─ API 调用 CalcNewNext("0 3 * * *", "Asia/Shanghai", time.Now())
+    │     │
+    │     ├─ time.LoadLocation("Asia/Shanghai") → *time.Location
+    │     ├─ now = now.In(loc)                   → 转为上海时间
+    │     ├─ parser.Parse("0 3 * * *")           → Schedule 对象
+    │     └─ schedule.Next(now)                  → 上海时间 03:00 对应的 UTC 时刻
+    │
+    └─ NextExec = result.Unix()  ← 存入数据库的是绝对时间戳
+                                           (如 1661979600)
+
+运行时 runCron():
+    │
+    ├─ CronListNextExecute(now.Unix())  ← 用 UTC 时间戳比较
+    │     → 找到 NextExec <= now 的 Cron
+    │
+    └─ CalcNewNext(cron.Schedule, cron.Timezone, now)
+          → 基于上海时区计算下一个 03:00 → 新的绝对时间戳
+          → CronGetLock 更新 NextExec
+```
+
+#### 时区边界行为
+
+| 场景 | 行为 |
+|------|------|
+| DST 向前跳（春季） | 跳过不存在的时间点，直接到下一个有效时刻 |
+| DST 向后跳（秋季） | gdgvda/cron 会选择第一次出现的时刻 |
+| 无效时区名 | `time.LoadLocation` 返回错误，Cron 创建/更新被拒绝 |
+| `@every` 间隔格式 | 不受时区影响，始终从当前时刻加固定间隔 |
+
+#### 迁移：秒字段移除
+
+`migration/011_cron_without_sec.go` 将旧版 6 字段（含秒）表达式截断为 5 字段：
+
+```go
+// 对非预定义表达式，去掉第一个空格前的秒字段
+if !strings.HasPrefix(schedule, "@") {
+    cron.Schedule = strings.SplitN(strings.TrimSpace(cron.Schedule), " ", 2)[1]
+}
+```
+
+这确保 Woodpecker 统一使用 `StandardOptions`（5 字段），不包含秒级精度。
+
+---
+
+## 八、分布式多 Server 部署下的重叠保护
+
+### 8.1 Woodpecker 的部署假设
+
+**关键发现：Woodpecker 不包含任何 leader 选举或分布式协调机制。**
+
+代码中搜索 `leader`、`election`、`raft`、`consul`、`etcd`、`SELECT FOR UPDATE` 等关键词，均未找到相关实现。`cron_scheduler.Run()` 在每个 Server 进程中无条件启动：
+
+```go
+// cmd/server/server.go:127
+serviceWaitingGroup.Go(func() error {
+    log.Info().Msg("starting cron service ...")
+    if err := cron_scheduler.Run(ctx, _store); err != nil {
+        go stopServerFunc(err)
+        return err
+    }
+    return nil
+})
+```
+
+**这意味着：多 Server 实例部署时，每个实例都会运行独立的 Cron 轮询循环。**
+
+### 8.2 多 Server 下的竞争时序
+
+```
+Server A                          Server B
+  │                                 │
+  ├─ Run() 每分钟轮询               ├─ Run() 每分钟轮询
+  │  CronListNextExecute()          │  CronListNextExecute()
+  │  → 返回 cron{ID:5, NextExec:T} │  → 返回 cron{ID:5, NextExec:T}
+  │                                 │
+  ├─ runCron(cron, now)             ├─ runCron(cron, now)
+  │  ├─ CalcNewNext → newNext       │  ├─ CalcNewNext → newNext
+  │  ├─ CronGetLock(ID:5, T, newNext)│  ├─ CronGetLock(ID:5, T, newNext)
+  │  │                              │  │
+  │  │  ┌──────── RACE ────────┐   │  │
+  │  │  │ UPDATE crons         │   │  │
+  │  │  │ SET next_exec=newNext│   │  │
+  │  │  │ WHERE id=5           │   │  │
+  │  │  │   AND next_exec=T    │   │  │
+  │  │  │                      │   │  │
+  │  │  │ 只有1个能影响0行≠0    │   │  │
+  │  │  └──────────────────────┘   │  │
+  │  │                              │  │
+  │  ├─ ✅ cols=1, gotLock=true     │  ├─ ❌ cols=0, gotLock=false
+  │  ├─ CreatePipeline()            │  ├─ return nil ← 放弃
+  │  └─ pipeline.Create()           │  └─ (另一个goroutine处理了)
+  │                                 │
+```
+
+### 8.3 CronGetLock 的跨数据库原子性分析
+
+`CronGetLock` 通过 xorm 生成如下 SQL：
+
+```go
+// server/store/datastore/cron.go:64
+cols, err := s.engine.ID(cron.ID).Where(builder.Eq{"next_exec": cron.NextExec}).
+    Cols("next_exec").Update(&model.Cron{NextExec: newNextExec})
+```
+
+等效 SQL：
+```sql
+UPDATE crons SET next_exec = ? WHERE id = ? AND next_exec = ?
+```
+
+**各数据库引擎的原子性保证**：
+
+| 数据库 | UPDATE 原子性 | 并发安全性 | 备注 |
+|--------|-------------|-----------|------|
+| **PostgreSQL** | ✅ MVCC 行级锁 | ✅ 安全 | UPDATE 对同一行串行化；WHERE 条件在最新快照求值 |
+| **MySQL (InnoDB)** | ✅ 行级排他锁 | ✅ 安全 | UPDATE 获取 X 锁；第二个事务阻塞直到第一个提交，然后 WHERE 不匹配 |
+| **SQLite** | ⚠️ 文件级锁 | ✅ 安全（单写者） | WAL 模式下读不阻塞写，但写仍串行；CAS 语义成立 |
+
+**核心机制**：无论哪种引擎，`UPDATE ... WHERE next_exec = old_value` 都保证了：
+1. **原子性**：读-改-写作为单条 SQL 原子执行
+2. **互斥**：只有一个 UPDATE 能匹配到旧值并返回 `affected rows = 1`
+3. **无害失败**：其他竞争者得到 `affected rows = 0`，安全退出
+
+### 8.4 缺失的保护：多 Server 部署的隐患
+
+虽然 `CronGetLock` 解决了"同一 Cron 任务不会被多个 Server 同时执行"的问题，但多 Server 场景下仍存在以下隐患：
+
+#### 隐患 1：Pipeline 创建非幂等
+
+`CronGetLock` 成功后，`CreatePipeline()` → `pipeline.Create()` 链路中：
+
+```
+CronGetLock 成功
+    → cron_scheduler.CreatePipeline()  ← 构造 Pipeline 对象
+    → pipeline.Create()                ← 状态落库 + 入队
+```
+
+如果 `CronGetLock` 成功但 `pipeline.Create()` 因网络/Forge 故障失败：
+- `NextExec` 已被推进到下次时间 ✅
+- 但本次 Pipeline 未创建 ❌
+- **结果：跳过一次执行，无法自动补偿**
+
+#### 隐患 2：CronListNextExecute 的批量竞争
+
+```go
+// 每分钟每 Server 都执行此查询
+crons, err := store.CronListNextExecute(now.Unix(), checkItems)
+```
+
+如果到期 Cron 超过 `checkItems`（10 条）：
+- 多个 Server 可能拿到**不同子集**的到期 Cron
+- 某些 Cron 可能被**所有 Server 忽略**（恰好不在任何子集中）
+- 但下一轮轮询会重新拾取，**最多延迟 1 分钟**
+
+#### 隐患 3：手动触发 Cron 无锁
+
+`api/RunCron()` 不经过 `CronGetLock`，这意味着：
+- 用户通过 API 手动触发 Cron Job 时，不检查 NextExec
+- 手动触发的 Pipeline 与自动触发的 Pipeline 使用 `cancelPreviousPipelines` 互斥
+- 但如果用户在短时间内多次点击"手动触发"，**可能创建多个并行的 Cron Pipeline**
+- 并行 Pipeline 的去重依赖 `cancelPreviousPipelines`（需 Repo 配置 `CancelPreviousPipelineEvents` 包含 `cron` 事件）
+
+### 8.5 为什么不需要 Leader 选举
+
+Woodpecker 的设计选择是 **数据库 CAS 锁** 而非 **Leader 选举**，理由如下：
+
+| 维度 | Leader 选举 | 数据库 CAS（当前实现） |
+|------|-----------|---------------------|
+| 部署复杂度 | 需要 etcd/Consul 或自定义协议 | 零额外依赖 |
+| 故障恢复 | 需要心跳 + 选举超时 | 天然容错：任何 Server 可抢占 |
+| 一致性 | 强一致（同一时刻只有1个调度器） | 最终一致（最多重复1轮，由 CAS 去重） |
+| 适用场景 | 对"恰好一次"语义要求极高 | 允许偶发跳过/延迟 |
+| 代码复杂度 | 高（状态机、选举协议） | 低（1条 UPDATE 语句） |
+
+**Woodpecker 的定位是 CI/CD 工具**，Cron 调度容忍分钟级延迟，无需强一致调度。数据库 CAS 是最简方案。
+
+### 8.6 完整的多 Server 并发时序图
+
+```
+时间轴 →
+
+Server A (轮询周期 T)                Server B (轮询周期 T)
+    │                                    │
+    ├─ CronListNextExecute(T)            ├─ CronListNextExecute(T)
+    │  → [cron_1, cron_2, ...]           │  → [cron_1, cron_2, ...]
+    │                                    │
+    ├─ runCron(cron_1) ──────┐           ├─ runCron(cron_1) ──────┐
+    │  ├─ CalcNewNext()      │           │  ├─ CalcNewNext()      │
+    │  ├─ CronGetLock ───────┼─── RACE ──┤  ├─ CronGetLock ───────┤
+    │  │  UPDATE next_exec   │   ON DB   │  │  UPDATE next_exec   │
+    │  │  ✅ rows=1          │           │  │  ❌ rows=0          │
+    │  ├─ CreatePipeline()   │           │  └─ return nil         │
+    │  └─ pipeline.Create()  │           │                        │
+    │                         │           │                        │
+    ├─ runCron(cron_2) ──────┤           ├─ runCron(cron_2) ──────┤
+    │  ├─ CronGetLock ───────┼─── RACE ──┤  ├─ CronGetLock ───────┤
+    │  │  ❌ rows=0          │           │  │  ✅ rows=1          │
+    │  └─ return nil         │           │  ├─ CreatePipeline()   │
+    │                         │           │  └─ pipeline.Create()  │
+    │                                    │
+    └─ 等待下一轮 (T+1min)               └─ 等待下一轮 (T+1min)
+```
+
+**核心保证**：同一个 Cron Job 在同一个执行周期内，**只有一个 Server 能成功创建 Pipeline**。
+
+---
+
+## 九、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
-| `server/cron/cron.go` | Cron 调度主循环、runCron、CreatePipeline 构造 |
-| `server/api/cron.go` | Cron REST API：RunCron（手动触发 cron）、CRUD |
+| `server/cron/cron.go` | Cron 调度主循环、`CalcNewNext`、`runCron`、`CreatePipeline` 构造 |
+| `server/cron/cron_test.go` | `TestCalcNewNext` — 时区解析测试（UTC vs Europe/Bucharest） |
+| `server/api/cron.go` | Cron REST API：RunCron（手动触发 cron）、CRUD（含 CalcNewNext 调用点） |
 | `server/api/pipeline.go` | Pipeline REST API：CreatePipeline（手动触发） |
 | `server/pipeline/create.go` | Pipeline 创建主流程（三方汇合点） |
 | `server/pipeline/start.go` | start()、cancelPreviousPipelines 调用入口 |
 | `server/pipeline/cancel.go` | cancelPreviousPipelines 具体实现 |
 | `server/pipeline/pipeline_status.go` | 状态更新函数 |
-| `server/store/datastore/cron.go` | CronListNextExecute、CronGetLock 乐观锁 |
+| `server/store/datastore/cron.go` | CronListNextExecute、CronGetLock（CAS 乐观锁） |
+| `server/store/datastore/cron_test.go` | CronGetLock 测试（抢锁成功/失败场景） |
 | `server/store/datastore/pipeline.go` | CreatePipeline（事务+重试）、UpdatePipeline |
-| `server/model/cron.go` | Cron 数据结构 |
+| `server/store/datastore/init_cgo.go` | 支持的数据库驱动（sqlite3 + mysql + postgres） |
+| `server/store/datastore/init.go` | 非 cgo 构建的驱动（mysql + postgres only） |
+| `server/store/datastore/migration/011_cron_without_sec.go` | 秒字段迁移：6 字段 → 5 字段 |
+| `server/store/datastore/migration/027_add_cron_field.go` | Pipeline 增加 Cron 字段迁移 |
+| `server/model/cron.go` | Cron 数据结构 + Validate（内含 cron 表达式校验） |
 | `server/model/pipeline.go` | Pipeline 数据结构（含 Cron 字段） |
 | `server/model/const.go` | WebhookEvent、StatusValue 枚举 |
+| `cmd/server/server.go` | Server 启动入口，Cron 调度在 errgroup 中无条件启动 |
+| `go.mod` | `github.com/gdgvda/cron v0.7.0`（robfig/cron fork） |
