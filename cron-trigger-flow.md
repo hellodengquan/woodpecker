@@ -2,19 +2,19 @@
 
 ## 一、整体架构概览
 
-Woodpecker CI 存在三种触发路径，它们在不同入口分离，但在 Pipeline 创建层汇合：
+Woodpecker CI 存在四种触发路径，它们在不同入口分离，但在 Pipeline 创建层汇合：
 
 ```
-┌───────────────────────┐     ┌───────────────────────┐     ┌───────────────────────┐
-│   ① Cron 定时轮询     │     │  ② 手动触发 Cron Job  │     │  ③ 手动触发 Pipeline  │
-│ server/cron/cron.go   │     │   server/api/cron.go  │     │ server/api/pipeline.go│
-└───────────┬───────────┘     └───────────┬───────────┘     └───────────┬───────────┘
-            │ Cron.CreatePipeline()       │ Cron.CreatePipeline()       │ createTmpPipeline()
-            ▼                             ▼                             ▼
-┌──────────────────────────────────────────────────────────────────────────────────────┐
-│                          ④ pipeline.Create() —— 公共汇合点                             │
-│                         server/pipeline/create.go:35                                  │
-└──────────────────────────────────────┬───────────────────────────────────────────────┘
+┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐ ┌───────────────────┐
+│  ① Cron 定时轮询  │ │ ② 手动触发 Cron   │ │ ③ 手动触发Pipeline │ │   ④ Webhook       │
+│ server/cron/cron  │ │ server/api/cron   │ │ server/api/pipe   │ │ server/api/hook   │
+└────────┬──────────┘ └────────┬──────────┘ └────────┬──────────┘ └────────┬──────────┘
+         │ Cron.CreatePipeline()        │ Cron.CreatePipeline()  │ createTmpPipeline()│ Forge 构造
+         ▼                             ▼                        ▼                    ▼
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                            pipeline.Create() —— 公共汇合点                                │
+│                           server/pipeline/create.go:35                                    │
+└──────────────────────────────────────┬───────────────────────────────────────────────────┘
                                        │
                     ┌──────────────────┼──────────────────┐
                     ▼                  ▼                  ▼
@@ -678,27 +678,484 @@ Server A (轮询周期 T)                Server B (轮询周期 T)
 
 ---
 
-## 九、关键文件索引
+## 十、Cron 触发失败的重试与退避策略
+
+### 10.1 总览：三层失败点，两种重试策略
+
+```
+runCron() 调用链
+    │
+    ├─ [F1] CalcNewNext()        ← 失败点 1：表达式/时区错误
+    │   └─ 无重试，直接返回错误
+    │
+    ├─ [F2] CronGetLock()        ← 失败点 2：抢锁失败
+    │   └─ 无需重试，正常退出（已被其他 goroutine 处理）
+    │
+    ├─ [F3] cron_scheduler.CreatePipeline()  ← 失败点 3a：Forge 网络错误
+    │   ├─ store.GetRepo()       → 无重试
+    │   ├─ ForgeFromRepo()       → 无重试
+    │   ├─ store.GetUser()       → 无重试
+    │   ├─ forge.Refresh()       → 无重试
+    │   └─ _forge.BranchHead()   → 无重试
+    │
+    └─ [F4] pipeline.Create()    ← 失败点 3b：Pipeline 创建流程
+        ├─ store.CreatePipeline() → ✅ 指数退避重试（最多 3 次）
+        ├─ configService.Fetch()  → 无重试（失败 → StatusError）
+        ├─ createPipelineItems()  → 无重试（失败 → StatusError）
+        └─ start()/queuePipeline() → 无重试
+```
+
+### 10.2 Cron 调度层：无重试，仅记日志
+
+```go
+// server/cron/cron.go:58
+for _, cron := range crons {
+    if err := runCron(ctx, store, cron, now); err != nil {
+        log.Error().Err(err).Int64("cronID", cron.ID).Msg("run cron failed")
+        // ← 仅记录日志，不重试，不回滚 NextExec
+    }
+}
+```
+
+**各失败场景的后果**：
+
+| 失败点 | NextExec 状态 | Pipeline 状态 | 后果 | 是否自动恢复 |
+|--------|-------------|-------------|------|------------|
+| `CalcNewNext` 失败 | 未修改（仍为旧值） | 不存在 | 下分钟重新命中 | ✅ 1 分钟后重试 |
+| `CronGetLock` 抢锁失败 | 已被别人推进 | 由别人创建 | 正常，无影响 | — |
+| `CronGetLock` 本身报错 | 未修改 | 不存在 | 下分钟重新命中 | ✅ 1 分钟后重试 |
+| `CreatePipeline` 中 Forge 失败 | **已推进** | 不存在 | **永久跳过一次执行** | ❌ 不会补偿 |
+| `pipeline.Create` 配置拉取失败 | **已推进** | StatusError（已落库） | 算作一次执行，有记录 | ✅ 可人工 Restart |
+| `pipeline.Create` 入队失败 | **已推进** | StatusPending | Pipeline 卡在 Pending | ⚠️ 需人工干预 |
+
+### 10.3 唯一的重试点：`store.CreatePipeline` 的指数退避
+
+**位置**：`server/store/datastore/pipeline.go:135`
+
+这是整条链路中**唯一带有重试机制**的环节，使用 `cenkalti/backoff/v5`：
+
+```go
+func (s storage) CreatePipeline(pipeline *model.Pipeline, stepList ...*model.Step) error {
+    const maxRetries = 3
+    exponentialBackoff := backoff.NewExponentialBackOff()
+
+    _, err := backoff.Retry(context.Background(), func() (struct{}, error) {
+        sess := s.engine.NewSession()
+        defer sess.Close()
+        if err := sess.Begin(); err != nil {
+            return struct{}{}, err
+        }
+
+        // 事务内：查 MAX(number) + INSERT pipeline
+        var number int64
+        if _, err := sess.Select("MAX(number)").
+            Table(new(model.Pipeline)).
+            Where("repo_id = ?", pipeline.RepoID).
+            Get(&number); err != nil {
+            return struct{}{}, err
+        }
+        pipeline.Number = number + 1
+
+        if err := wrapInsert(sess.Insert(pipeline)); err != nil {
+            if isUniqueConstraintError(err) {
+                return struct{}{}, err       // ← 唯一键冲突：可重试
+            }
+            return struct{}{}, backoff.Permanent(err)  // ← 其他错误：永久失败
+        }
+
+        return struct{}{}, sess.Commit()
+    }, backoff.WithBackOff(exponentialBackoff), backoff.WithMaxTries(maxRetries))
+    return err
+}
+```
+
+**退避参数**（`backoff.NewExponentialBackOff()` 默认值）：
+
+| 参数 | 默认值 | 说明 |
+|------|-------|------|
+| `InitialInterval` | 500ms | 首次重试等待 |
+| `RandomizationFactor` | 0.5 | ±50% 随机抖动 |
+| `Multiplier` | 1.5 | 每次间隔 ×1.5 |
+| `MaxInterval` | 60s | 单次最大等待 |
+| `MaxElapsedTime` | 15min | 总最大等待 |
+
+**实际重试间隔估算**：
+- 第 1 次重试：~500ms（±250ms）
+- 第 2 次重试：~750ms（±375ms）
+- 第 3 次重试：~1125ms（±562ms）
+
+**为什么需要这个重试**：
+
+高并发下多个 Pipeline 同时创建时，`SELECT MAX(number) + INSERT` 事务之间会竞争 `(repo_id, number)` 唯一约束：
+
+```
+Webhook 触发 Pipeline A               Cron 触发 Pipeline B
+    │                                      │
+    ├─ BEGIN                               ├─ BEGIN
+    ├─ SELECT MAX(number) → 100            ├─ SELECT MAX(number) → 100
+    ├─ INSERT number=101                   ├─ INSERT number=101  ← 💥 唯一键冲突
+    ├─ COMMIT                              ├─ ROLLBACK
+    │                                      │
+    │                                      ├─ backoff 等待 ~500ms
+    │                                      ├─ BEGIN
+    │                                      ├─ SELECT MAX(number) → 101  ← 已提交
+    │                                      ├─ INSERT number=102  ✅
+    │                                      └─ COMMIT
+```
+
+`isUniqueConstraintError` 检测 5 种数据库的唯一键错误模式：
+
+```go
+func isUniqueConstraintError(err error) bool {
+    errStr := err.Error()
+    return strings.Contains(errStr, "duplicate key")        // PostgreSQL
+        || strings.Contains(errStr, "Duplicate entry")       // MySQL
+        || strings.Contains(errStr, "UNIQUE constraint failed") // SQLite
+        || strings.Contains(errStr, "unique constraint")     // 通用
+        || strings.Contains(errStr, "UNIQUE violation")      // 通用
+}
+```
+
+**关键**：只有唯一键冲突被判定为**可重试错误**，其他 INSERT 错误通过 `backoff.Permanent(err)` 标记为**永久失败**，不再重试。
+
+### 10.4 pipeline.Create 内部的失败处理：StatusError 落库
+
+当 `pipeline.Create()` 在配置拉取或解析阶段失败时，Pipeline 不会被静默丢弃，而是**标记为 StatusError 并持久化**：
+
+```go
+// server/pipeline/create.go:78-94 — 配置拉取失败
+case configFetchErr != nil && forgeYamlConfigs != nil:
+    // Forge 返回异常状态码但有旧配置 → 降级使用旧配置，仅 Warn
+    log.Warn().Err(configFetchErr).Msg("will fallback to old config")
+
+case configFetchErr != nil:
+    // Forge 返回异常且无旧配置 → StatusError 落库
+    return nil, updatePipelineWithErr(ctx, _forge, _store, pipeline, repo, repoUser, ...)
+```
+
+```go
+// server/pipeline/create.go:96-101 — YAML 解析失败
+if handleParseErrors(pipeline, parseErr) {
+    return pipeline, updatePipelineWithErr(ctx, _forge, _store, pipeline, repo, repoUser, parseErr)
+}
+```
+
+`updatePipelineWithErr` 调用 `UpdateToStatusError`：
+```go
+func UpdateToStatusError(store store.Store, pipeline model.Pipeline, err error) (*model.Pipeline, error) {
+    pipeline.Errors = errors.GetPipelineErrors(err)
+    pipeline.Status = model.StatusError
+    pipeline.Started = time.Now().Unix()
+    pipeline.Finished = pipeline.Started    // 瞬时完成
+    return &pipeline, store.UpdatePipeline(&pipeline)
+}
+```
+
+**效果**：失败的 Cron Pipeline 在 UI 中可见（Status=error），可被 `pipeline.Restart` 重新触发。
+
+### 10.5 ErrFiltered：静默丢弃，无重试
+
+以下场景返回 `ErrFiltered`，Pipeline 被删除或不创建，**不重试**：
+
+| 场景 | 代码位置 | 行为 |
+|------|---------|------|
+| commit message 含 `[CI SKIP]` | `create.go:43` | 返回 `ErrFiltered`，Pipeline 未创建 |
+| 配置文件不存在 | `create.go:82` | 先删除已创建记录，再返回 `ErrFiltered` |
+| 全部 workflow 被 when 条件过滤 | `create.go:108` | 先删除已创建记录，再返回 `ErrFiltered` |
+
+API 层对 `ErrFiltered` 的处理：
+```go
+// server/api/helper.go:38
+case errors.Is(err, pipeline.ErrFiltered):
+    c.Writer.Header().Add("Pipeline-Filtered", "true")
+    c.Status(http.StatusNoContent)
+```
+
+Cron 层对此的处理：
+```go
+// server/cron/cron.go:111
+_, err = pipeline.Create(ctx, store, repo, newPipeline)
+return err  // ErrFiltered 会被 log.Error 记录，但不影响下次调度
+```
+
+### 10.6 完整的失败-恢复决策树
+
+```
+runCron() 失败
+    │
+    ├─ CalcNewNext 错误
+    │   └─ NextExec 未变 → 下轮自动重试 ✅
+    │
+    ├─ CronGetLock 失败
+    │   ├─ 抢锁失败 (gotLock=false) → 正常，别人已处理 ✅
+    │   └─ DB 错误 → NextExec 未变 → 下轮自动重试 ✅
+    │
+    ├─ cron_scheduler.CreatePipeline 错误
+    │   ├─ DB 错误 (GetRepo/GetUser) → NextExec 已推 → 跳过 ❌
+    │   └─ Forge 错误 (BranchHead) → NextExec 已推 → 跳过 ❌
+    │
+    └─ pipeline.Create 错误
+        ├─ CreatePipeline 唯一键冲突 → 自动退避重试 ✅
+        ├─ CreatePipeline 其他错误 → Permanent 失败 → 跳过 ❌
+        ├─ 配置拉取失败 (无旧配置) → StatusError 落库 → 可 Restart ✅
+        ├─ 配置拉取失败 (有旧配置) → 降级使用旧配置 → 继续 ✅
+        ├─ YAML 解析失败 → StatusError 落库 → 可 Restart ✅
+        ├─ ErrFiltered → Pipeline 被删除 → 不可 Restart ❌
+        └─ 入队失败 → Pipeline 卡在 Pending → 需人工 ⚠️
+```
+
+---
+
+## 十一、Webhook 触发与 Cron 触发的并发路径
+
+### 11.1 第四种触发入口：Webhook
+
+**入口**：`server/api/hook.go:69` — `PostHook()`
+
+```go
+func PostHook(c *gin.Context) {
+    // POST /hook
+
+    // 1. 验证 webhook token
+    _, err := token.ParseRequest([]token.Type{token.HookToken}, c.Request, ...)
+
+    // 2. 解析 webhook 数据
+    repoFromForge, pipelineFromForge, err := _forge.Hook(c, c.Request)
+
+    // 3. 校验 repo + 用户
+    if !repo.IsActive { return }
+    forge.Refresh(c, _forge, _store, user)
+
+    // 4. 更新 repo 信息
+    repo.Update(repoFromForge)
+    _store.UpdateRepo(repo)
+
+    // 5. 创建 Pipeline
+    pl, err := pipeline.Create(c, _store, repo, pipelineFromForge)
+}
+```
+
+**Webhook 产生的 Event 类型**：
+
+| Forge 事件 | Pipeline Event | Refspec 字段 |
+|-----------|---------------|-------------|
+| push 到分支 | `push` | 空（Branch 填充） |
+| push 标签 | `tag` | 空 |
+| Pull Request 创建/更新 | `pull_request` | `source:target` |
+| PR 关闭 | `pull_request_closed` | `source:target` |
+| Release | `release` | 空 |
+| Deployment | `deployment` | 空 |
+
+**与 Cron/手动触发的关键区别**：
+- Webhook Pipeline 由 Forge 构造，**包含完整的 commit 信息**（message、author 等）
+- Event 类型可以是 `push`、`tag`、`pull_request` 等，但**永远不会是 `cron` 或 `manual`**
+- Webhook 是**外部驱动**的，频率不可控
+
+### 11.2 四种触发路径的完整并发视图
+
+```
+┌──────────────┐ ┌───────────────┐ ┌───────────────┐ ┌──────────────┐
+│  Webhook     │ │ Cron 自动调度  │ │ 手动触发 Cron  │ │ 手动触发     │
+│  POST /hook  │ │ cron.Run()    │ │ POST /cron/{id}│ │ POST /pipes  │
+│  Event: push │ │ Event: cron   │ │ Event: cron    │ │ Event: manual│
+└──────┬───────┘ └──────┬────────┘ └──────┬────────┘ └──────┬───────┘
+       │                │                 │                 │
+       └────────────────┴─────────────────┴─────────────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────┐
+                    │   pipeline.Create()      │  ← 四路汇合
+                    │   公共创建流程            │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────┴─────────────┐
+                    │  store.CreatePipeline()  │  ← 唯一键竞争点
+                    │  (repo_id, number) UNIQUE│
+                    │  指数退避重试 ×3          │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────┴─────────────┐
+                    │ cancelPreviousPipelines()│  ← 事件隔离的取消
+                    │ 匹配规则：同 Event +      │
+                    │   push→同 Branch          │
+                    │   cron→同 Cron 名         │
+                    │   manual→同 Refspec       │
+                    │   其他→同 Refspec         │
+                    └──────────────────────────┘
+```
+
+### 11.3 并发竞争核心：`store.CreatePipeline` 的 number 分配
+
+**四种触发源可能同时为同一 Repo 创建 Pipeline**，它们在 `(repo_id, number)` 唯一约束上竞争：
+
+```
+Webhook (push main)              Cron (nightly, main)           手动 Pipeline (main)
+    │                                 │                              │
+    ├─ pipeline.Create()              ├─ pipeline.Create()           ├─ pipeline.Create()
+    │  ├─ CreatePipeline()            │  ├─ CreatePipeline()         │  ├─ CreatePipeline()
+    │  │  ├─ BEGIN                    │  │  ├─ BEGIN                 │  │  ├─ BEGIN
+    │  │  ├─ MAX(number)→100          │  │  ├─ MAX(number)→100       │  │  ├─ MAX(number)→100
+    │  │  ├─ INSERT #101 ✅           │  │  ├─ INSERT #101 💥        │  │  ├─ INSERT #101 💥
+    │  │  └─ COMMIT                   │  │  └─ ROLLBACK              │  │  └─ ROLLBACK
+    │  │                              │  │                           │  │
+    │  │                              │  │  ← backoff ~500ms →      │  │  ← backoff ~500ms →
+    │  │                              │  │  ├─ BEGIN                 │  │  ├─ BEGIN
+    │  │                              │  │  ├─ MAX(number)→101       │  │  ├─ MAX(number)→101 💥
+    │  │                              │  │  ├─ INSERT #102 ✅        │  │  ├─ INSERT #102 💥
+    │  │                              │  │  └─ COMMIT                │  │  └─ ROLLBACK
+    │  │                              │  │                           │  │
+    │  │                              │  │                           │  │  ← backoff ~750ms →
+    │  │                              │  │                           │  │  ├─ BEGIN
+    │  │                              │  │                           │  │  ├─ MAX(number)→102
+    │  │                              │  │                           │  │  ├─ INSERT #103 ✅
+    │  │                              │  │                           │  │  └─ COMMIT
+```
+
+**为什么用 `MAX(number)+1` 而非自增**：
+- `number` 是**Repo 范围内**的流水号（非全局自增 ID `id`）
+- 用户通过 `repo/repo-id/pipelines/103` 访问，需要连续且有意义的编号
+- 全局 `id` 是数据库自增主键，对用户不可见
+
+**退避重试的边界**：
+- 最多 3 次重试，在高并发下仍有耗尽重试的可能
+- 3 次重试仍冲突 → `CreatePipeline` 返回唯一键错误 → `pipeline.Create` 返回错误
+- 对 Webhook：API 返回 500，Forge 可能重试 webhook（取决于 Forge 实现）
+- 对 Cron：`runCron` 记录日志，**NextExec 已推，跳过执行**
+
+### 11.4 `cancelPreviousPipelines` 的事件隔离机制
+
+**关键代码**：`server/pipeline/cancel.go:120-133`
+
+```go
+pipelineNeedsCancel := func(active *model.Pipeline) bool {
+    if active.Event != pipeline.Event {   // ← 必须同 Event 才可能取消
+        return false
+    }
+    switch pipeline.Event {
+    case model.EventPush:
+        return pipeline.Branch == active.Branch   // push: 同分支
+    default:
+        return pipeline.Refspec == active.Refspec  // 其他: 同 Refspec
+    }
+}
+```
+
+**各 Event 的取消匹配规则**：
+
+| 新 Pipeline Event | 匹配条件 | 会被取消的旧 Pipeline |
+|------------------|---------|---------------------|
+| `push` | 同 Branch | 同分支的 `push` Pipeline |
+| `cron` | 同 Refspec（Cron 名存于 Refspec？） | 同 Refspec 的 `cron` Pipeline |
+| `manual` | 同 Refspec | 同 Refspec 的 `manual` Pipeline |
+| `pull_request` | 同 Refspec (`source:target`) | 同 PR 的 `pull_request` Pipeline |
+| `tag` | 同 Refspec | 同 tag 的 `tag` Pipeline |
+
+**注意**：Cron Event 走的是 `default` 分支，用 `Refspec` 匹配。Cron Pipeline 构造时 `Refspec` 为空字符串（只有 `Branch` 和 `Ref` 字段被填充），所以**同一 Repo 的所有 Cron Pipeline 会互相取消**（因为 Refspec 都是空）。这与之前文档中"按 Cron 名匹配"的描述有差异——实际代码行为取决于 `Refspec` 字段值。
+
+### 11.5 Webhook 与 Cron 并发的四个典型场景
+
+#### 场景 A：同一分支的 push 和 Cron 同时触发
+
+```
+T0: Git push 到 main → Webhook → pipeline.Create() → Pipeline #50 (Event=push, Branch=main)
+T0+1s: Cron "nightly" 到期 → runCron → pipeline.Create() → Pipeline #51 (Event=cron, Branch=main)
+
+cancelPreviousPipelines:
+  - #51 是 Event=cron，查找活跃 Pipeline 中 Event=cron 且 Refspec 相同的
+  - #50 是 Event=push → 不匹配 → 不会被取消
+
+结果: #50 (push) 和 #51 (cron) 并行执行 ✅
+```
+
+#### 场景 B：快速连续 push 触发
+
+```
+T0: push main → Webhook → Pipeline #60 (Event=push, Branch=main, Status=Pending)
+T0+2s: 另一次 push main → Webhook → Pipeline #61 (Event=push, Branch=main)
+
+cancelPreviousPipelines (Repo 配置 push 在取消名单中):
+  - #61 是 Event=push，查找活跃 Pipeline 中 Event=push 且 Branch=main 的
+  - #60 匹配 → Cancel #60 (SupersededBy: 61)
+
+结果: #60 被取消，只有 #61 执行 ✅
+```
+
+#### 场景 C：Cron 和 push 争抢同一 Branch 的 Pipeline number
+
+```
+T0: push main + Cron "nightly" 同时触发
+    两者几乎同时调用 store.CreatePipeline()
+
+    Webhook goroutine:                Cron goroutine:
+    BEGIN                              BEGIN
+    MAX(number) → 70                   MAX(number) → 70
+    INSERT #71 ✅                      INSERT #71 💥 unique conflict
+    COMMIT                             ROLLBACK
+                                       ← backoff ~500ms →
+                                       BEGIN
+                                       MAX(number) → 71
+                                       INSERT #72 ✅
+                                       COMMIT
+
+    Pipeline #71: Event=push (先创建)
+    Pipeline #72: Event=cron (后退避创建)
+
+    cancelPreviousPipelines:
+      #72 (cron) 不会取消 #71 (push) → 并行执行 ✅
+```
+
+#### 场景 D：PR Webhook 和 Cron 交错
+
+```
+T0: PR #42 opened → Webhook → Pipeline #80 (Event=pull_request, Refspec="feature:main")
+T0+5s: Cron "nightly" 触发 → Pipeline #81 (Event=cron, Refspec="")
+
+cancelPreviousPipelines:
+  #81 (cron) 查找 Event=cron 且 Refspec="" 的 → 无匹配（#80 是 pull_request）
+  #80 (pull_request) 不会被取消
+
+结果: PR Pipeline 和 Cron Pipeline 并行 ✅
+```
+
+### 11.6 并发安全总结
+
+| 并发对 | 是否互斥 | 保护机制 | 潜在问题 |
+|--------|---------|---------|---------|
+| Webhook vs Webhook | 按事件+分支 | `cancelPreviousPipelines` + 唯一键退避 | 无 |
+| Webhook vs Cron | **不互斥** | 事件类型不同，不会互相取消 | 同分支并行执行可能冲突 |
+| Webhook vs Manual | **不互斥** | 事件类型不同 | 同分支并行 |
+| Cron vs Cron | 按事件+Refspec | `CronGetLock` + `cancelPreviousPipelines` | Refspec 为空可能误杀其他 Cron |
+| Manual vs Manual | 按事件+Refspec | `cancelPreviousPipelines` + 唯一键退避 | 无 |
+| Cron vs Manual | **不互斥** | 事件类型不同 | 同分支并行 |
+
+---
+
+## 十二、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
 | `server/cron/cron.go` | Cron 调度主循环、`CalcNewNext`、`runCron`、`CreatePipeline` 构造 |
 | `server/cron/cron_test.go` | `TestCalcNewNext` — 时区解析测试（UTC vs Europe/Bucharest） |
 | `server/api/cron.go` | Cron REST API：RunCron（手动触发 cron）、CRUD（含 CalcNewNext 调用点） |
+| `server/api/hook.go` | Webhook 入口：PostHook — 解析 Forge webhook 并调用 pipeline.Create |
 | `server/api/pipeline.go` | Pipeline REST API：CreatePipeline（手动触发） |
-| `server/pipeline/create.go` | Pipeline 创建主流程（三方汇合点） |
+| `server/api/helper.go` | `handlePipelineErr` — API 层错误分类（ErrFiltered/ErrNotFound/ErrBadRequest） |
+| `server/pipeline/create.go` | Pipeline 创建主流程（四方汇合点），含 StatusError 落库 |
 | `server/pipeline/start.go` | start()、cancelPreviousPipelines 调用入口 |
-| `server/pipeline/cancel.go` | cancelPreviousPipelines 具体实现 |
-| `server/pipeline/pipeline_status.go` | 状态更新函数 |
+| `server/pipeline/cancel.go` | cancelPreviousPipelines 具体实现（事件隔离 + Cancel 逻辑） |
+| `server/pipeline/pipeline_status.go` | 状态更新函数（含 UpdateToStatusError） |
+| `server/pipeline/errors.go` | `ErrFiltered` — Pipeline 被条件过滤时的错误类型 |
+| `server/pipeline/restart.go` | Restart — 重启 StatusError 的 Pipeline |
 | `server/store/datastore/cron.go` | CronListNextExecute、CronGetLock（CAS 乐观锁） |
 | `server/store/datastore/cron_test.go` | CronGetLock 测试（抢锁成功/失败场景） |
-| `server/store/datastore/pipeline.go` | CreatePipeline（事务+重试）、UpdatePipeline |
+| `server/store/datastore/pipeline.go` | CreatePipeline（事务+指数退避重试）、isUniqueConstraintError |
 | `server/store/datastore/init_cgo.go` | 支持的数据库驱动（sqlite3 + mysql + postgres） |
 | `server/store/datastore/init.go` | 非 cgo 构建的驱动（mysql + postgres only） |
 | `server/store/datastore/migration/011_cron_without_sec.go` | 秒字段迁移：6 字段 → 5 字段 |
 | `server/store/datastore/migration/027_add_cron_field.go` | Pipeline 增加 Cron 字段迁移 |
 | `server/model/cron.go` | Cron 数据结构 + Validate（内含 cron 表达式校验） |
-| `server/model/pipeline.go` | Pipeline 数据结构（含 Cron 字段） |
+| `server/model/pipeline.go` | Pipeline 数据结构（含 Cron、Refspec 字段） |
 | `server/model/const.go` | WebhookEvent、StatusValue 枚举 |
+| `server/model/repo.go` | Repo 数据结构（含 CancelPreviousPipelineEvents 配置） |
 | `cmd/server/server.go` | Server 启动入口，Cron 调度在 errgroup 中无条件启动 |
-| `go.mod` | `github.com/gdgvda/cron v0.7.0`（robfig/cron fork） |
+| `go.mod` | `github.com/gdgvda/cron v0.7.0`、`github.com/cenkalti/backoff/v5` |
