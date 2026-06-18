@@ -227,10 +227,11 @@ func cancelPreviousPipelines(ctx, _forge, _store, pipeline, repo, user) error {
 ```
 
 **关键要点**：
-- 取消与否由 **Repo 配置**决定（`repo.CancelPreviousPipelineEvents`）
-- Cron 之间：按 `Cron 名称` 匹配，同一名 Cron 的新执行会取消旧执行
-- 手动触发之间：按 `Branch` 匹配，同分支新手动会取消旧手动
+- 取消与否由 **Repo 配置**决定（`repo.CancelPreviousPipelineEvents`，默认为空 → 不开启）
+- Cron 之间：按 Refspec 匹配（Cron Pipeline 构造时 Refspec 为空）→ 同 Repo 所有 Cron 互相取消
+- 手动触发之间：按 Refspec 匹配（Manual Pipeline 构造时 Refspec 为空）→ 同 Repo 所有手动互相取消
 - Cron 与手动：**互不影响**，因为 `Event` 不同
+- Push 之间：按 Branch 匹配
 
 ---
 
@@ -346,32 +347,42 @@ api/CreatePipeline()
 | **NextExec 更新** | ✅ 抢占时更新 | ❌ 不更新 | — |
 | **Event 类型** | `cron` | `cron` | `manual` |
 | **Cron 字段** | 填充名称 | 填充名称 | 空 |
-| **重叠取消匹配键** | `Cron 名` | `Cron 名` | `Branch` |
-| **Cron 间重叠保护** | ✅ | ✅ 与自动 cron 互相取消 | ❌ 不影响 |
-| **手动间重叠保护** | ❌ 不影响 | ❌ 不影响 | ✅ 同分支互相取消 |
+| **Refspec 字段** | 空字符串 | 空字符串 | 空字符串 |
+| **重叠取消匹配键** | Event 相同 + Refspec 相同 | Event 相同 + Refspec 相同 | Event 相同 + Refspec 相同 |
+| **Cron 间重叠保护** | ✅ 同 Repo 所有 Cron 互相取消（Refspec 均为空） | ✅ 同 Repo 所有 Cron 互相取消 | ❌ 不影响 |
+| **手动间重叠保护** | ❌ 不影响 | ❌ 不影响 | ✅ 同 Repo 所有 Manual 互相取消（Refspec 均为空） |
+| **Cron 与手动互相取消** | ❌ Event 不同 | ❌ Event 不同 | — |
 
 ### 6.3 协作场景举例
 
 **场景 A**：Cron "nightly" 每分钟触发，上次执行还在跑
-1. T1：Run() 轮询发现 nightly 到期，CronGetLock 成功 → 创建 Pipeline #101 (Event=cron, Cron=nightly)
+1. T1：Run() 轮询发现 nightly 到期，CronGetLock 成功 → 创建 Pipeline #101 (Event=cron, Cron=nightly, Refspec="")
 2. T1 + 30s：Pipeline #101 仍在 Running
 3. T2（下一分钟）：Run() 再次发现 nightly（NextExec 已推进，不会再命中 T1 那条）
    - 若手动调整了 NextExec 导致再次命中 → CronGetLock 中旧值不匹配 → 抢锁失败
-4. 新 Pipeline #102 创建前 → `cancelPreviousPipelines` → 找到 #101 (同 Cron=nightly) → Cancel #101
+4. 新 Pipeline #102 创建前 → `cancelPreviousPipelines` → 找到 #101 (同 Event=cron, 同 Refspec="") → Cancel #101
 
 **场景 B**：用户手动执行 Cron "nightly"，此时自动调度也正好触发
-1. T0：用户点击 POST /repos/1/cron/5 → 走 RunCron → CreatePipeline → #201 (Running)
+1. T0：用户点击 POST /repos/1/cron/5 → 走 RunCron → CreatePipeline → #201 (Event=cron, Cron=nightly, Running)
    - **不经过 CronGetLock**，NextExec 不变
 2. T0 + 5s：Run() 轮询发现 NextExec <= now → 走 runCron
    - CronGetLock → 更新 NextExec 成功 → 创建 #202
-   - start() → cancelPreviousPipelines → 匹配到 #201 (同 Cron=nightly, Event=cron) → Cancel #201
+   - start() → cancelPreviousPipelines → 匹配到 #201 (同 Event=cron, 同 Refspec="") → Cancel #201
 
-**场景 C**：用户同时触发手动 Pipeline + Cron 执行同一分支
-1. 手动 Pipeline POST /repos/1/pipelines → #301 (Event=manual, Branch=main)
-2. 紧接着 Cron 触发 → #302 (Event=cron, Cron=nightly, Branch=main)
+**场景 C**：Cron "nightly" 与 Cron "weekly" 同时触发（新场景）
+1. T0：Cron "nightly" 到期 → Pipeline #301 (Event=cron, Cron=nightly, Refspec="")
+2. T0 + 1s：Cron "weekly" 也到期 → Pipeline #302 (Event=cron, Cron=weekly, Refspec="")
+3. cancelPreviousPipelines:
+   - #302 的 Event=cron，查找 Event=cron 且 Refspec="" 的活跃 Pipeline
+   - #301 匹配（虽然 Cron 名不同，但 Refspec 都是空）→ Cancel #301
+   - 结果：**"weekly" 误杀了 "nightly"** ❗
+
+**场景 D**：用户同时触发手动 Pipeline + Cron 执行同一分支
+1. 手动 Pipeline POST /repos/1/pipelines → #401 (Event=manual, Branch=main, Refspec="")
+2. 紧接着 Cron 触发 → #402 (Event=cron, Cron=nightly, Branch=main, Refspec="")
 3. cancelPreviousPipelines 检查：
-   - #302 的 Event=cron，匹配 #301 的 Event=manual？→ **不匹配**
-   - 结果：两个 Pipeline **并行执行，互不影响**
+   - #402 的 Event=cron，匹配 #401 的 Event=manual？→ **不匹配**
+   - 结果：两个 Pipeline **并行执行，互不影响** ✅
 
 ---
 
@@ -978,8 +989,8 @@ func PostHook(c *gin.Context) {
                     │ cancelPreviousPipelines()│  ← 事件隔离的取消
                     │ 匹配规则：同 Event +      │
                     │   push→同 Branch          │
-                    │   cron→同 Cron 名         │
-                    │   manual→同 Refspec       │
+                    │   cron→同 Refspec(空)     │
+                    │   manual→同 Refspec(空)   │
                     │   其他→同 Refspec         │
                     └──────────────────────────┘
 ```
@@ -1121,16 +1132,435 @@ cancelPreviousPipelines:
 
 | 并发对 | 是否互斥 | 保护机制 | 潜在问题 |
 |--------|---------|---------|---------|
-| Webhook vs Webhook | 按事件+分支 | `cancelPreviousPipelines` + 唯一键退避 | 无 |
+| Webhook vs Webhook | 按事件：push→同Branch，其他→同Refspec | `cancelPreviousPipelines` + 唯一键退避 | 无 |
 | Webhook vs Cron | **不互斥** | 事件类型不同，不会互相取消 | 同分支并行执行可能冲突 |
 | Webhook vs Manual | **不互斥** | 事件类型不同 | 同分支并行 |
-| Cron vs Cron | 按事件+Refspec | `CronGetLock` + `cancelPreviousPipelines` | Refspec 为空可能误杀其他 Cron |
-| Manual vs Manual | 按事件+Refspec | `cancelPreviousPipelines` + 唯一键退避 | 无 |
+| Cron vs Cron | 按事件+Refspec（Refspec 均为空→同 Repo 所有 Cron 互取消） | `CronGetLock` + `cancelPreviousPipelines` | **不同 Cron 任务之间也会互相误杀** |
+| Manual vs Manual | 按事件+Refspec（Refspec 均为空→同 Repo 所有 Manual 互取消） | `cancelPreviousPipelines` + 唯一键退避 | **不同分支 Manual 之间也会互相误杀** |
 | Cron vs Manual | **不互斥** | 事件类型不同 | 同分支并行 |
 
 ---
 
-## 十二、关键文件索引
+## 十二、Cron Job 长时间运行被覆盖时的取消信号传递路径
+
+### 12.1 触发链路总览
+
+当一个新的 Cron Pipeline 触发后，`cancelPreviousPipelines` 会匹配到旧的同 Cron 名 Pipeline 并调用 `Cancel()`。取消信号从 Server 内存队列出发，经 gRPC 长连接到达 Agent，最终终止容器进程。
+
+```
+  [新 Cron Pipeline 触发]
+            │
+            ▼
+start() → cancelPreviousPipelines()
+            │  CancelInfo{SupersededBy: newPipelineNumber}
+            ▼
+         Cancel()  ←──────────────────────────────────────────┐
+            │                                                  │
+            ├─ ① 收集所有 Running/Pending 的 Workflow ID       │
+            │     → Scheduler.ErrorAtOnce([workflowIDs])       │ Server 端
+            │     → Queue.fifo.finished()                      │
+            │       ├─ 找到 entry → close(entry.done)          │
+            │       └─ 从 pending/waitingDeps 中移除           │
+            │                                                  │
+            ├─ ② Pending 状态的 Workflow/Step                  │
+            │     → 直接 DB UPDATE → StatusSkipped             │
+            │                                                  │
+            ├─ ③ Pipeline DB UPDATE                            │
+            │     → StatusKilled / StatusCanceled              │
+            │     → CancelInfo 持久化                          │
+            │                                                  │
+            └─ ④ publishToTopic + Forge 通知                   │
+                                                               │
+  ─────────────────────────────────────────────────────────────┼────────────────────
+                                                               │
+            ┌──────────────────────────────────────────────────┘
+            │  Agent 侧 goroutine: r.client.Wait()
+            ▼
+RPC.Wait(workflowID)
+    │  → scheduler.Wait() → fifo.Wait()
+    │    阻塞在 entry.done channel
+    │    被 close() 唤醒
+    ▼
+  queue.ErrCancel 检测到
+    │
+    ▼
+  canceled=true 返回给 Agent
+    │
+    ▼
+  cancelWorkflowCtx(ErrCancel)  ←── 取消 context
+    │
+    ├─ pipeline_runtime 收到 context 取消
+    │   → 终止正在执行的 Step（Docker/K8s 容器 kill）
+    │
+    └─ r.client.Done(Canceled=true)
+           ▲
+           │
+           └── 上报完成状态，Server 端写 DB：
+               StatusKilled / Finished 时间戳
+```
+
+### 12.2 Server 端：Cancel() 函数的四个阶段
+
+**位置**：`server/pipeline/cancel.go:32`
+
+```go
+func Cancel(ctx context.Context, _forge forge.Forge, store store.Store,
+    repo *model.Repo, user *model.User, pipeline *model.Pipeline,
+    cancelInfo *model.CancelInfo) error {
+```
+
+#### 阶段 1：队列层驱逐（异步非阻塞）
+
+```go
+// 收集所有 Running/Pending 的 workflow
+var workflowsToCancel []string
+for _, w := range workflows {
+    if w.State == Running || w.State == Pending {
+        workflowsToCancel = append(workflowsToCancel, fmt.Sprint(w.ID))
+    }
+}
+
+// 一次性驱逐
+server.Config.Services.Scheduler.ErrorAtOnce(ctx, workflowsToCancel, queue.ErrCancel)
+```
+
+`ErrorAtOnce` 的调用链：
+```
+Cancel()
+  → scheduler.proxy.ErrorAtOnce()
+    → queue.fifo.ErrorAtOnce()
+      → fifo.finished(ids, StatusKilled, ErrCancel)
+```
+
+`fifo.finished()` 核心逻辑（`server/queue/fifo.go:133`）：
+```go
+func (q *fifo) finished(ids []string, exitStatus StatusValue, err error) {
+    for _, id := range ids {
+        if taskEntry, ok := q.running[id]; ok {
+            taskEntry.error = NewErrExternal(err)
+            close(taskEntry.done)   // ← 关键：关闭 done channel，唤醒所有 Wait
+            delete(q.running, id)
+        } else {
+            q.removeFromPendingAndWaiting(id)  // 还没被 Agent 拉取，直接删除
+        }
+    }
+}
+```
+
+**Pending vs Running 的区别**：
+- **Pending**：还在队列中未分配给 Agent → 从 `pending`/`waitingOnDeps` 链表删除，永远不会执行
+- **Running**：已分配给 Agent 正在执行 → `close(entry.done)` 通知 Agent 的 `Wait()` goroutine
+
+#### 阶段 2：Pending Workflow/Step 状态落库
+
+```go
+// Running 的 Workflow 不改 DB 状态（等 Agent 上报）
+// Pending 的直接标记为 Skipped
+for _, workflow := range workflows {
+    if workflow.State == StatusPending {
+        UpdateWorkflowToStatusSkipped(store, *workflow)
+    }
+    for _, step := range workflow.Children {
+        if step.State == StatusPending {
+            UpdateStepToStatusSkipped(store, *step, 0, StatusCanceled)
+        }
+    }
+}
+```
+
+#### 阶段 3：Pipeline 状态落库
+
+```go
+hasPendingOnly := true
+for _, w := range workflows {
+    if w.State != StatusPending { hasPendingOnly = false }
+}
+
+plState := StatusKilled
+if hasPendingOnly {
+    plState = StatusCanceled  // 全是 Pending，标记 Canceled（更轻量）
+}
+
+killedPipeline, _ := UpdateToStatusKilled(store, *pipeline, cancelInfo, plState)
+// ← 设置 Finished=now, CancelInfo=CancelInfo{CanceledByUser, SupersededBy}
+```
+
+**StatusKilled vs StatusCanceled 的区别**：
+| 状态 | 触发条件 | 含义 |
+|------|---------|------|
+| `StatusCanceled` | 全部 Workflow 都是 Pending | 还没开始跑就被取消了 |
+| `StatusKilled` | 至少有一个 Workflow 是 Running | 已经在执行中被强制终止 |
+
+#### 阶段 4：通知下游
+
+```go
+updatePipelineStatus(ctx, _forge, killedPipeline, repo, user)  // 通知 Forge（如 GitHub commit status）
+publishToTopic(ctx, killedPipeline, repo)                       // 通知 PubSub（WebSocket UI 推送）
+```
+
+### 12.3 gRPC 桥接：`RPC.Wait()`
+
+**位置**：`server/rpc/rpc.go:112`
+
+Agent 在执行 Workflow 的同时，会起一个 goroutine 调用 `RPC.Wait(workflowID)`，这是取消信号的**唯一传输通道**：
+
+```go
+func (s *RPC) Wait(c context.Context, workflowID string) (canceled bool, err error) {
+    // ... 权限检查 ...
+    err = s.scheduler.Wait(c, workflowID)  // ← 阻塞调用
+    if errors.Is(err, queue.ErrCancel) {
+        return true, nil  // ← 明确返回 canceled=true
+    }
+    return false, err
+}
+```
+
+`fifo.Wait()` 的实现：
+```go
+func (q *fifo) Wait(ctx context.Context, taskID string) error {
+    state := q.running[taskID]
+    if state != nil {
+        select {
+        case <-ctx.Done():
+        case <-state.done:       // ← 阻塞在这里，直到 Cancel() 时 close()
+            if errors.Is(state.error, ErrCancel) {
+                return ErrCancel  // ← 向上传递取消错误
+            }
+        }
+    }
+    return nil
+}
+```
+
+**channel 关闭的广播语义**：`close(ch)` 会让所有正在 `<-ch` 上等待的 goroutine 同时被唤醒，确保多 Agent 场景下所有监听者都收到取消信号。
+
+### 12.4 Agent 侧：`runner.Run()` 的取消监听
+
+**位置**：`agent/runner.go:63`
+
+每个正在运行的 Workflow 有 **3 个 goroutine** 协作：
+
+```
+Runner.Run(workflowCtx)
+    │
+    ├─ 主 goroutine: pipeline_runtime.Run() 执行实际 CI 步骤
+    │
+    ├─ goroutine A: 监听取消信号（Wait）
+    │     r.client.Wait(workflowCtx, workflow.ID)
+    │       → 阻塞 → 收到 canceled=true
+    │       → cancelWorkflowCtx(pipeline_errors.ErrCancel)
+    │
+    └─ goroutine B: 续租
+          r.client.Extend() 每 TaskTimeout/3 续租一次
+```
+
+关键代码（`agent/runner.go:117`）：
+```go
+go func() {
+    logger.Debug().Msg("start listening for server side cancel signal")
+
+    if canceled, err := r.client.Wait(workflowCtx, workflow.ID); err != nil {
+        cancelWorkflowCtx(err)
+    } else {
+        if canceled {
+            logger.Debug().Msg("server side cancel signal received")
+            cancelWorkflowCtx(pipeline_errors.ErrCancel)  // ← 触发 context 取消
+        }
+    }
+}()
+```
+
+`cancelWorkflowCtx(ErrCancel)` 的连锁反应：
+1. `workflowCtx` 被取消，所有子 context 也被取消
+2. `pipeline_runtime` 收到 context Done 信号，开始终止正在运行的 Step（Docker stop / Kubernetes delete pod）
+3. Step 进程被 kill，pipeline_runtime.Run() 返回 `pipeline_errors.ErrCancel`
+4. 最终调用 `r.client.Done(Canceled=true)` 上报完成
+
+### 12.5 Cron 场景下的完整取消时序
+
+以 Cron "nightly" 为例，旧 Pipeline #100 正在运行，新 Pipeline #101 触发：
+
+```
+时间  Server                                    Agent (执行 #100)
+ │    │                                          │
+ │    ├─ runCron("nightly") → 创建 #101           │
+ │    ├─ start(#101)                              │
+ │    │   └─ cancelPreviousPipelines()             │
+ │    │       └─ Cancel(#100, {SupersededBy:101})  │
+ │    │           ├─ Scheduler.ErrorAtOnce(wf_ids)│
+ │    │           │   └─ fifo.finished()           │
+ │    │           │        close(entry.done) ──────┼─── goroutine A 被唤醒
+ │    │           │                                │    canceled=true
+ │    │           │                                │    cancelWorkflowCtx(ErrCancel)
+ │    │           │                                │    ├─ context cancel 广播
+ │    │           │                                │    └─ pipeline_runtime 开始 kill 容器
+ │    │           ├─ DB: Pipeline #100 → Killed    │
+ │    │           └─ Forge: status=killed          │
+ │    │                                            │
+ │    │                                            ├─ 容器被终止
+ │    │                                            │  pipeline_runtime.Run() 退出
+ │    │                                            │  state.Canceled=true
+ │    │                                            │
+ │    │                       ◄────────────────────┼─ RPC.Done(#100, Canceled=true)
+ │    │                                            │
+ │    ├─ RPC.Done() 处理                           │
+ │    │   ├─ fifo.Done() 清理                      │
+ │    │   └─ Workflow/Pipeline 状态确认             │
+ ▼    ▼                                            ▼
+```
+
+### 12.6 取消信号传递的容错点
+
+| 环节 | 可能故障 | 后果 | 恢复机制 |
+|------|---------|------|---------|
+| `ErrorAtOnce` 调用失败 | DB/内存队列异常 | 信号没发到 Agent | 只打 Error 日志，**不阻塞** Cancel() 继续 |
+| Agent 与 Server 断连 | gRPC 中断 | `Wait()` 连接断开，Agent 收不到取消 | Agent 本地 context 不受影响，继续跑；**Agent 会在续租 Extend() 失败时感知** |
+| Agent 崩溃 | 进程挂掉 | 没有 Done 上报 | Server 端 TaskTimeout（默认 1h）到期后自动 `resubmitExpiredPipelines()` 从 running 中清理 |
+| `close(done)` 之前 Server 崩溃 | 服务重启 | 内存队列 `fifo` 全部丢失，Agent 的 Wait 全部断开 | 重启后 Agent 重新 `Next()` 拉任务，之前执行中的 Workflow 会因续租失败重新入队 |
+
+---
+
+## 十三、Cron 与手动触发互相 Cancel 的代码挂载点
+
+### 13.1 挂载点全景：Cancel 的三种调用来源
+
+```
+Cancel() 函数
+    ▲
+    │
+    ├─ 挂载点 A: cancelPreviousPipelines()  ← 自动重叠取消（本文重点）
+    │   server/pipeline/cancel.go:100
+    │   调用方: pipeline/start.go:31 start()
+    │   CancelInfo: {SupersededBy: newPipeline.Number}
+    │
+    ├─ 挂载点 B: API 手动取消
+    │   server/api/pipeline.go:494 PostCancel()
+    │   CancelInfo: {CanceledByUser: user.Login}
+    │
+    └─ 挂载点 C: PR 审批被拒
+        server/pipeline/approve.go Decline()
+        CancelInfo: {ReviewedBy: reviewer, Reviewed: timestamp}
+```
+
+### 13.2 挂载点 A：`cancelPreviousPipelines` 的匹配逻辑详解
+
+**位置**：`server/pipeline/cancel.go:100`
+
+调用时机：`pipeline.Create()` → `start()` 的最开始，在入队之前执行。
+
+#### 前置条件检查：Repo 配置开关
+
+```go
+eventIncluded := slices.Contains(repo.CancelPreviousPipelineEvents, pipeline.Event)
+if !eventIncluded {
+    return nil  // ← 直接返回，不取消任何东西
+}
+```
+
+`repo.CancelPreviousPipelineEvents` 的来源：
+- Repo 创建时：继承全局 `server.Config.Pipeline.DefaultCancelPreviousPipelineEvents`（`cmd/server/setup.go:211`）
+- Repo 更新时：PATCH API 可覆盖（`server/api/repo.go:285`）
+- 默认值：`nil`（空切片，**默认不开启任何重叠取消**）
+
+所以，如果管理员没配置这个全局开关，所有触发方式之间都**不会互相取消**，即使事件匹配。
+
+#### 事件匹配表（实际代码行为）
+
+匹配函数（`cancel.go:120`）：
+```go
+pipelineNeedsCancel := func(active *model.Pipeline) bool {
+    if active.Event != pipeline.Event { return false }  // 强制：必须同 Event
+    switch pipeline.Event {
+    case model.EventPush:
+        return pipeline.Branch == active.Branch          // Push: 按 Branch
+    default:
+        return pipeline.Refspec == active.Refspec        // 其他: 按 Refspec
+    }
+}
+```
+
+各 Event 的 Refspec 字段实际填充情况：
+
+| Event | Refspec 来源 | 实际值 | 匹配效果 |
+|-------|-------------|--------|---------|
+| `push` | Forge Webhook 赋值 | 空字符串 | 走 `case EventPush` 分支，用 Branch 匹配 ✅ |
+| `cron` | `cron_scheduler.CreatePipeline()` | **空字符串**（Refspec 未赋值） | 走 default 分支，按 Refspec 匹配 → 同 Repo 所有 Cron 互相取消 ❌ |
+| `manual` | `api/pipeline.go:91 createTmpPipeline()` | **空字符串**（Refspec 未赋值） | 走 default 分支，按 Refspec 匹配 → 同 Repo 所有 Manual 互相取消 ❌ |
+| `pull_request` | Forge 驱动赋值（如 GitLab） | `"source:target"` | 走 default 分支，PR 同 ID 互相取消 ✅ |
+| `pull_request_closed` | Forge 驱动 | `"source:target"` | 同上 ✅ |
+| `tag` | Forge 驱动 | 空 / tag 名 | 依赖 Forge 实现 |
+
+**关键发现**：
+- Cron 之间不是按 Cron 名取消，而是按 Refspec（空字符串）匹配 → **同 Repo 的所有 Cron Pipeline 会互相取消，即使是不同 Cron 任务**
+- Manual 之间不是按 Branch 取消，而是按 Refspec（空字符串）匹配 → **同 Repo 的所有手动 Pipeline 会互相取消，即使是不同分支**
+- Cron 和 Manual 之间因 Event 不同，**永远不会互相取消**
+
+### 13.3 Cron ↔ Manual 的 Cancel 交互矩阵
+
+实际代码行为（假设 Repo 已配置 `CancelPreviousPipelineEvents = [cron, manual, push]`）：
+
+| 新触发 \ 旧活跃 | Cron "nightly" (main) | Cron "weekly" (main) | Manual (main) | Manual (dev) | Push (main) |
+|-----------------|----------------------|---------------------|---------------|-------------|------------|
+| **Cron "nightly"** | ✅ Cancel | ✅ Cancel ❗ | ❌ 不取消 | ❌ 不取消 | ❌ 不取消 |
+| **Cron "weekly"** | ✅ Cancel ❗ | ✅ Cancel | ❌ 不取消 | ❌ 不取消 | ❌ 不取消 |
+| **Manual (main)** | ❌ 不取消 | ❌ 不取消 | ✅ Cancel | ✅ Cancel ❗ | ❌ 不取消 |
+| **Manual (dev)** | ❌ 不取消 | ❌ 不取消 | ✅ Cancel ❗ | ✅ Cancel | ❌ 不取消 |
+| **Push (main)** | ❌ 不取消 | ❌ 不取消 | ❌ 不取消 | ❌ 不取消 | ✅ Cancel |
+
+标记 ❗ 的是与直觉不符的行为：
+- **Cron 之间误杀**："nightly" 触发会取消 "weekly"（因为两者 Refspec 都是空）
+- **Manual 之间跨分支误杀**：main 分支的手动执行会取消 dev 分支的手动执行（Refspec 都是空）
+
+### 13.4 配置路径：如何让 Cron 支持重叠取消
+
+要让 Cron Pipeline 能被重叠取消，需要两级配置都到位：
+
+```
+[CLI flag] --default-cancel-previous-pipeline-events
+    │
+    ▼
+server.Config.Pipeline.DefaultCancelPreviousPipelineEvents  (cmd/server/setup.go:211)
+    │  Repo 激活时继承
+    ▼
+repo.CancelPreviousPipelineEvents  (server/model/repo.go:72)
+    │  可被 PATCH /repos/{id} 覆盖
+    ▼
+cancelPreviousPipelines() 检查: slices.Contains(events, pipeline.Event)
+    │
+    └─ 包含 "cron" → 执行取消逻辑
+       不包含 → 直接 return
+```
+
+如果配置为空（默认），则 `cancelPreviousPipelines` 直接 return，**即使 Cron 名相同也不会互相取消**，重叠 Pipeline 会并行执行。
+
+### 13.5 Cron 场景下的 CancelInfo 内容
+
+当 Cron Pipeline 被重叠取消时：
+
+```go
+// server/pipeline/cancel.go:147
+Cancel(ctx, _forge, _store, repo, user, active, &model.CancelInfo{
+    SupersededBy: pipeline.Number,  // ← 新 Pipeline 的 number
+})
+```
+
+被取消的 Pipeline 会存储：
+```go
+// server/model/pipeline.go
+type CancelInfo struct {
+    Canceled     bool   `json:"canceled"`      // true
+    CanceledBy   string `json:"canceled_by"`   // 空（非用户主动取消）
+    SupersededBy int64  `json:"superseded_by"` // 新 Pipeline 编号，如 101
+    ApprovedBy   string `json:"approved_by"`   // 空
+    Reviewed     int64  `json:"reviewed"`      // 0
+}
+```
+
+UI 可通过 `SupersededBy` 显示 "Pipeline #101 被 #102 替代"。
+
+---
+
+## 十四、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -1138,24 +1568,33 @@ cancelPreviousPipelines:
 | `server/cron/cron_test.go` | `TestCalcNewNext` — 时区解析测试（UTC vs Europe/Bucharest） |
 | `server/api/cron.go` | Cron REST API：RunCron（手动触发 cron）、CRUD（含 CalcNewNext 调用点） |
 | `server/api/hook.go` | Webhook 入口：PostHook — 解析 Forge webhook 并调用 pipeline.Create |
-| `server/api/pipeline.go` | Pipeline REST API：CreatePipeline（手动触发） |
+| `server/api/pipeline.go` | Pipeline REST API：CreatePipeline（手动触发）、PostCancel（手动取消）、createTmpPipeline |
+| `server/api/repo.go` | Repo 设置：CancelPreviousPipelineEvents 配置入口 |
 | `server/api/helper.go` | `handlePipelineErr` — API 层错误分类（ErrFiltered/ErrNotFound/ErrBadRequest） |
 | `server/pipeline/create.go` | Pipeline 创建主流程（四方汇合点），含 StatusError 落库 |
 | `server/pipeline/start.go` | start()、cancelPreviousPipelines 调用入口 |
-| `server/pipeline/cancel.go` | cancelPreviousPipelines 具体实现（事件隔离 + Cancel 逻辑） |
-| `server/pipeline/pipeline_status.go` | 状态更新函数（含 UpdateToStatusError） |
+| `server/pipeline/cancel.go` | Cancel() 四阶段实现、cancelPreviousPipelines 匹配逻辑 |
+| `server/pipeline/pipeline_status.go` | 状态更新函数（含 UpdateToStatusKilled/UpdateToStatusError） |
 | `server/pipeline/errors.go` | `ErrFiltered` — Pipeline 被条件过滤时的错误类型 |
 | `server/pipeline/restart.go` | Restart — 重启 StatusError 的 Pipeline |
+| `server/queue/queue.go` | Queue 接口定义、ErrCancel、ErrExternal 包装 |
+| `server/queue/fifo.go` | 内存 FIFO 队列实现：ErrorAtOnce → finished() → close(done) |
+| `server/scheduler/proxy.go` | Scheduler proxy：Queue + PubSub 的统一门面 |
+| `server/rpc/rpc.go` | gRPC 服务：Wait() 取消信号桥接、Init/Done 状态上报 |
+| `server/model/repo.go` | Repo 数据结构：CancelPreviousPipelineEvents 配置字段 |
+| `server/model/pipeline.go` | Pipeline 数据结构：CancelInfo、Refspec、Cron 字段 |
 | `server/store/datastore/cron.go` | CronListNextExecute、CronGetLock（CAS 乐观锁） |
 | `server/store/datastore/cron_test.go` | CronGetLock 测试（抢锁成功/失败场景） |
-| `server/store/datastore/pipeline.go` | CreatePipeline（事务+指数退避重试）、isUniqueConstraintError |
+| `server/store/datastore/pipeline.go` | CreatePipeline（事务+指数退避重试）、isUniqueConstraintError、GetActivePipelineList |
 | `server/store/datastore/init_cgo.go` | 支持的数据库驱动（sqlite3 + mysql + postgres） |
 | `server/store/datastore/init.go` | 非 cgo 构建的驱动（mysql + postgres only） |
 | `server/store/datastore/migration/011_cron_without_sec.go` | 秒字段迁移：6 字段 → 5 字段 |
 | `server/store/datastore/migration/027_add_cron_field.go` | Pipeline 增加 Cron 字段迁移 |
 | `server/model/cron.go` | Cron 数据结构 + Validate（内含 cron 表达式校验） |
-| `server/model/pipeline.go` | Pipeline 数据结构（含 Cron、Refspec 字段） |
 | `server/model/const.go` | WebhookEvent、StatusValue 枚举 |
-| `server/model/repo.go` | Repo 数据结构（含 CancelPreviousPipelineEvents 配置） |
 | `cmd/server/server.go` | Server 启动入口，Cron 调度在 errgroup 中无条件启动 |
+| `cmd/server/setup.go` | CLI flag → DefaultCancelPreviousPipelineEvents 全局默认配置 |
+| `cmd/agent/core/agent.go` | Agent 启动：Runner Pool、健康上报、连接管理 |
+| `agent/runner.go` | Runner.Run：3 goroutine 模型（主执行 + Wait 监听取消 + 续租） |
+| `agent/rpc/client_grpc.go` | Agent 侧 gRPC 客户端封装 |
 | `go.mod` | `github.com/gdgvda/cron v0.7.0`、`github.com/cenkalti/backoff/v5` |
