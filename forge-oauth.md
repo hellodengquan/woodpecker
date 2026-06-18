@@ -1278,7 +1278,432 @@ httpServer := &http.Server{
 
 ---
 
-## 10. 关键代码路径索引
+## 10. 深度分析（续三）：15s 硬编码超时风险、可配置 deadline 与 HTTP Server 超时对 gRPC 的冲突
+
+> 本章基于 `cmd/server/flags.go`、`cmd/server/grpc_server.go`、`server/rpc/serve.go`、`server/rpc/rpc.go:60-100`、`agent/rpc/dial.go:68-112`、`cmd/agent/core/flags.go`、`cmd/agent/core/agent.go:114-122`、`server/services/config/forge.go:88-91`、`server/services/setup.go:74`、`cmd/server/server.go:183-265` 的代码逐行核对。
+
+---
+
+### 10.1 仓库中已有的可配置 deadline/timeout 字段
+
+#### `WOODPECKER_FORGE_TIMEOUT`（已有，但用途不同）
+
+**文件**: `cmd/server/flags.go:446-451`
+
+```go
+&cli.DurationFlag{
+    Sources: cli.EnvVars("WOODPECKER_FORGE_TIMEOUT"),
+    Name:    "forge-timeout",
+    Usage:   "how many seconds before timeout when fetching the Woodpecker configuration from a Forge",
+    Value:   time.Second * 5,
+},
+```
+
+**用途**: 仅用于 Pipeline 配置文件获取（`config/forge.go:90` 的 `context.WithTimeout(c, f.timeout)`），**不涉及** OAuth token 刷新。
+
+**实现位置**: `server/services/setup.go:74`
+
+```go
+func setupConfigService(c *cli.Command, client *utils.Client) (config.Service, error) {
+    timeout := c.Duration("forge-timeout")
+    retries := c.Uint("forge-retry")
+    // ...
+    configFetcher := config.NewForge(timeout, retries, ...)
+}
+```
+
+#### `WOODPECKER_KEEPALIVE_MIN_TIME`（gRPC 服务端）
+
+**文件**: `cmd/server/flags.go:278-282`
+
+```go
+&cli.DurationFlag{
+    Sources: cli.EnvVars("WOODPECKER_KEEPALIVE_MIN_TIME"),
+    Name:    "keepalive-min-time",
+    Usage:   "server-side enforcement policy on the minimum amount of time a client should wait before sending a keepalive ping.",
+    // ← 无默认值（零值 = 不强制限制）
+},
+```
+
+**用途**: gRPC 服务端 `KeepaliveEnforcementPolicy`，控制 agent 客户端 keepalive ping 的最小间隔，**不涉及** HTTP 或 OAuth。
+
+#### Agent 侧 keepalive 参数
+
+| 参数 | Flag 名 | 环境变量 | 默认值 |
+|------|---------|---------|--------|
+| KeepaliveTime | `keepalive-time` | `WOODPECKER_KEEPALIVE_TIME` | **0**（Go gRPC 默认 = infinity，即不发 ping） |
+| KeepaliveTimeout | `keepalive-timeout` | `WOODPECKER_KEEPALIVE_TIMEOUT` | **20s** |
+| gRPC KeepaliveTime | `grpc-keepalive-time` | — | **0**（未注册为 flag，走 Go gRPC 默认 = infinity） |
+| gRPC KeepaliveTimeout | `grpc-keepalive-timeout` | — | **0**（未注册为 flag，走 Go gRPC 默认 = 20s） |
+
+**注意**：`agent.go:119-120` 引用了 `"grpc-keepalive-time"` 和 `"grpc-keepalive-timeout"`，但这两个 flag 在 `flags.go` 中**未定义**。`urfave/cli/v3` 对未定义的 flag 调用 `c.Duration()` 返回零值。因此：
+- `DialConfig.KeepaliveTime = 0` → `keepalive.ClientParameters.Time = 0` → Go gRPC 默认不发送 keepalive ping
+- `DialConfig.KeepaliveTimeout = 0` → `keepalive.ClientParameters.Timeout = 0` → Go gRPC 默认 20s
+
+#### `WOODPECKER_DEFAULT_PIPELINE_TIMEOUT` / `WOODPECKER_MAX_PIPELINE_TIMEOUT`
+
+**文件**: `cmd/server/flags.go:194-205`
+
+```go
+&cli.Int64Flag{
+    Name:  "default-pipeline-timeout",
+    Value: 60,  // 分钟
+},
+&cli.Int64Flag{
+    Name:  "max-pipeline-timeout",
+    Value: 120, // 分钟
+},
+```
+
+**用途**: Pipeline 执行超时，与 OAuth token 刷新无关。
+
+#### 结论：当前**不存在** OAuth token 刷新专用的可配置 timeout
+
+`forge.Refresh()` 中没有读取任何 flag 或环境变量。9.3 节方案中的 `tokenRefreshTimeout = 15 * time.Second` 是纯硬编码常量，无法通过环境变量调整。
+
+---
+
+### 10.2 15s 硬编码超时在不同环境下的误杀风险分析
+
+#### OAuth token refresh 的实际耗时分布
+
+| Forge | Token Endpoint | 正常耗时 | 429 排队耗时 | 极端情况 |
+|-------|---------------|---------|------------|---------|
+| GitHub (云) | `github.com/login/oauth/access_token` | 100-500ms | 1-10s（GitHub API rate limit 较宽松） | 跨洋网络延迟 2-5s |
+| GitLab (云) | `gitlab.com/oauth/token` | 100-500ms | 1-10s | 同上 |
+| GitLab (自托管) | `gitlab.internal/oauth/token` | 10-200ms | 取决于实例配置 | 负载高的自托管可能 > 15s |
+| Gitea (自托管) | `gitea.internal/login/oauth/access_token` | 5-50ms | 极少 429 | 弱机器 + 高并发可能 > 5s |
+| Bitbucket (云) | `bitbucket.org/site/oauth2/access_token` | 200-800ms | 1-10s | 同 GitHub |
+| Bitbucket DC (自托管) | `bbdc.internal/rest/oauth2/token` | 50-500ms | 取决于实例 | 大企业实例高峰期可能 > 15s |
+
+#### 误杀场景
+
+| 环境 | 场景 | 15s 是否够 | 误杀风险 |
+|------|------|-----------|---------|
+| K8s + 云 Forge (GitHub/GitLab/Bitbucket) | 正常 token refresh | ✅ 充裕 | 无 |
+| K8s + 云 Forge | 429 rate limit 排队 | ⚠️ 勉强 | GitHub 429 重试通常 1-5s，但极端排队 > 15s 会误杀 |
+| K8s + 自托管 Forge（内网） | 正常 | ✅ 充裕 | 无 |
+| K8s + 自托管 Forge（海外节点） | 跨洋 + 429 | ⚠️ | 高延迟 + 排队 > 15s 会误杀 |
+| 裸跑 Docker + 云 Forge | 正常 | ✅ 充裕 | 无 |
+| CI Runner（Woodpecker 自举） | agent→server→Forge | ⚠️ | 自举场景下 Forge 也是 Woodpecker 自身，token endpoint 响应可能因负载高而 > 15s |
+| 大企业 Bitbucket DC | 高峰期 | ❌ 不够 | BDC token endpoint 在高峰期可能需要 20-30s |
+
+#### 误杀后果
+
+15s 超时导致的误杀与无超时相比，**后果更可控**：
+
+| 对比维度 | 无超时（现状） | 15s 超时误杀 |
+|---------|--------------|-------------|
+| goroutine 泄漏 | ✅ 可能永久泄漏 | ❌ 15s 后释放 |
+| 用户可见 | 请求无限挂起 → nginx 504 → 但 goroutine 不死 | 刷新失败 → 500 toast → 请求快速返回 |
+| 下一次请求 | 同一请求仍在阻塞 | 新请求可立即进入（可能再次失败，但不会堆积） |
+| FD 占用 | 累积到 ulimit | 15s 后释放 FD |
+
+**结论**：15s 误杀的风险**远低于**无超时的泄漏风险。但在大企业自托管 Forge 场景下，15s 可能不够。
+
+#### 建议：将硬编码改为可配置 flag
+
+```go
+// cmd/server/flags.go 新增
+&cli.DurationFlag{
+    Sources: cli.EnvVars("WOODPECKER_FORGE_REFRESH_TIMEOUT"),
+    Name:    "forge-refresh-timeout",
+    Usage:   "maximum time to wait for an OAuth token refresh before giving up",
+    Value:   15 * time.Second,
+},
+```
+
+```go
+// server/forge/refresh.go 修改
+var tokenRefreshTimeout time.Duration // 由 main() 初始化时设置
+
+func Refresh(ctx context.Context, forge Forge, _store store.Store, user *model.User) {
+    // ...
+    refreshCtx, refreshCancel := context.WithTimeout(context.WithoutCancel(ctx), tokenRefreshTimeout)
+    defer refreshCancel()
+    // ...
+}
+```
+
+这样：
+- 默认仍为 15s，覆盖 95% 场景
+- 大企业 BDC 部署可设 `WOODPECKER_FORGE_REFRESH_TIMEOUT=30s`
+- 零值或负值 → 回退到无超时（向后兼容）
+
+---
+
+### 10.3 ReadHeaderTimeout / IdleTimeout 与 gRPC stream 长连接的冲突分析
+
+#### 关键事实：gRPC 和 HTTP Server 监听在不同端口
+
+**HTTP Server**（gin）监听 `:8000`（`server-addr` flag）
+**gRPC Server** 监听 `:9000`（`grpc-addr` flag）
+
+**文件**: `cmd/server/grpc_server.go:31`
+
+```go
+lis, err := net.Listen("tcp", c.String("grpc-addr"))
+```
+
+**文件**: `cmd/server/server.go:249-252`
+
+```go
+httpServer := &http.Server{
+    Addr:    c.String("server-addr"),
+    Handler: handler,
+}
+```
+
+两个服务器**完全独立**：不同的 `net.Listener`、不同的 `http.Server` / `grpc.Server` 实例。
+
+#### 冲突检查
+
+| 场景 | ReadHeaderTimeout=10s 影响 | IdleTimeout=120s 影响 | 冲突？ |
+|------|---------------------------|----------------------|--------|
+| HTTP API 请求（gin handler） | ✅ 限制读取 header 的时间 | ✅ 限制空闲 keepalive 连接 | 无冲突，这正是期望的行为 |
+| gRPC agent 连接（:9000） | ❌ **不经过** HTTP Server | ❌ **不经过** HTTP Server | **无冲突**——gRPC 有自己的监听器 |
+| Webhook 回调（:8000/gin） | ✅ 限制读取 header 的时间 | ✅ 空闲 120s 后断开 | 无冲突，webhook 请求是短连接 |
+| SSE 事件流（:8000/gin） | ✅ 限制读取 header 的时间 | ⚠️ 见下方分析 | **可能冲突** |
+
+#### SSE (Server-Sent Events) 场景的 IdleTimeout 影响
+
+Woodpecker 使用 SSE 推送实时事件给前端浏览器。SSE 是长连接 HTTP 响应（`Content-Type: text/event-stream`），客户端连接后服务端持续发送数据。
+
+`IdleTimeout` 的语义是：**连接空闲（无数据读取）超过该时间后关闭**。对于 SSE：
+- 服务端 → 客户端：持续发送事件 → 连接"非空闲"
+- 但 Go `http.Server` 的 `IdleTimeout` 仅作用于 **HTTP/1.x keepalive 连接中等待下一个请求的阶段**（即两个请求之间），不影响正在处理中的响应
+
+**结论**：`IdleTimeout=120s` **不会**断开正在发送 SSE 的连接。它只影响：
+- HTTP/1.x keepalive：两个请求之间的空闲等待，120s 后关闭
+- HTTP/2：`IdleTimeout` 等同于 HTTP/2 `idle_timeout`，120s 无活动帧后关闭
+
+SSE 连接在持续发送数据时不算空闲，不会被 `IdleTimeout` 断开。
+
+---
+
+### 10.4 gRPC keepalive 默认设置 vs HTTP Server timeout
+
+#### gRPC 服务端 keepalive 配置
+
+**文件**: `server/rpc/serve.go:59-64`
+
+```go
+grpcServer := grpc.NewServer(
+    grpc.StreamInterceptor(authorizer.StreamInterceptor),
+    grpc.UnaryInterceptor(authorizer.UnaryInterceptor),
+    grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+        MinTime: cfg.KeepaliveMinTime,  // 来自 WOODPECKER_KEEPALIVE_MIN_TIME，默认 0
+    }),
+)
+```
+
+**注意**：没有设置 `grpc.KeepaliveParams`（服务端主动 ping），只有 `EnforcementPolicy`（限制客户端 ping 频率）。
+
+当 `KeepaliveMinTime = 0` 时，Go gRPC 的默认行为是：
+- `EnforcementPolicy.MinTime = 0` → 不限制客户端 ping 频率
+- 服务端**不会**主动发送 keepalive ping
+
+#### gRPC 客户端（Agent）keepalive 配置
+
+**文件**: `agent/rpc/dial.go:78-81`
+
+```go
+keepaliveOpts := grpc.WithKeepaliveParams(keepalive.ClientParameters{
+    Time:    cfg.KeepaliveTime,    // 默认 0（infinity）
+    Timeout: cfg.KeepaliveTimeout, // 默认 0（Go gRPC 内部默认 20s）
+})
+```
+
+Go gRPC `keepalive.ClientParameters` 零值行为：
+- `Time = 0` → 不发送 keepalive ping（`infinity`）
+- `Timeout = 0` → 等待 ping 响应 20s（Go gRPC 内部默认值）
+
+**因此，默认配置下 agent 不会发送 keepalive ping**。这意味着：
+- 如果 agent 和 server 之间的网络静默（无数据交互），连接不会被检测为断开
+- `RPC.Next()` 是阻塞式 stream 调用，agent 等待任务时无数据传输，连接可能长时间静默
+
+#### 关键 RPC 调用的长连接特性
+
+**文件**: `server/rpc/rpc.go:63`
+
+```go
+func (s *RPC) Next(c context.Context, agentFilter rpc.Filter) (*rpc.Workflow, error) {
+    // ...
+    for {
+        task, err := s.scheduler.Poll(c, agent.ID, filterFn)  // 阻塞直到有任务
+        // ...
+    }
+}
+```
+
+`Next()` 是 gRPC **streaming RPC**，agent 长时间阻塞等待任务。在默认配置下：
+- 无 keepalive ping → TCP 层可能被中间设备（防火墙/NAT/负载均衡器）超时断开
+- gRPC 层不会感知断开 → agent 看起来"连着"但实际已断
+
+**这个问题与 HTTP Server 的 `ReadHeaderTimeout`/`IdleTimeout` 完全无关**——因为 gRPC 在独立端口（:9000）上运行。
+
+#### 如果用户配置了 gRPC keepalive（非默认）
+
+当用户设置 `WOODPECKER_KEEPALIVE_TIME=30s` 时：
+- agent 每 30s 发一次 keepalive ping
+- gRPC 服务端 `EnforcementPolicy.MinTime` 默认为 0（不限制）
+- ping/pong 在 gRPC 层面处理，**不经过 HTTP Server 的 :8000 端口**
+- HTTP Server 的 `ReadHeaderTimeout=10s` 和 `IdleTimeout=120s` **完全不影响** gRPC 连接
+
+---
+
+### 10.5 修正 9.3 节方案中 server.go 的 ReadHeaderTimeout / IdleTimeout
+
+#### 发现的问题
+
+9.3 节方案在 `cmd/server/server.go` 中添加了 `ReadHeaderTimeout: 10s` 和 `IdleTimeout: 120s`。经过核对：
+
+1. **gRPC 完全不受影响**——独立端口、独立 `http.Server`/`grpc.Server`，无冲突。
+2. **SSE 不受影响**——`IdleTimeout` 只影响 keepalive 连接的请求间空闲，不影响正在发送的响应。
+3. **Webhook 不受影响**——短连接。
+4. **`ReadHeaderTimeout=10s` 是安全的**——只限制读取 HTTP 请求 header 的时间，10s 远超任何正常客户端。这是 Go 安全最佳实践（防 Slowloris 攻击）。
+
+#### 但有一个微妙风险：`ReadHeaderTimeout` 对大请求的影响
+
+如果 Forge webhook 发送非常大的 request header（如 GitLab 在 header 中包含大量 CI 变量），超过 10s 读取时间会被切断。但这在实践中**不会发生**——HTTP header 通常在几十 KB 内，10s 足以读取。
+
+#### 修正后的 server.go 建议
+
+```go
+httpServer := &http.Server{
+    Addr:              c.String("server-addr"),
+    Handler:           handler,
+    ReadHeaderTimeout: 10 * time.Second,  // 防Slowloris，不影响gRPC/SSE
+    IdleTimeout:       120 * time.Second, // keepalive空闲超时，不影响SSE响应中
+    // 不设 ReadTimeout/WriteTimeout:
+    //   - Webhook 回调后的 pipeline 创建可能耗时（forge.Refresh + config fetch）
+    //   - SSE 长连接需要无限期写
+    //   - 由 refresh.go 内部的 forge-refresh-timeout 精确控制刷新时长
+}
+```
+
+对 `tlsServer` 做相同修改。
+
+---
+
+### 10.6 综合结论与修正方案
+
+#### 10.6.1 15s 硬编码 → 改为可配置 flag
+
+| 维度 | 硬编码 15s | 可配置 `WOODPECKER_FORGE_REFRESH_TIMEOUT`（默认 15s） |
+|------|-----------|---------------------------------------------------|
+| 覆盖 95% 场景 | ✅ | ✅ |
+| 大企业 BDC 部署 | ❌ 可能误杀 | ✅ 可设 30s |
+| 自托管高延迟 Forge | ❌ 可能误杀 | ✅ 可调整 |
+| 向后兼容 | — | ✅ 默认 15s 等价于硬编码 |
+| 运维可见性 | ❌ 只能改代码 | ✅ 环境变量 / flag |
+
+#### 10.6.2 ReadHeaderTimeout / IdleTimeout 安全确认
+
+| 组件 | 端口 | 受影响？ | 原因 |
+|------|------|---------|------|
+| gRPC agent 连接 | :9000 | ❌ 不受影响 | 独立 `grpc.Server` + 独立 `net.Listener` |
+| HTTP API 请求 | :8000 | ✅ 受益 | 防Slowloris、空闲连接回收 |
+| Webhook 回调 | :8000 | ✅ 受益 | 短连接不受 IdleTimeout 影响 |
+| SSE 事件流 | :8000 | ✅ 安全 | IdleTimeout 不影响正在发送的响应 |
+| gRPC keepalive | :9000 | ❌ 不受影响 | 独立端口，HTTP Server timeout 无法触及 |
+
+#### 10.6.3 修正后的完整方案
+
+**修改 1**: `cmd/server/flags.go` — 新增 flag
+
+```go
+&cli.DurationFlag{
+    Sources: cli.EnvVars("WOODPECKER_FORGE_REFRESH_TIMEOUT"),
+    Name:    "forge-refresh-timeout",
+    Usage:   "maximum time to wait for an OAuth token refresh before giving up (0 = no timeout)",
+    Value:   15 * time.Second,
+},
+```
+
+**修改 2**: `server/forge/refresh.go` — 从 flag 读取超时
+
+```go
+var TokenRefreshTimeout time.Duration = 15 * time.Second // 由 main() 初始化时覆盖
+
+func Refresh(ctx context.Context, forge Forge, _store store.Store, user *model.User) {
+    const tokenMinTTL = 1800
+    if refresher, ok := forge.(Refresher); ok {
+        if time.Now().UTC().Unix() < (user.Expiry - tokenMinTTL) {
+            return
+        }
+
+        key := fmt.Sprintf("refresh-%d", user.ID)
+
+        var refreshCtx context.Context
+        var refreshCancel context.CancelFunc
+        if TokenRefreshTimeout > 0 {
+            refreshCtx, refreshCancel = context.WithTimeout(context.WithoutCancel(ctx), TokenRefreshTimeout)
+        } else {
+            refreshCtx, refreshCancel = context.WithCancel(context.WithoutCancel(ctx))
+        }
+        defer refreshCancel()
+
+        result, err, _ := refreshGroup.Do(key, func() (any, error) {
+            userUpdated, err := refresher.Refresh(refreshCtx, user)
+            if err != nil {
+                return nil, err
+            }
+            if userUpdated {
+                if err := _store.UpdateUser(user); err != nil {
+                    log.Error().Err(err).Msg("fail to save user to store after refresh oauth token")
+                }
+            }
+            return &refreshResult{
+                AccessToken:  user.AccessToken,
+                RefreshToken: user.RefreshToken,
+                Expiry:       user.Expiry,
+            }, nil
+        })
+        if err != nil {
+            log.Error().Err(err).Msgf("refresh oauth token of user '%s' failed", user.Login)
+            return
+        }
+        if r, ok := result.(*refreshResult); ok {
+            user.AccessToken = r.AccessToken
+            user.RefreshToken = r.RefreshToken
+            user.Expiry = r.Expiry
+        }
+    }
+}
+```
+
+**修改 3**: `cmd/server/server.go` — 初始化时覆盖 + HTTP Server 超时
+
+```go
+// 在 router.Load 之前
+forge.TokenRefreshTimeout = c.Duration("forge-refresh-timeout")
+
+// HTTP server
+httpServer := &http.Server{
+    Addr:              c.String("server-addr"),
+    Handler:           handler,
+    ReadHeaderTimeout: 10 * time.Second,
+    IdleTimeout:       120 * time.Second,
+}
+```
+
+**修改 4**: `server/forge/refresh_test.go` — 新增边界测试
+
+```go
+func TestRefresh_ZeroTimeout(t *testing.T) {
+    // TokenRefreshTimeout=0 等价于无超时（向后兼容）
+    original := forge.TokenRefreshTimeout
+    forge.TokenRefreshTimeout = 0
+    defer func() { forge.TokenRefreshTimeout = original }()
+
+    // ... 验证无超时行为
+}
+```
+
+---
+
+## 11. 关键代码路径索引
 
 | 功能 | 文件 | 行号/函数 |
 |------|------|-----------|
@@ -1320,3 +1745,9 @@ httpServer := &http.Server{
 | Docker HEALTHCHECK | `docker/Dockerfile.server.alpine.multiarch.rootless:20` | `HEALTHCHECK CMD ping` |
 | Ping 子命令 | `cmd/server/health.go:29-63` | `pingTimeout = 1s` |
 | /healthz 端点 | `server/api/z.go:37-43` | `Health()`（仅检查 DB） |
+| gRPC Server 启动 | `server/rpc/serve.go:55-87` | `Serve()`，`KeepaliveEnforcementPolicy` |
+| gRPC Server 入口 | `cmd/server/grpc_server.go:30-45` | `runGrpcServer()`，端口 `:9000` |
+| Agent gRPC 客户端拨号 | `agent/rpc/dial.go:68-112` | `Dial()`，`WithKeepaliveParams` |
+| Agent Keepalive Flags | `cmd/agent/core/flags.go:105-115` | `keepalive-time`(0), `keepalive-timeout`(20s) |
+| Server Flags 定义 | `cmd/server/flags.go` | `forge-timeout`(5s), `keepalive-min-time`(0) |
+| Config Service 初始化 | `server/services/setup.go:73-79` | `setupConfigService()`，读取 `forge-timeout` |
