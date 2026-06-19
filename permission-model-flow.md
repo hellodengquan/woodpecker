@@ -674,6 +674,10 @@ HTTP 请求到达
 | 权限缓存层 | `server/router/middleware/session/repo.go` `server/cache/membership.go` `server/forge/refresh.go` | `SetPerm` Synced 字段、`membershipCache` ttlcache、`singleflight.Group` |
 | SSO账号合并 | `server/api/login.go` `server/store/datastore/user.go` | HandleAuth 查找策略 (GetUserByRemoteID → GetUserByLogin → CreateUser) |
 | Webhook鉴权 | `server/api/hook.go` `server/api/repo.go` `shared/token/token.go` | `PostHook`, `HookToken` 签发/校验, `keyFunc` 强制HS256, `getRepoFromToken` |
+| 跨Org资源共享 | `server/pipeline/items.go` `server/services/secret/db.go` `server/services/registry/db.go` `server/store/datastore/secret.go` | `parsePipeline` 三级聚合, `SecretListPipeline` 同名覆盖, `RegistryListPipeline` |
+| Extension叠加 | `server/services/secret/combined.go` `server/services/manager.go:104-120` | `SecretServiceFromRepo`, `combined.SecretListPipeline`, ed25519签名 |
+| Token体系 | `shared/token/token.go` `server/api/user.go:243-284` | 6种Token类型, `PostToken`/`DeleteToken` 签发吊销, `SignExpires` |
+| Rate Limit | **无内置实现** | 外部依赖 Forge/Nginx/WAF, Admin无豁免 |
 
 ---
 
@@ -1349,6 +1353,267 @@ POST /api/hook:
 - ❌ HookToken 无过期时间（永久有效，除非仓库重新激活/修复
 - ❌ 无一次性 nonce 防重放（依赖 Forge 端去重
 
+### 10.7 跨 Organization 的资源共享与权限边界
+
+Woodpecker 的 Secret、Registry、Environment 三类可共享资源均采用 **Global → Org → Repo 三级作用域** 模型，通过 `org_id` / `repo_id` 双字段组合判定归属层级，跨组织共享仅发生在 Global 层。
+
+#### 10.7.1 三级作用域判定逻辑
+
+```go
+// server/model/secret.go:69-81
+func (s Secret) IsGlobal() bool       { return s.RepoID == 0 && s.OrgID == 0 }
+func (s Secret) IsOrganization() bool { return s.RepoID == 0 && s.OrgID != 0 }
+func (s Secret) IsRepository() bool   { return s.RepoID != 0 && s.OrgID == 0 }
+```
+
+| 作用域 | org_id | repo_id | 可见范围 | 管理权限 |
+|--------|--------|---------|---------|---------|
+| Global | 0 | 0 | 全部仓库 | Admin 读写，普通用户只读脱敏 |
+| Organization | ≠0 | 0 | 该组织下所有仓库 | Org Member（admin=true）读写 |
+| Repository | 0 | ≠0 | 仅该仓库 | Repo Push 权限读写 |
+
+Registry 模型（`server/model/registry.go`）结构相同，共享同一套三级判定逻辑。
+
+#### 10.7.2 Pipeline 运行时资源聚合（跨组织注入路径）
+
+Pipeline 解析阶段通过 `parsePipeline` 函数聚合三级资源（`server/pipeline/items.go:38-155`）：
+
+```
+parsePipeline()
+  │
+  ├─ SecretServiceFromRepo(repo)          ← 按 repo 判断是否使用 repo 级 extension
+  │   └─ SecretListPipeline(repo, pipeline, netrc)
+  │       ├─ DB: repo_id=repoID OR org_id=repo.OrgID OR (org_id=0 AND repo_id=0)
+  │       └─ HTTP Extension: POST /secrets {repo, pipeline, netrc}
+  │
+  ├─ RegistryServiceFromRepo(repo)        ← 同理判断 repo 级 extension
+  │   └─ RegistryListPipeline(repo, pipeline, netrc)
+  │       ├─ DB: 同上三级 SQL
+  │       └─ HTTP Extension: POST /registries {repo, pipeline, netrc}
+  │
+  └─ EnvironmentService()                 ← 无 org 隔离，全局生效
+      └─ EnvironList(repo)                ← 返回 WOODPECKER_ENVIRONMENT 配置的所有键值对
+```
+
+**关键 SQL 查询**（`server/store/datastore/secret.go:32-40`）：
+```go
+func (s storage) SecretList(repo *model.Repo, includeGlobalAndOrgSecrets bool, p *model.ListOptions) ([]*model.Secret, error) {
+    var cond builder.Cond = builder.Eq{"repo_id": repo.ID}
+    if includeGlobalAndOrgSecrets {
+        cond = cond.Or(builder.Eq{"org_id": repo.OrgID}).
+            Or(builder.And(builder.Eq{"org_id": 0}, builder.Eq{"repo_id": 0}))
+    }
+    return secrets, s.paginate(p).Where(cond).OrderBy(orderSecretsBy).Find(&secrets)
+}
+```
+
+**同名覆盖优先级**（`server/services/secret/db.go:41-72`）：
+```
+Repo 级 > Org 级 > Global 级
+```
+遍历三组条件（IsRepository → IsOrganization → IsGlobal），用 `uniq` map 去重，先入先占，实现细粒度覆盖粗粒度。
+
+#### 10.7.3 Extension 叠加层的跨组织边界
+
+当仓库配置了 `SecretExtensionEndpoint` / `RegistryExtensionEndpoint` 时（`server/services/manager.go:104-120`）：
+
+```go
+func (m *manager) SecretServiceFromRepo(repo *model.Repo) secret.Service {
+    if repo.SecretExtensionEndpoint != "" {
+        return secret.NewCombined(m.secret,
+            secret.NewHTTP(repo.SecretExtensionEndpoint, m.client, repo.SecretExtensionNetrc))
+    }
+    return m.SecretService()
+}
+```
+
+合并策略（`server/services/secret/combined.go:37-74`）：
+1. 先从 DB 三级聚合获取 `baseSecrets`
+2. 再从 HTTP extension 获取 `extensionSecrets`
+3. **Extension 优先**：extension 返回的同名 Secret 覆盖 DB 中的
+4. Extension 失败降级：仅 log warning，继续使用 baseSecrets
+
+**签名安全**：所有 extension HTTP 请求使用 ed25519 签名（`server/services/utils/http.go:45-84`）：
+```go
+signer, _ := httpsign.NewEd25519Signer(ed25519Key,
+    httpsign.NewSignConfig(),
+    httpsign.Headers("@request-target", "content-digest"))
+```
+公钥可通过 `/api/signature/public-key` 获取验证。
+
+#### 10.7.4 API 层权限边界
+
+| API 路径 | 认证要求 | 跨组织可见性 |
+|---------|---------|------------|
+| `GET /api/secrets` | MustUser | 全局 Secret 列表（值脱敏） |
+| `POST/PATCH/DELETE /api/secrets` | MustAdmin | 全局 Secret 管理 |
+| `GET /api/orgs/:org_id/secrets` | MustOrgMember(false) | 仅本组织 Secret |
+| `POST /api/orgs/:org_id/secrets` | MustOrgMember(true=admin) | 仅本组织管理 |
+| `GET /api/repos/:repo_id/secrets` | MustPush | 仅本仓库 Secret |
+| `GET /api/badges/:owner/:repo/status.svg` | **无需认证** | 公开访问 |
+| `GET /api/stream/events` | SetUser（可选） | 公共 topic + 用户私有 topic |
+| `GET /api/stream/logs/:repo_id/:pipeline/:step_id` | SetRepo + SetPerm + MustPull | 需仓库读权限 |
+
+**关键边界**：
+- ✅ 组织级 Secret/Registry 严格按 `org_id` 隔离，不同组织不可互访
+- ✅ 全局资源对所有认证用户可见（但值脱敏，仅 Admin 可管理）
+- ✅ Badge 端点完全无认证，仅展示公开仓库的流水线状态
+- ❌ **不存在跨组织资源共享授权机制**（如 Org A 授权 Org B 访问其 Secret）
+- ❌ **Environment 变量无 org 隔离**，全局生效无法按组织区分
+
+---
+
+### 10.8 临时调试访问授权（Token 体系与生命周期）
+
+Woodpecker 定义了 6 种 Token 类型（`shared/token/token.go:30-37`）：
+
+```go
+const (
+    UserToken       Type = "user"   // 个人访问令牌（CLI 使用）
+    SessToken       Type = "sess"   // UI 会话令牌（需 CSRF 校验）
+    HookToken       Type = "hook"   // 仓库 Webhook 令牌
+    CsrfToken       Type = "csrf"   // CSRF 防护令牌
+    AgentToken      Type = "agent"  // Agent 注册/认证令牌
+    OAuthStateToken Type = "oauth-state" // OAuth 状态防重放令牌
+)
+```
+
+#### 10.8.1 UserToken：长期个人访问令牌
+
+**签发**（`server/api/user.go:243-253`）：
+```go
+func PostToken(c *gin.Context) {
+    user := session.User(c)
+    t := token.New(token.UserToken)
+    t.Set("user-id", strconv.FormatInt(user.ID, 10))
+    tokenString, _ := t.Sign(user.Hash)  // 签名密钥 = user.Hash (32字节随机)
+    c.String(http.StatusOK, tokenString)
+}
+```
+
+**吊销与重签**（`server/api/user.go:264-284`）：
+```go
+func DeleteToken(c *gin.Context) {
+    user := session.User(c)
+    user.Hash = base32.StdEncoding.EncodeToString(
+        random.GetRandomBytes(32),  // 重新生成 Hash
+    )
+    _store.UpdateUser(user)       // 持久化新 Hash → 旧 Token 全部失效
+    t := token.New(token.UserToken)
+    t.Set("user-id", strconv.FormatInt(user.ID, 10))
+    tokenString, _ := t.Sign(user.Hash)
+    c.String(http.StatusOK, tokenString)  // 返回新 Token
+}
+```
+
+**生命周期分析**：
+
+| Token 类型 | 过期时间 | 签名密钥 | 吊销方式 | 存储位置 |
+|-----------|---------|---------|---------|---------|
+| UserToken | **永不过期** | `user.Hash` (DB) | 重生成 Hash（全量吊销） | 用户自行保存 |
+| SessToken | OAuth session 有效期 | `user.Hash` (DB) | 同上 | Cookie `user_sess` |
+| HookToken | **永不过期** | `repo.Hash` (DB) | 重新激活/修复仓库 | Forge Webhook URL |
+| CsrfToken | Session 有效期 | `user.Hash` (DB) | Session 结束 | Cookie + Header |
+| AgentToken | **永不过期** | `agent.Token` (DB) | 删除 Agent | Agent 配置文件 |
+| OAuthStateToken | 短暂（分钟级） | `server.Config.Server.SessionSecret` | 一次性使用 | URL query |
+
+#### 10.8.2 SessToken：UI 会话令牌
+
+**签发路径**（`server/api/login.go` → `server/router/middleware/token/token.go`）：
+1. OAuth 回调成功后，调用 `token.New(token.SessToken).SignExpires(user.Hash, exp)`
+2. `exp` 来自 `WOODPECKER_SESSION_EXPIRES` 配置（默认不设置，浏览器关闭即失效）
+3. 写入 Cookie `user_sess`，同时签发 CsrfToken 写入 `csrf_token` Cookie
+
+**校验中间件**（`server/router/middleware/session/user.go:SetUser()`）：
+```
+Authorization: Bearer <token>  →  ParseRequest → Parse
+Cookie: user_sess=<token>      →  ParseRequest → Parse
+```
+- UserToken 和 SessToken 都可认证成功
+- CSRF 校验仅对 SessToken 生效（`shared/token/token.go:102-114`）
+
+#### 10.8.3 OAuthStateToken：一次性防重放令牌
+
+**签发**（`server/api/login.go:53-65`）：
+```go
+func HandleAuth(c *gin.Context) {
+    t := token.New(token.OAuthStateToken)
+    t.Set("redirect", ...)
+    t.Set("forge-id", ...)
+    state, _ := t.SignExpires(server.Config.Server.SessionSecret, time.Now().Add(time.Hour).Unix())
+    // state 写入 URL redirect
+}
+```
+
+**校验**：OAuth 回调时验证 `state` 参数，确保请求由本系统发起，防止 CSRF 攻击。一次性使用后丢弃。
+
+#### 10.8.4 设计缺口：无短期调试 / Preview Token
+
+| 缺失能力 | 说明 |
+|---------|------|
+| ❌ 无 TTL 限定的短期 Token | UserToken/HookToken 均永不过期，无法签发"仅 1 小时有效"的临时调试凭证 |
+| ❌ 无 Scoped Token | 所有 UserToken 拥有用户完整权限，无法限制为只读或特定仓库 |
+| ❌ 无 Token 审计日志 | Token 签发/吊销不记录日志，无法追踪使用情况 |
+| ❌ 无按 Token 吊销 | `DeleteToken` 重生成 `user.Hash` 吊销该用户所有 Token，无法单独吊销 |
+| ✅ 全量吊销机制 | `DeleteToken` 确保所有旧 Token 立即失效 |
+
+---
+
+### 10.9 API Rate Limit 与权限耦合分析
+
+#### 10.9.1 Woodpecker 服务端无内置 Rate Limit
+
+经全量代码搜索（关键词 `rateLimit` / `RateLimit` / `limiter` / `throttle` / `quota`），Woodpecker 服务端 **不包含任何 API 速率限制实现**。
+
+关键证据：
+- `server/router/router.go:37-78`：全局中间件链仅包含 `Recovery` + `SetUser` + `token.Refresh` + 安全头，无 rate limit 中间件
+- `go.mod`：无 `golang.org/x/time/rate` 或 `github.com/ulule/limiter` 等限流库依赖
+- 所有 API handler 直接处理请求，无前置限流检查
+
+#### 10.9.2 外部限流依赖
+
+Woodpecker 的 Rate Limit 完全依赖外部基础设施：
+
+| 防护层 | 实现方式 | 作用范围 |
+|-------|---------|---------|
+| Forge 端 | GitHub/GitLab/Gitea API Rate Limit | 限制 Forge API 调用频率 |
+| 反向代理 | Nginx `limit_req` / HAProxy rate limiting | 全局 HTTP 请求限流 |
+| WAF | 云厂商 WAF 规则 | DDoS / 暴力破解防护 |
+| Forge Webhook | Forge 端重试与超时控制 | Webhook 回调频率限制 |
+
+Forge SDK 内置限流示例（`server/forge/github/github.go`）：
+```go
+// GitHub SDK 自带 rate limit 处理
+// transport 层自动检测 X-RateLimit-Remaining 头
+// 触发限流时等待 Reset 时间后重试
+```
+
+#### 10.9.3 权限与 Rate Limit 耦合度
+
+**结论：完全解耦，Admin 无特殊豁免**
+
+| 维度 | 分析 |
+|------|------|
+| 权限检查位置 | Gin 中间件层（`session.MustAdmin` / `session.MustPush` 等） |
+| 限流检查位置 | **不存在** → 外部代理层 |
+| Admin 豁免 | **不适用**（Woodpecker 层无限流） |
+| 用户/Token 区分 | **不适用**（无按用户限流） |
+| 端点级别限流 | **不适用**（无按端点限流） |
+
+唯一与频率相关的内部机制：
+
+1. **OAuth Token 刷新 singleflight**（`server/forge/refresh.go:58-101`）：并发刷新请求合并为单次，防止 refresh token 失效
+2. **Extension HTTP 请求指数退避**（`server/services/utils/http.go:98-207`）：最多重试 3 次，退避间隔递增
+3. **Badge 无认证端点**：完全暴露，无限流，理论上可被滥用为信息泄露或 DoS 载体
+
+#### 10.9.4 安全影响
+
+- ❌ **无限流**：恶意用户可通过高频 API 调用耗尽服务器资源或 Forge API 配额
+- ❌ **Admin 无额外保护**：Admin 账户被盗后可无限制执行高权限操作
+- ❌ **Webhook 端点暴露**：`POST /api/hook` 无认证前置（HookToken 在 handler 内校验），无限流
+- ❌ **Badge/CC 端点完全开放**：无需认证，可被刷量
+- ✅ **Forge 端限流兜底**：Forge API 调用受 GitHub/GitLab 限流保护
+
 ---
 
 ## 六、设计特点总结
@@ -1370,3 +1635,6 @@ POST /api/hook:
 15. **两级缓存架构**：数据库持久缓存（1小时）+ 内存缓存（10分钟）+ singleflight 去重，时间驱动失效而非主动推送
 16. **SSO 账号自动迁移**：登录时优先按 ForgeRemoteID 查找，未命中回退按 login 查找，支持同一 forge 内用户账号迁移自动合并
 17. **Webhook 双层鉴权**：Woodpecker 签发的仓库独立 HookToken JWT + Forge 端 payload 签名校验，强制 HS256 防算法混淆攻击
+18. **三级资源隔离**：Secret/Registry/Environment 三级作用域严格按 org_id/repo_id 隔离，同名细粒度覆盖粗粒度，Extension 层叠加优先
+19. **全量吊销 Token**：UserToken/HookToken 永不过期，吊销依赖重生成签名密钥使全部旧 Token 失效，无单 Token 吊销能力
+20. **无限流设计**：服务端无 API Rate Limit，权限检查与限流完全解耦，依赖外部反向代理/Forge 端限流兜底
