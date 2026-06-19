@@ -51,6 +51,71 @@ type User struct {
         └─ 签发会话 cookie
 ```
 
+### 1.2.1 OAuth Token 申请完整代码路径
+
+**统一入口**：`server/api/login.go:47-323` `HandleAuth`
+
+```
+用户访问 GET /authorize （Handler: HandleAuth）
+    │
+    ├─ Step1: 解析 ForgeID 和 code 参数
+    │   └─ 无 code → 进入「授权前阶段」，有 code → 进入「回调阶段」
+    │
+    ├─ 授权前阶段（req.Code 为空）：
+    │   ├─ 构造 state token = JWT(kind=CsrfToken, forge_id=forgeID)
+    │   │   └─ 有效期：stateTokenDuration = 5 分钟
+    │   │
+    │   ├─ 调用 Forge.Login(ctx, &OAuthRequest{State: stateToken})
+    │   │   │
+    │   │   ├─ **Gitea/Forgejo** (`server/forge/gitea/gitea.go:112-147`)：
+    │   │   │   ├─ config.AuthCodeURL(state) 生成授权 URL
+    │   │   │   └─ 带 scope = read:org, read:user, write:repository, read:repository
+    │   │   │
+    │   │   ├─ **GitHub** (`server/forge/github/github.go:107-154`)：
+    │   │   │   └─ config.AuthCodeURL(state) + scope=read:org, repo
+    │   │   │
+    │   │   ├─ **GitLab** (`server/forge/gitlab/gitlab.go:115-156`)：
+    │   │   │   └─ config.AuthCodeURL(state) + scope=api, read_user
+    │   │   │
+    │   │   └─ **Bitbucket**：scope=project, team, repository
+    │   │
+    │   └─ Forge 返回 (nil, redirectURL, nil)
+    │       └─ HTTP 303 → redirectURL（跳转到 Forge 授权页
+    │
+    └─ 回调阶段（req.Code 非空）：
+        ├─ 解析 state token，校验 forge_id
+        │   └─ 失败 → 重定向 /login?error=...
+        │
+        ├─ 第二次调用 Forge.Login(ctx, &OAuthRequest{Code: code, State: state})
+        │   │
+        │   ├─ 所有 Provider 共同流程：
+        │   │   ├─ config.Exchange(oauth2Ctx, req.Code)
+        │   │   │   └─ 换取 AccessToken/RefreshToken/Expiry
+        │   │   │
+        │   │   ├─ 用新 AccessToken 构建 HTTP Client
+        │   │   │
+        │   │   └─ 查询 Forge 用户资料：
+        │   │       ├─ Gitea: client.GetMyUserInfo() → ID/UserName/Email/AvatarURL
+        │   │       ├─ GitHub: client.Users.Get(ctx, "") + ListEmails 匹配已验证邮箱
+        │   │       ├─ GitLab: client.Users.CurrentUser() → Username/Email/AvatarURL
+        │   │       └─ Bitbucket: client.User.Current()
+        │   │
+        │   └─ 返回 User 对象填充:
+        │       {Login, Email, Avatar, AccessToken, RefreshToken, Expiry, ForgeRemoteID}
+        │
+        ├─ 组织白名单检查 Permissions.Orgs.IsMember
+        │
+        ├─ DB GetUserByRemoteID(ForgeID, ForgeRemoteID) 查找本地用户
+        │   ├─ 存在 → 更新字段 + 创建/关联个人组织
+        │   └─ 不存在 → CreateUser(事务内: 先建/找同名Org IsUser=true, 再插入users表)
+        │
+        ├─ updateRepoPermissions 同步仓库权限（见 3.2）
+        │
+        └─ 生成 SessToken (kind=SessToken, user-id=id)
+            └─ 签名 user.Hash, 有效期 SessionExpires
+            └─ Set-Cookie 写入浏览器
+```
+
 ### 1.3 会话管理
 
 **会话中间件**：`server/router/middleware/session/user.go:42-75` 的 `SetUser`
@@ -494,6 +559,14 @@ HTTP 请求到达
 | Agent权限校验 | `server/rpc/rpc.go` `server/rpc/sanitize.go` | `checkAgentPermissionByWorkflow`, `Next` |
 | Agent过滤 | `server/rpc/filter.go` | `createFilterFunc`, 任务标签匹配 |
 | Agent客户端 | `agent/rpc/auth_interceptor.go` | `AuthInterceptor`, `scheduleRefreshToken` |
+| OAuth申请代码路径 | `server/api/login.go` + `server/forge/github/gitlab/gitea` | `HandleAuth`, `Config.Exchange`, `Forge.Login` 各Provider实现 |
+| 仓库重命名/迁移 | `server/api/hook.go` `server/model/repo.go` | `PostHook`, `Redirection`, `Repo.Update`, `ForgeRemoteID` 稳定主键 |
+| 用户硬删除清理 | `server/store/datastore/user.go` `server/store/datastore/org.go` `server/store/datastore/repo.go` `server/store/datastore/pipeline.go` | `DeleteUser`, `orgDelete`, `deleteRepo`, `deletePipeline` 五级级联清理 |
+| 用户管理API | `server/api/users.go` | `GetUsers/GetUser/PatchUser/PostUser/DeleteUser` |
+| 组织查找/创建 | `server/store/datastore/org.go` | `orgFindByName(forgeID+name)`, `OrgLookup` |
+| 多Forge隔离查询 | `server/store/datastore/user.go` | `GetUserByRemoteID(forgeID,remoteID)`, `GetUserByLogin(forgeID,login)` |
+| GitLab刷新实现 | `server/forge/gitlab/gitlab.go:160-179` | `Refresh()` TokenSource自动刷新 |
+| GitHub刷新实现 | `server/forge/github/github.go:158-181` | `Refresh()` 仅RefreshToken非空时触发 |
 
 ---
 
@@ -603,6 +676,38 @@ MembershipService.Get:
 ```go
 // server/api/user.go:216-233
 RefreshRepos → updateRepoPermissions → 同登录时全量同步逻辑
+```
+
+### 7.5 Token 刷新各 Provider 代码路径对比
+
+**Refresher 接口声明** (`server/forge/forge.go`)：
+
+```go
+type Refresher interface {
+    Refresh(ctx context.Context, u *model.User) (bool, error)
+}
+```
+
+**各 Provider 实现对比**：
+
+| Forge Provider | 实现 `Refresher`? | Token 类型 | 刷新机制 | 代码位置 |
+|--------------|-------------------|------------|---------|----------|
+| **GitHub** | ✅ 仅有 RefreshToken 时生效 | Personal access token / OAuth | `oauth2.Config.TokenSource().Token()` 自动检测并刷新 | `server/forge/github/github.go:158-181` |
+| **GitLab** | ✅ 完整实现 | OAuth token（2小时过期） | `config.RedirectURL = ""` → `TokenSource().Token()` Go 标准库自动刷新 | `server/forge/gitlab/gitlab.go:160-179` |
+| **Gitea** | ✅ 完整实现 | OAuth token | 同 GitLab 流程 | `server/forge/gitea/gitea.go:?` (通过 `oauth2Config` 初始化) |
+| **Forgejo** | ✅ 完整实现 | OAuth token | 同 Gitea | `server/forge/forgejo/forgejo.go` |
+| **Bitbucket Cloud** | ✅ 完整实现 | OAuth token | 标准 TokenSource 自动刷新 | `server/forge/bitbucket/bitbucket.go` |
+| **Bitbucket DC** | ✅ 完整实现 | OAuth token | 标准 TokenSource 自动刷新 | `server/forge/bitbucketdatacenter/bitbucketdatacenter.go` |
+
+**统一刷新调度点** (`server/forge/refresh.go:58-101`)：
+
+```
+每次调用 Forge 接口前注入：
+    └─ router middleware token.Refresh
+        └─ 检查过期阈值：Expiry - 1800秒
+            └─ 实现 Refresher? → 是 → singleflight(Refresh)
+                ├─ 成功 → user.{AccessToken, RefreshToken, Expiry} 更新后 persist
+                └─ 失败 → log.Error 但返回旧 token 继续使用
 ```
 
 ---
@@ -819,6 +924,148 @@ checkAgentPermissionByWorkflow(agent, workflowID, pipeline, repo)
 
 ---
 
+## 十、组织/仓库重命名与迁移的权限映射，及用户清理残留机制
+
+### 10.1 仓库重命名与跨组织迁移的权限重映射
+
+**稳定主键设计原则**：
+
+Woodpecker 以 `ForgeRemoteID`（Forge 端的仓库/用户/组织的不可变内部 ID）作为稳定关联键，而非依赖可变的 `Owner/Name/FullName` 字符串。
+
+**重命名检测与处理** (`server/api/hook.go:177-191`)：
+
+```
+Webhook 触发 → PostHook handler：
+    │
+    ├─ 步骤 1：HookToken 解析出仓库后，比较：
+    │   repo.FullName(当前) vs repoFromForge.FullName(来自webhook)
+    │
+    ├─ 步骤 2：不一致则记录重定向：
+    │   _store.CreateRedirection({RepoID: repo.ID, FullName: repo.FullName})
+    │   └─ 历史URL → 新URL 自动跳转（Redirection 表
+    │
+    ├─ 步骤 3：repo.Update(repoFromForge) 更新本地元数据：
+    │   {ForgeRemoteID, Owner, Name, FullName, Avatar, ForgeURL,
+    │    Clone, CloneSSH, Branch, Visibility, IsSCMPrivate}
+    │   └─ Visibility 仅当 forge 返回非空才更新（防止GitLab等部分事件丢失
+    │
+    └─ 步骤 4：_store.UpdateRepo(repo) 持久化
+```
+
+**组织迁移自动映射** (`server/api/repo.go:125-151`)：
+
+```
+激活/重新同步仓库时 PostRepo：
+    │
+    ├─ 根据 repo.Owner + user.ForgeID → OrgFindByName
+    │   ├─ 命中：orgID 关联
+    │   └─ 未命中：
+    │       ├─ 调用 Forge.Org(c, user, repo.Owner) 查 Forge 端组织信息
+    │       └─ OrgCreate：新建组织，关联 ForgeID + Name
+    │
+    └─ 结果：repo.OrgID = org.ID（权限关联保持正确
+```
+
+**用户登录时个人组织重映射** (`server/api/login.go:221-268`)：
+
+```
+HandleAuth 回调阶段：
+    │
+    ├─ user.Login(来自Forge的新用户名) ≠ org.Name(数据库中旧名)?
+    │   └─ 是：OrgUpdate → org.Name = user.Login（更新组织名匹配新用户名）
+    │
+    └─ 个人组织始终跟随用户名变化，保持 IsUser=true
+```
+
+### 10.2 用户硬删除的级联清理路径
+
+**删除入口** (`server/api/users.go:198-224` `DeleteUser`)：
+
+```
+DELETE /users/:login → DeleteUser：
+    │
+    └─ _store.DeleteUser(user) （事务，全有或全无
+        │
+        ▼
+        DeleteUser 事务 (`server/store/datastore/user.go:88-108`):
+        ├─ BEGIN
+        │
+        ├─ [1] s.orgDelete(sess, user.OrgID) 级联删除个人组织：
+        │   │
+        │   ▼ orgDelete (`server/store/datastore/org.go:57-74`):
+        │   ├─ 删组织级 Secret: DELETE secrets WHERE org_id=?
+        │   │
+        │   ├─ 列出所有组织下的仓库：SELECT repos WHERE org_id=?
+        │   │   └─ 逐个 repo → 调用 deleteRepo(sess, repo)
+        │   │       │
+        │   │       ▼ deleteRepo (`server/store/datastore/repo.go:105-141`):
+        │   │       ├─ DELETE configs     WHERE repo_id=?
+        │   │       ├─ DELETE perms       WHERE repo_id=?
+        │   │       ├─ DELETE registries  WHERE repo_id=?
+        │   │       ├─ DELETE secrets     WHERE repo_id=?
+        │   │       ├─ DELETE redirections WHERE repo_id=?
+        │   │       │
+        │   │       ├─ 分批（每次50）取 pipelineIDs
+        │   │       │   └─ 逐个 pipeline → deletePipeline(sess, pipelineID)
+        │   │       │       │
+        │   │       │       ▼ deletePipeline (`server/store/datastore/pipeline.go:219-245`):
+        │   │       │       ├─ workflowsDelete() → 级联 steps + logs
+        │   │       │       ├─ 查 pipeline_configs 关联的 config_id
+        │   │       │       │   └─ 若该 config 只被此 pipeline 使用 → 删 configs
+        │   │       │       ├─ DELETE pipeline_configs WHERE pipeline_id=?
+        │   │       │       └─ DELETE pipelines WHERE id=?
+        │   │       │
+        │   │       └─ DELETE repos WHERE id=?
+        │   │
+        │   └─ DELETE orgs WHERE id=?
+        │
+        ├─ [2] DELETE users WHERE id=?
+        │
+        ├─ [3] DELETE perms WHERE user_id=? （清理用户的所有仓库权限
+        │
+        └─ COMMIT / ROLLBACK
+```
+
+### 10.3 清理覆盖范围与残留分析
+
+| 数据类型 | 清理方式 | 触发点 | 可能的残留 |
+|---------|----------|-------|-----------|
+| 用户账号 | 硬 DELETE | DeleteUser | 无 |
+| 个人组织 | 硬 DELETE（级联）| DeleteUser | 若 OrgID=-1 或关联失败可能残留 |
+| 用户-仓库权限表 perms | 硬 DELETE（按 user_id）| DeleteUser | 无（事务保证 |
+| 仓库完整数据（configs/perm/secret/redirection/pipelines）| 硬 DELETE 级联 | orgDelete → deleteRepo → deletePipeline | 无（分批删除保证大量流水线完整清理）|
+| 流水线运行日志 | workflowsDelete → stepsDelete → logsDelete | deletePipeline 级联 | 无 |
+| 组织级 Secrets | 直接 DELETE | orgDelete | 无 |
+| 组织下仓库级 Secrets | 随 deleteRepo 删除 | orgDelete → deleteRepo | 无 |
+| Agent 注册数据 | 不随用户删除 | Agent 独立生命周期 | ✅ 可能残留（OwnerID 字段留空）|
+| TaskLog 审计表（若存在）| 无关联清理 | 独立日志表 | ✅ 可能残留 |
+| membership 缓存 | Redis/Memory TTL 自动过期 | TTL 10分钟 | ✅ 过期前有窗口 |
+
+### 10.4 跨 Forge 实例迁移的权限隔离
+
+多 Forge 场景的权限键组合：
+
+```go
+// 唯一性约束（数据库层面
+// users 表唯一索引：(forge_id, forge_remote_id)
+// orgs  表唯一索引：(forge_id, name)
+// repos 表唯一索引：(forge_id, forge_remote_id)
+```
+
+```
+同一用户名在不同 Forge 实例：
+    │
+    ├─ forge_id=1 (GitHub)  → userA（ForgeRemoteID=123）→ orgA(org_id=1)
+    ├─ forge_id=2 (GitLab)  → userA（ForgeRemoteID=456）→ orgA(org_id=2)  ← 重名但不同Forge
+    │
+    └─ 权限查询：
+        ├─ GetUserByRemoteID(forgeID, remoteID) → 精确匹配
+        ├─ GetUserByLogin(forgeID, login)       → 带 forgeID 过滤
+        └─ OrgFindByName(name, forgeID)         → forgeID 确保跨实例隔离
+```
+
+---
+
 ## 六、设计特点总结
 
 1. **权限源分离**：系统管理员权限、组织成员权限、仓库权限分别来自不同数据源
@@ -832,3 +1079,6 @@ checkAgentPermissionByWorkflow(agent, workflowID, pipeline, repo)
 9. **任务分配双保险**：调度器标签过滤 + Workflow 执行前二次 Org 校验，防越权执行
 10. **Secret 分层覆盖**：Global/Org/Repo 三级作用域，同名优先级从细到粗
 11. **Pipeline 门控审批**：按事件类型（PR/fork/all）分级审批策略，白名单用户自动放行
+12. **稳定主键迁移容忍**：以 ForgeRemoteID 为不可变关联键，重命名/跨组织迁移通过 Redirection 表保持访问连通性
+13. **硬删除级联清理**：DeleteUser 单事务级联清理用户→组织→仓库→流水线→步骤日志五层结构，保证数据一致性
+14. **多 Forge 实例隔离**：所有查询强制带 forge_id，同名用户/组织在不同 Forge 实例完全隔离不串权
