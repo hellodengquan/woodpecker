@@ -2170,3 +2170,527 @@ T3 (Agent):   Workflow 完成 → WorkflowState.Finished = T3
 - Agent 与 Server 严重不同步（> 30s）→ `since` (T0:Server) 与 `duration` (T1:Agent)
   的基准不一致，可能出现"等待了 2 分钟，执行 1 分钟，但 since 显示 1 分钟"
   的反直觉现象
+
+---
+
+## 16. Build 列表分页加载性能策略
+
+### 16.1 两套分页组件：`RepoPipelines.vue` vs `RepoBranches.vue`
+
+Build 列表有两条独立的分页实现路径，分别服务不同的视图：
+
+| 视图 | 分页实现 | 代码位置 |
+|------|----------|----------|
+| Repo 活动页（`RepoPipelines.vue`） | **手动点击 "Load More"** + Pinia Store 增量累加 | `pipelines.ts:85-96` |
+| Repo 分支页（`RepoBranches.vue`）、PR 列表、Cron 列表等 | **`usePagination` composition** + 无限滚动 | `usePaginate.ts:24-96` |
+
+TODO(4626) 标记了重构计划（`RepoPipelines.vue:19-20`），目标是统一为
+`usePagination` + 服务端过滤，但目前仍各自为政。
+
+### 16.2 RepoPipelines：Pinia Store 全量累加 + 手动加载
+
+这是主列表的实现，核心在 `store/pipelines.ts:85-96`：
+
+```typescript
+const perPage = 50;
+const hasMore = ref(false);
+
+async function loadRepoPipelines(repoId: number, page?: number) {
+  loading.value = true;
+  const _pipelines = await apiClient.getPipelineList(repoId, { page, perPage });
+  _pipelines.forEach((pipeline) => {
+    setPipeline(repoId, pipeline);       // Map.set 去重合并
+  });
+  hasMore.value = _pipelines.length >= perPage;
+  loading.value = false;
+}
+```
+
+**前端 API 调用** (`web/src/lib/api/index.ts:113-119`)：
+
+```typescript
+getPipelineList(repoId, opts?: {
+  page?: number;
+  perPage?: number;
+  before?: string;      // RFC3339 日期
+  after?: string;       // RFC3339 日期
+  ref?: string;         // ref 包含的字符串
+  branch?: string;
+  events?: string;      // 逗号分隔的事件列表
+}): Promise<Pipeline[]>;
+```
+
+**关键行为**：
+- `perPage = 50` 写死，无配置项
+- 返回数组长度 === 50 → `hasMore = true`，否则为 `false`
+- 每次加载 `forEach` 调用 `setPipeline()`，后者通过 `Map.set(pipeline.number)`
+  做**去重合并**（同 pipeline.number 保留新数据）
+- 数据存储在 `pipelines: Map<repoId, Map<number, Pipeline>>`，即 repo → 序号 → Pipeline
+
+**前端渲染层** (`RepoPipelines.vue:25-30`):
+
+```typescript
+const page = ref(1);
+
+async function loadMore() {
+  page.value += 1;
+  await pipelineStore.loadRepoPipelines(repo.value.id, page.value);
+}
+```
+
+点击 "Load More" → `page++` → 拉取下一页 → 合并到 Store → 触发响应式更新。
+
+**Store 数据在组件间共享**：`RepoWrapper.vue:98` 通过 `provide('pipelines', pipelines)`
+注入给所有子组件，`pipelines` 是 `getRepoPipelines(repositoryId)` 返回的 computed：
+
+```typescript
+// store/pipelines.ts:56-58
+function getRepoPipelines(repoId: Ref<number>) {
+  return computed(() =>
+    [...(pipelines.get(repoId.value)?.values() ?? [])]
+      .sort(comparePipelines)  // 按 created 降序
+  );
+}
+```
+
+**排序是每次访问时全量排序**，无缓存。对 1000 条数据，比较函数执行 ~5000 次，
+性能可接受。
+
+### 16.3 服务端分页：数据库索引 + 按 number 排序
+
+`server/api/pipeline.go:129-189` 的 `GetPipelines` handler：
+
+```go
+func GetPipelines(c *gin.Context) {
+    repo := session.Repo(c)
+    filter := &model.PipelineFilter{
+        Branch:      c.Query("branch"),
+        RefContains: c.Query("ref"),
+    }
+
+    // 解析 before/after RFC3339 → Unix 秒
+    if before := c.Query("before"); before != "" {
+        filter.Before, _ = time.Parse(time.RFC3339, before).Unix()
+    }
+    if after := c.Query("after"); after != "" {
+        filter.After, _ = time.Parse(time.RFC3339, after).Unix()
+    }
+    if events := c.Query("event"); events != "" {
+        filter.Events = strings.Split(events, ",")  // 验证每个 event 值
+    }
+    if status := c.Query("status"); status != "" {
+        filter.Status = status
+    }
+
+    pipelines, _ := store.GetPipelineList(repo, session.Pagination(c), filter)
+    c.JSON(http.StatusOK, pipelines)
+}
+```
+
+**数据库层** (`server/store/datastore/pipeline.go:68-102`)：
+
+```go
+func (s storage) GetPipelineList(repo *model.Repo, p *model.ListOptions, f *model.PipelineFilter) ([]*model.Pipeline, error) {
+    cond := builder.NewCond().And(builder.Eq{"repo_id": repo.ID})
+
+    if f != nil {
+        if f.After != 0  { cond = cond.And(builder.Gt{"created": f.After}) }
+        if f.Before != 0 { cond = cond.And(builder.Lt{"created": f.Before}) }
+        if f.Branch != "" { cond = cond.And(builder.Eq{"branch": f.Branch}) }
+        if f.Status != "" { cond = cond.And(builder.Eq{"status": f.Status}) }
+        if len(f.Events) != 0 { cond = cond.And(builder.In("event", f.Events)) }
+        if f.RefContains != "" { cond = cond.And(builder.Like{"ref", f.RefContains}) }
+    }
+
+    return pipelines, s.paginate(p).Where(cond).
+        Desc("number").      // 按 pipeline number 降序（即新建在前）
+        Find(&pipelines)
+}
+```
+
+**排序键是 `number`（自增序号）**，不是 `created`。因为 number 是数据库自增字段，
+有索引 (`UNIQUE(repo_id, number)`)，查询性能比 `created` 更好。
+
+**分页使用 offset/limit**（`s.paginate(p)` 实现），不是 cursor 分页。
+大页数（> 1000 条）会有性能衰减。
+
+### 16.4 usePagination：无限滚动 + 支持"each"级联加载
+
+`usePaginate.ts:24-96` 的 `usePagination` composition 是更通用的分页实现，
+支持**无限滚动自动加载**，还支持 `each` 数组参数的级联加载（如分页拉取 A 分支 →
+拉完自动切换 B 分支继续拉）：
+
+```typescript
+export function usePagination<T, S = unknown>(
+  _loadData: (page: number, arg: S) => Promise<T[] | null>,
+  isActive: () => boolean = () => true,
+  {
+    scrollElement: _scrollElement,  // 滚动容器，默认 #scroll-component
+    each: _each,                     // 级联参数数组
+    pageSize: _pageSize,             // 默认 50
+  }: { ... } = {},
+) {
+  // 内部状态
+  const page = ref(1);
+  const hasMore = ref(true);
+  const data = ref<T[]>([]);
+  const loading = ref(false);
+  const each = ref([...(_each ?? [])]);
+
+  async function loadData() {
+    if (loading.value || !hasMore.value) return;
+
+    loading.value = true;
+    const newData = await _loadData(page.value, each.value?.[0]) ?? [];
+    hasMore.value = newData.length >= pageSize.value && newData.length > 0;
+
+    if (newData.length > 0) {
+      data.value.push(...newData);
+    }
+
+    // 当前 each 元素拉完，切换到下一个
+    if (!hasMore.value && each.value.length > 0) {
+      each.value.shift();
+      page.value = 1;
+      hasMore.value = each.value.length > 0;
+      if (hasMore.value) {
+        loading.value = false;
+        await loadData();  // 递归拉取下一个
+      }
+    }
+    loading.value = false;
+  }
+
+  if (scrollElement !== null) {
+    useInfiniteScroll(scrollElement, nextPage, { distance: 10 });
+  }
+}
+```
+
+**无限滚动触发**：使用 `@vueuse/core` 的 `useInfiniteScroll`，
+滚动到底部 `10px` 内自动调用 `nextPage()` → `page++` → `loadData()`。
+
+**每个视图按需使用**：
+- `RepoBranches.vue:42`：`usePagination(loadBranches)`，无 each 参数
+- `RepoPullRequests.vue`：类似
+
+**性能特点**：
+- 无限滚动无 DOM 虚拟化，500 条数据以上有滚动卡顿
+- `each` 级联是同步循环拉取，可能产生连续多次网络请求
+- `loadData` 有 `loading` 标志防重入
+
+### 16.5 分页性能瓶颈分析
+
+| 瓶颈 | 影响 | 代码位置 |
+|------|------|----------|
+| 前端每次访问 `pipelines` computed 都全量 sort | O(n log n)，n > 2000 时感知明显 | `store/pipelines.ts:57` |
+| 无限滚动无虚拟列表，DOM 随数据量线性增长 | 500 条 Pipeline → 约 5000+ DOM 节点 | `PipelineList.vue:3-11` + `PipelineItem.vue` |
+| 服务端 offset/limit 分页，大 offset 全表扫描 | page > 20（> 1000 条）时查询变慢 | `datastore/pipeline.go:99` |
+| `RepoPipelines` 每次 "Load More" 50 条，500 条需 10 次点击 | UX 较差，无无限滚动 | `RepoPipelines.vue:27-30` |
+| `pipelineFeed` computed 每次访问跨 repo 合并 + 全量 sort | 多 repo 场景性能开销大 | `store/pipelines.ts:105-117` |
+
+**`pipelineFeed` 跨 repo 聚合** (`store/pipelines.ts:105-117`) 是性能最吃紧的点：
+
+```typescript
+const pipelineFeed = computed(() =>
+  [...pipelines.entries()]                            // Map<repoId, Map<number, Pipeline>>
+    .reduce<PipelineFeed[]>((acc, [_repoId, repoPipelines]) => {
+      const repoPipelinesArray = Array.from(repoPipelines.entries(),
+        ([_pipelineNumber, pipeline]) => ({
+          ...pipeline, repo_id: _repoId, number: _pipelineNumber,
+        })
+      );
+      return [...acc, ...repoPipelinesArray];         // 展平为一维数组
+    }, [])
+    .sort(comparePipelinesWithStatus)                 // 全局排序：优先级 + created
+    .filter(/* owned repos only */)
+);
+```
+
+每次访问（包括 SSE 推送更新触发响应式）都执行：
+1. 遍历所有 repo 的所有 Pipeline，创建新数组（展开）
+2. 全量排序（running 优先 + created 降序）
+3. 过滤不属于当前用户的 repo
+
+用户有 10 个 repo，每个 100 条 Pipeline → 每次更新遍历 1000 条 + 1000 log n 次比较。
+
+---
+
+## 17. 过滤器持久化：URL 查询参数驱动，无本地存储
+
+### 17.1 过滤体系：服务端过滤 vs 客户端过滤
+
+Build 列表的过滤分两层：
+
+| 过滤层 | 实现方式 | 持久化方式 |
+|--------|----------|------------|
+| **服务端过滤** | `GetPipelineList` 支持 `branch` / `status` / `event` / `before` / `after` / `ref` 等查询参数 | URL query string |
+| **客户端过滤** | `RepoBranch.vue:24-31` 对已加载数据做 `filter()` | 路由参数（`:branch`） |
+
+**关键发现**：用户保存的筛选条件（Saved Filters / Presets）**在代码中完全不存在**。
+没有本地存储、没有 Pinia store、没有服务端数据库表，过滤仅由 URL 驱动。
+
+### 17.2 RepoBranch：客户端分支过滤
+
+`RepoBranch.vue` 是最典型的客户端过滤场景：
+
+```typescript
+// RepoBranch.vue:20-31
+const props = defineProps<{ branch: string }>();
+const branch = toRef(props, 'branch');
+
+const allPipelines = requiredInject('pipelines');  // Store 全量数据
+const pipelines = computed(() =>
+  allPipelines.value.filter(
+    (b) =>
+      b.branch === branch.value &&
+      b.event !== 'pull_request' &&
+      b.event !== 'pull_request_closed' &&
+      b.event !== 'pull_request_metadata',
+  ),
+);
+```
+
+- 分支名来自**路由参数** `:branch`（URL `/repos/{id}/branch/{branch}`）
+- 过滤范围是 `pipelines` Store 中**已加载**的数据
+- 切换分支时不触发网络请求（假设数据已加载）
+- 如果数据未加载（用户直接访问分支 URL），走 `RepoWrapper.loadRepo()` 的
+  `loadRepoPipelines(repoId, 1)`，只拉第一页（50 条），可能显示不全
+
+**过滤与分页的交互缺陷**：如果某分支的 Pipeline 分散在多个分页页中，
+只拉了第一页的用户可能看不到该分支的历史 Pipeline（即使存在）。
+
+### 17.3 PR 列表：类似机制
+
+`RepoPullRequest.vue` 采用相同模式，但通过 PR 索引页拉取：
+
+```typescript
+// RepoPullRequests.vue 中调用
+apiClient.getRepoPullRequests(repoId, { page, perPage })
+```
+
+这是一个**独立的 API 端点**（`/api/repos/{id}/pull_requests`），服务端直接按
+`event in (pull_request, pull_request_closed, pull_request_metadata)` 过滤，
+不需要客户端过滤。
+
+### 17.4 服务端过滤：API 参数与数据库查询对应
+
+服务端 `GetPipelineList` 支持的过滤参数：
+
+| URL 参数 | 数据库条件 | 类型 |
+|----------|------------|------|
+| `branch=main` | `branch = 'main'` | 等值 |
+| `status=success` | `status = 'success'` | 等值 |
+| `event=push,pull_request` | `event IN ('push','pull_request')` | 集合 |
+| `ref=release/v1.0` | `ref LIKE '%release/v1.0%'` | 模糊 |
+| `before=2025-06-20T00:00:00Z` | `created < 1750406400` | 范围（Unix 秒） |
+| `after=2025-06-19T00:00:00Z` | `created > 1750320000` | 范围 |
+| `page=3&perPage=25` | `LIMIT 25 OFFSET 50` | 分页 |
+
+**前端未直接暴露 UI 控件**让用户输入这些参数（除了分页）。
+目前 UI 上没有状态筛选下拉框、事件筛选 checkbox、日期范围选择器。
+用户需要手动构造 URL 才能使用这些服务端过滤能力。
+
+### 17.5 加载顺序与数据竞态
+
+`RepoWrapper.vue` 的 `loadRepo()` 函数是数据加载入口：
+
+```
+onMounted / watch(repositoryId) → loadRepo():
+  ├─ getRepoPermissions()           // 权限校验
+  ├─ repoStore.loadRepo()           // 拉取 Repo 元数据
+  ├─ pipelineStore.loadRepoPipelines(repoId)  // 拉取 page=1 的 Pipeline
+  ├─ forgeStore.getForge()
+  └─ updateLastAccess()
+```
+
+**执行顺序是串行**的：权限 → Repo → Pipelines。Pipeline 数据的加载
+依赖前面的权限校验和 Repo 加载。
+
+**数据竞态分析**：
+- `provide('pipelines', pipelines)` 是同步执行的（`RepoWrapper.vue:101`），
+  在 `onMounted` 之前执行
+- `pipelines` 是 computed，初始值为空数组
+- `onMounted` 触发 `loadRepo()` → 异步 `loadRepoPipelines()` → 数据填充 →
+  computed 重新计算 → 子组件（`RepoPipelines.vue`）自动刷新
+
+因此子组件看到的 `pipelines` 是响应式的，不会出现 undefined。
+
+### 17.6 过滤器持久化现状总结
+
+| 功能 | 状态 | 代码线索 |
+|------|------|----------|
+| 分支过滤 | ✅ 基于路由参数 | `RepoBranch.vue:24-31` |
+| PR 事件过滤 | ✅ 独立 API 端点 | `/api/repos/{id}/pull_requests` |
+| 状态筛选 UI | ❌ 不存在 | API 支持但无 UI |
+| 事件多选 UI | ❌ 不存在 | API 支持但无 UI |
+| 日期范围选择 | ❌ 不存在 | API 支持但无 UI |
+| 保存筛选条件（"我的筛选"） | ❌ 不存在 | 无相关代码 |
+| 筛选条件持久化（localStorage） | ❌ 不存在 | 无 `useStorage` 调用于 Pipeline 过滤 |
+| 筛选条件分享（URL 复制） | ⚠️ 需手动构造 | API 参数可用但无 UI 生成 |
+
+**当前唯一的"持久化"机制**是 Vue Router 的 `$route.query` / `$route.params`，
+用户手动在 URL 中添加查询参数（如 `?status=success&branch=main`）时，可以分享链接。
+但代码中没有任何 `watch(route.query)` 自动同步到 API 调用的逻辑。
+
+TODO(4626) 的重构目标之一就是 "server-side filtering"，即让 URL query 参数
+自动驱动 `getPipelineList` 调用。
+
+---
+
+## 18. Build 历史趋势图表：（几乎）完全不存在的聚合层
+
+### 18.1 现状：没有图表组件，只有 badge 状态图标
+
+代码搜索 `chart` / `graph` / `trend` / `sparkline` / `metrics` 等关键词，
+仅在 `tailwind.css` 的 `font-family: graphik` 中出现了 "graphik" 字符串，
+以及 `useRepoSearch.ts` 的一些无关引用。**没有任何 SVG chart、折线图、
+柱状图、饼图等可视化组件**。
+
+UI 中显示 Pipeline 状态的方式：
+- 列表中每条 Pipeline 左侧的 `PipelineStatusIcon` 图标
+- 徽章 SVG：`/api/badges/{repoId}/status.svg`
+- 分支列表中的 `Badge` 组件（标记 default 分支）
+- Repo 卡片右下角的最新状态图标
+
+### 18.2 服务端没有预聚合接口
+
+检查服务端 API 端点（`server/api/`），没有找到任何聚合类接口：
+- ❌ `GET /api/repos/{id}/pipelines/aggregate`
+- ❌ `GET /api/repos/{id}/metrics`
+- ❌ `GET /api/repos/{id}/builds/stats`
+- ❌ `GET /api/user/metrics`
+
+唯一的计数 API 是 `GetPipelineCount()` (`datastore/pipeline.go:130-132`)，
+用于数据库总 Pipeline 数统计（内部管理用），不暴露给前端。
+
+```go
+func (s storage) GetPipelineCount() (int64, error) {
+    return s.engine.Count(new(model.Pipeline))
+}
+```
+
+### 18.3 前端也没有聚合计算
+
+检查前端 `store/pipelines.ts`，没有聚合 computed：
+- ❌ `successRate = computed(...)`
+- ❌ `dailyBuilds = computed(...)`
+- ❌ `statusCounts = computed(...)`
+- ❌ `avgDuration = computed(...)`
+
+唯一的聚合类逻辑是 `pipelineFeed` 和 `activePipelines` computed，
+它们做的是**跨 repo 合并和过滤**，而非统计聚合：
+
+```typescript
+// store/pipelines.ts:119-121
+const activePipelines = computed(() =>
+  pipelineFeed.value.filter(
+    (pipeline) => ['pending', 'running', 'started'].includes(pipeline.status)
+  )
+);
+```
+
+这只是 `filter()`，不做 `reduce()` 统计。
+
+### 18.4 唯一的"趋势"信息：Repo 卡片的 last pipeline
+
+Repo 列表卡片（`RepoList.vue` 或类似组件）展示每个 Repo 的最后一次 Pipeline 状态，
+数据来源是 `Repo.last_pipeline` 字段：
+
+```typescript
+// store/pipelines.ts:47-51
+// setPipeline 中顺带更新 Repo.last_pipeline_number
+const repo = repoStore.repos.get(repoId);
+if (repo?.last_pipeline_number < pipeline.number) {
+    repo.last_pipeline_number = pipeline.number;
+    repoStore.setRepo(repo);
+}
+```
+
+这是**单条最新状态**，不是历史趋势。
+
+### 18.5 如果要实现：前端聚合的可行性分析
+
+假设未来要添加趋势图表，前端现有数据结构可以支持：
+
+```typescript
+// 假设 N 天历史聚合（如果拉取了足够数据）
+const dailyStats = computed(() => {
+  const byDay = new Map<string, { success: number; failure: number; running: number; }>();
+
+  for (const p of pipelines.value) {
+    const day = new Date(p.created * 1000).toISOString().slice(0, 10);  // YYYY-MM-DD
+    const stats = byDay.get(day) ?? { success: 0, failure: 0, running: 0 };
+    stats[p.status as keyof typeof stats]++;
+    byDay.set(day, stats);
+  }
+
+  return [...byDay.entries()].sort();  // 按日期升序
+});
+```
+
+**但限制明显**：
+1. 最多只能聚合 Store 中已加载的数据（默认只拉了第一页 50 条）
+2. 要聚合 90 天历史，可能需要拉取上千条 Pipeline，内存和网络开销大
+3. 聚合在每次 `setPipeline()` 触发响应式更新时全量重算
+
+**更合理的实现路径**（服务端预聚合）：
+
+```go
+// 假设的聚合 API
+type PipelineAggregation struct {
+    Date     string `json:"date"`
+    Success  int    `json:"success"`
+    Failure  int    `json:"failure"`
+    Canceled int    `json:"canceled"`
+    Running  int    `json:"running"`
+    AvgDuration int64 `json:"avg_duration"`
+}
+
+func GetPipelineAggregation(c *gin.Context) {
+    repo := session.Repo(c)
+    // SQL: SELECT DATE(FROM_UNIXTIME(created)) as date, status, COUNT(*), AVG(finished-started)
+    //      FROM pipelines WHERE repo_id = ? AND created > ? GROUP BY date, status
+}
+```
+
+### 18.6 聚合相关 TODO 和设计意图
+
+`store/pipelines.ts` 的 `perPage = 50` + `hasMore` 设计意味着
+Woodpecker 假设用户浏览 Pipeline 是**从新到旧、按需加载**，而非一次性
+获取全量做聚合分析。Pipeline 列表的定位是**流水式事件流**，不是**数据仓库**。
+
+如果要添加趋势图，需要：
+1. 后端新增聚合 API（可能用单独的统计表或即时 SQL 聚合）
+2. 前端新增图表组件（ECharts / Chart.js 或自定义 SVG）
+3. 在 Repo 设置或独立视图中展示
+
+当前没有相关 issue 或 TODO 标注（代码中未找到），因此这是**非核心功能**。
+
+### 18.7 相关但不相同：Forge commit status
+
+唯一接近"聚合"的概念是 `updatePipelineStatus()` 将 Pipeline 状态
+同步到 Git forge（GitHub / GitLab 等）的 commit status。这是**外部系统**的
+状态展示，不是 Woodpecker 自身的趋势图。`updatePipelineStatus()` 只同步
+**最新状态**，不同步历史数据。
+
+---
+
+## 18. 关键未实现功能小结
+
+将 16-18 节发现的缺失功能汇总：
+
+| 功能 | 服务端能力 | 前端 UI | 持久化 |
+|------|----------|----------|--------|
+| 状态筛选下拉框 | ✅ API 支持 | ❌ 不存在 | - |
+| 事件多选过滤 | ✅ API 支持 | ❌ 不存在 | - |
+| 日期范围筛选 | ✅ API 支持 | ❌ 不存在 | - |
+| 保存筛选条件（预设） | - | ❌ 不存在 | ❌ |
+| URL query 自动驱动过滤 | ✅ API 支持 | ⚠️ TODO(4626) | ✅ URL 即持久化 |
+| 无限滚动（RepoPipelines） | ✅ API 支持 | ❌ 手动 Load More | - |
+| 虚拟滚动/分页性能 | - | ❌ 无虚拟化 | - |
+| Build 成功率趋势图 | ❌ 无聚合 API | ❌ 无图表组件 | - |
+| Build 时长趋势图 | ❌ 无聚合 API | ❌ 无图表组件 | - |
+| 状态分布饼图 | ❌ 无聚合 API | ❌ 无图表组件 | - |
+
+这些未实现功能解释了为什么之前的分析中"感觉有东西没追到"——这些功能本身不存在。
