@@ -404,6 +404,13 @@ groupedLogs (computed)    — 按 pipeline config 命令正则分组
 | `web/src/views/repo/pipeline/Pipeline.vue` | Pipeline 主视图：StepList + Log 布局 |
 | `web/src/components/repo/pipeline/PipelineStepList.vue` | Step 列表组件：Workflow/Step 树 |
 | `web/src/components/repo/pipeline/PipelineLog.vue` | 日志组件：SSE/REST 加载 + 渲染 + 分组 |
+| `web/src/components/repo/pipeline/PipelineStepDuration.vue` | Step/Workflow 计时器 |
+| `web/src/compositions/useElapsedTime.ts` | 实时耗时计算：setInterval + 自动启停 |
+| `web/src/compositions/useUserConfig.ts` | 用户配置持久化（含 collapseLogGroupsByDefault） |
+| `web/src/compositions/useConfig.ts` | 全局配置（含 maxPipelineLogLineCount） |
+| `web/src/style/console.css` | ANSI 颜色 CSS（light/dark 主题） |
+| `web/src/lib/utils/index.ts` | 工具函数：debounce、escapeHtml |
+| `web/src/main.ts` | 应用入口：初始化 useEvents 全局 SSE |
 
 ---
 
@@ -455,3 +462,526 @@ if (step.state !== 'running' && step.state !== 'pending') {
   重连后从上次断点继续推送（`stream.go:246-249`）
 - 日志流的 `event: eof` 表示 Step 日志流正常结束，
   前端收到后关闭 EventSource
+
+---
+
+## 7. SSE 流式日志重连与断线恢复
+
+### 7.1 前端 EventSource 生命周期管理
+
+`PipelineLog.vue` 通过 `stream` ref 持有当前日志 EventSource 实例：
+
+```
+stream: ref<EventSource | undefined>
+```
+
+生命周期关键节点：
+
+| 时机 | 操作 | 代码位置 |
+|------|------|----------|
+| Step 切换 / 初始加载 | `stream.value?.close()` → 重建 | `PipelineLog.vue:481,494` |
+| Step 状态变为终态 | `watch(step)` → `loadLogs()` → `stream.value?.close()` + REST 拉取 | `PipelineLog.vue:555-564` |
+| 组件销毁 | `onBeforeUnmount` → `stream.value?.close()` | `PipelineLog.vue:547-549` |
+
+**关键**：前端不直接处理 EventSource 的 `onerror` 回调。
+当 `opts.reconnect` 为 `true` 时（默认值），`ApiClient._subscribe()` 不注册 `onerror` handler，
+完全依赖浏览器内置的 EventSource 自动重连机制。
+
+```typescript
+// client.ts:94-117
+_subscribe<T>(path, callback, opts = { reconnect: true }) {
+  const events = new EventSource(_path);
+  events.onmessage = (event) => {
+    callback(JSON.parse(event.data));
+  };
+
+  if (!opts.reconnect) {
+    // 仅当 reconnect=false 时才注册 onerror
+    events.onerror = (err) => {
+      if (err.data === 'eof') events.close();
+    };
+  }
+  return events;
+}
+```
+
+`streamLogs()` 和 `on()` 都使用默认 `reconnect: true`，因此浏览器的 EventSource
+在连接断开后会自动指数退避重连，前端代码无需介入。
+
+### 7.2 服务端 Last-Event-ID 断点续传
+
+`LogStreamSSE` (`server/api/stream.go:244-277`) 实现了基于 SSE 标准 `id` 字段的重连续传：
+
+```
+┌────────────────────────────────────────────────────────┐
+│ 首次连接                                               │
+│                                                        │
+│ Server: id: 1\ndata: {...}\n\n                         │
+│ Server: id: 2\ndata: {...}\n\n                         │
+│ Server: id: 3\ndata: {...}\n\n                         │
+│   ↕ 网络断开                                           │
+│                                                        │
+│ 浏览器自动重连，请求头带 Last-Event-ID: 3               │
+│                                                        │
+│ Server: 读取 Last-Event-ID → last = 3                  │
+│ Server: id: 4\ndata: {...}\n\n  (id > last 才发送)     │
+│ Server: id: 5\ndata: {...}\n\n                         │
+└────────────────────────────────────────────────────────┘
+```
+
+服务端核心逻辑（`stream.go:244-277`）：
+
+```go
+id := 1
+last, _ := strconv.Atoi(c.Request.Header.Get("Last-Event-ID"))
+
+for {
+    select {
+    case buf := <-logChan:
+        if id > last {                    // 只发送 id > last 的消息
+            write("id: " + strconv.Itoa(id))
+            write("data: " + buf)
+            flush()
+        }
+        id++                              // id 始终递增，不论是否跳过
+    }
+}
+```
+
+**重要限制**：
+
+1. **id 是 SSE 连接内的递增序号，不是日志行号** — 每条 `LogEntry` 的 JSON 中有自己的 `line` 字段，
+   而 SSE `id` 仅用于断点续传。重连后跳过的是 SSE 层面的消息序号，不是日志行号。
+
+2. **重连窗口有限** — 断线期间日志仍通过 `logger.Write()` 写入 Log Mux 的 `stream.list` 缓冲。
+   但如果 Step 在断线期间完成，`logger.Close()` 会删除 stream，重连时 Log Mux 的 `Tail()` 返回 `ErrNotFound`，
+   SSE 连接发送 `event: error` 后关闭。此时前端 EventSource 重连也只会再次失败。
+
+3. **Step 已完成的重连回退** — 如果重连时 Step 已经不再是 `pending/running`，
+   `LogStreamSSE` 在校验 Step 状态时直接返回 `event: error\ndata: step not running (anymore)\n\n`，
+   不进入 Tail 循环。
+
+### 7.3 重连失败的兜底：Step 状态变更触发 REST 回退
+
+当前端通过 `EventStreamSSE` 收到 Pipeline 状态更新（Step 从 running → success/failure），
+`PipelineLog.vue:555-564` 的 `watch(step)` 被触发：
+
+```typescript
+watch(step, async (newStep, oldStep) => {
+  if (oldStep?.name === newStep?.name) {
+    if (oldStep?.state !== newStep?.state) {
+      await loadLogs();  // 重新加载 → step 不再 running → 走 REST 路径
+    }
+  }
+});
+```
+
+这条路径形成了 SSE 重连失败后的**最终兜底**：
+
+```
+SSE 断线
+  → 浏览器自动重连
+  → 重连失败（Step 已完成）
+  → EventSource 收到 error event
+  → 同时状态通道推送 Step 终态
+  → watch(step) 触发 loadLogs()
+  → loadLogs() 检测 step.state !== 'running'
+  → 关闭 EventSource，切换 REST API 获取完整日志
+```
+
+### 7.4 事件流重连的特殊性
+
+`EventStreamSSE` 不发送 `id` 字段，因此 **EventStream 不支持基于 Last-Event-ID 的断点续传**。
+断线重连后，前端只能收到重连时刻之后的新事件。
+
+但这在实践中影响有限：
+- `useEvents` 回调将事件 merge 到 `PipelineStore.setPipeline()`
+- `PipelineStore.setPipeline()` 是浅合并（`{...old, ...new}`）
+- 丢失的是中间瞬态，最终态一定会被下一次事件推送覆盖
+
+---
+
+## 8. 多 Step / 多 Workflow 并发执行的渲染调度
+
+### 8.1 数据模型：Pipeline → Workflow[] → Step[]
+
+Woodpecker CI 的 Pipeline 由多个 Workflow 组成，每个 Workflow 下有多个 Step：
+
+```typescript
+interface Pipeline {
+  workflows?: PipelineWorkflow[];   // 多 Workflow（对应 YAML 中的多 pipeline）
+}
+
+interface PipelineWorkflow {
+  id: number;
+  pid: number;
+  name: string;
+  state: PipelineStatus;
+  children: PipelineStep[];          // 多 Step
+}
+
+interface PipelineStep {
+  pid: number;
+  state: PipelineStatus;
+  type?: StepType;                   // Clone | Service | Plugin | Commands | Cache
+}
+```
+
+Workflow 之间可以并行执行（由 `depends_on` 控制依赖），
+同一 Workflow 下的 Step 也可以并行执行（如 `services` 和 `commands` 类型的 Step）。
+
+### 8.2 SSE 事件通道的状态合并机制
+
+当多个 Workflow/Step 并发执行时，Agent 会交错调用 `RPC.Update()`，
+每次调用都触发 `notify()` 推送完整 Pipeline 状态快照：
+
+```
+Agent 并发执行 Step A 和 Step B:
+
+  RPC.Update(stepA: running)  → notify({Pipeline 包含 stepA=running, stepB=pending})
+  RPC.Update(stepB: running)  → notify({Pipeline 包含 stepA=running, stepB=running})
+  RPC.Update(stepA: success)  → notify({Pipeline 包含 stepA=success, stepB=running})
+  RPC.Update(stepB: success)  → notify({Pipeline 包含 stepA=success, stepB=success})
+```
+
+前端 `PipelineStore.setPipeline()` (`store/pipelines.ts:39-54`) 使用**浅合并**策略：
+
+```typescript
+function setPipeline(repoId: number, pipeline: Pipeline) {
+  const repoPipelines = pipelines.get(repoId) ?? new Map();
+  repoPipelines.set(pipeline.number, {
+    ...repoPipelines.get(pipeline.number),  // 保留旧字段
+    ...pipeline,                            // 覆盖新字段
+  });
+  pipelines.set(repoId, repoPipelines);
+}
+```
+
+**这意味着**：每次 SSE 事件推送的是**完整 Pipeline 对象**（含所有 Workflow 和 Step），
+而不是增量 diff。前端无需手动合并多个 Step 的状态更新，
+因为服务端在 `RPC.Update()` 中每次都重建完整 Workflow 树：
+
+```go
+// server/rpc/rpc.go:220-225
+if currentPipeline.Workflows, err = s.store.WorkflowGetTree(currentPipeline); err != nil {
+    log.Error().Err(err).Msg("cannot build tree from step list")
+    return err
+}
+return s.notify(c, repo, currentPipeline)
+```
+
+### 8.3 PipelineStepList 的渲染调度
+
+`PipelineStepList.vue` 是左侧 Step 列表面板，渲染逻辑：
+
+**1. Workflow 折叠策略** (`PipelineStepList.vue:153-165`)
+
+```typescript
+const workflowsCollapsed = ref<Record<PipelineStep['id'], boolean>>(
+  pipeline.value.workflows.length > 1
+    ? pipeline.value.workflows.reduce((collapsed, workflow) => ({
+        ...collapsed,
+        [workflow.id]:
+          ['success', 'skipped', 'blocked'].includes(workflow.state) &&
+          !workflow.children.some((child) => child.pid === selectedStepId.value),
+      }), {})
+    : {},
+);
+```
+
+- 多 Workflow 时，已完成的 Workflow 默认折叠
+- 包含当前选中 Step 的 Workflow 保持展开
+- 单 Workflow 时全部展开
+
+**2. 单配置检测** (`PipelineStepList.vue:167-169`)
+
+```typescript
+const singleConfig = computed(
+  () => pipelineConfigs?.length === 1 && pipeline.workflows.length === 1,
+);
+```
+
+单配置时隐藏 Workflow 名称行和折叠按钮，直接展示 Step 列表。
+
+**3. Step 选中联动** (`Pipeline.vue:95-132`)
+
+```typescript
+const selectedStepId = computed({
+  get() {
+    // 1. URL 参数指定的 stepId 优先
+    // 2. 桌面端默认选中第一个 Step
+    // 3. 移动端默认不选中
+  },
+  set(_selectedStepId) {
+    // 通过 router.replace 更新 URL 参数
+  },
+});
+```
+
+选中 Step 通过 URL 参数 (`stepId`) 持久化，支持直接链接分享。
+
+**4. Step 滚动定位** (`PipelineStepList.vue:172-183`)
+
+```typescript
+watch(selectedStepId, async (newId, oldId) => {
+  if (!oldId && newId) {
+    await nextTick();
+    const step = steps.value?.find(s => s.dataset.stepId === newId.toString());
+    step?.scrollIntoView({ behavior: 'auto', block: 'start' });
+  }
+});
+```
+
+首次选中 Step 时自动滚动到可视区域。
+
+### 8.4 并发 Step 的日志流隔离
+
+每个 Step 的日志流是独立的 SSE 连接。用户同一时刻只能查看一个 Step 的日志
+（`PipelineLog` 只渲染 `selectedStepId` 对应的 Step），因此：
+
+- **不存在多 Step 日志同时流式推送** — 切换 Step 时关闭旧 SSE，建立新 SSE
+- **Step 切换的幂等保护** — `loadLogs()` 通过 `loadedStepSlug` 防止重复加载
+
+```typescript
+const stepSlug = computed(() =>
+  `${repo.owner} - ${repo.name} - ${pipeline.id} - ${stepId}`
+);
+
+async function loadLogs() {
+  if (loadedStepSlug.value === stepSlug.value) return;  // 已加载，跳过
+  // ...
+}
+```
+
+- **非选中 Step 的日志静默累积在 LogStore** — 即使前端未查看，
+  Agent 写入的日志仍通过 `LogStore.LogAppend()` 持久化到文件系统，
+  用户后续切换到该 Step 时通过 REST API 一次性获取
+
+### 8.5 并发 Step 的计时器调度
+
+`PipelineStepDuration.vue` 为每个 Step/Workflow 显示实时耗时，
+内部使用 `useElapsedTime` composition：
+
+```typescript
+// useElapsedTime.ts
+const running = computed(() => step?.state === 'running');
+const { time: durationElapsed } = useElapsedTime(running, durationRaw);
+```
+
+- 每个 `PipelineStepDuration` 实例独立持有 `setInterval`
+- 仅当 Step 状态为 `running` 时启动定时器
+- Step 完成时定时器自动停止
+- 组件卸载时 (`onBeforeUnmount`) 清除定时器
+
+**并发 Step 场景下**：多个 Step 同时 running → 多个 `setInterval` 同时运行，
+每秒更新各自的 `durationRaw` → 触发 Vue 响应式更新 → 各自的 `<span>` 独立渲染。
+由于每次更新只是简单的文本替换，性能影响可控。
+
+---
+
+## 9. 日志检索、关键字高亮与时间戳过滤
+
+### 9.1 行级锚点：URL Hash 驱动的日志行定位
+
+PipelineLog 通过 URL hash (`#L{lineNumber}`) 实现日志行精确定位：
+
+**行锚点渲染** (`PipelineLog.vue:106-117`)
+
+```html
+<a :id="`L${line.number}`" :href="`#L${line.number}`">{{ line.number }}</a>
+```
+
+- 每行的行号是 `<a>` 标签，`id` 为 `L{number}`，`href` 为 `#L{number}`
+- 点击行号 → URL hash 变更 → `isSelected()` 计算命中 → 高亮
+
+**行选中判定** (`PipelineLog.vue:338-340`)
+
+```typescript
+function isSelected(line: LogLine): boolean {
+  return route.hash === `#L${line.number}`;
+}
+```
+
+选中行通过 CSS class `bg-blue-600/30` + `underline` 高亮显示。
+
+**Hash 变更监听** (`PipelineLog.vue:594-600`)
+
+```typescript
+watch(() => route.hash, (newHash) => {
+  expandLogGroupWithPageHash(newHash);
+}, { immediate: true });
+```
+
+URL hash 变化时，自动展开包含目标行的日志分组。
+
+**日志加载后滚动** (`PipelineLog.vue:431-435`)
+
+```typescript
+if (route.hash.length > 0) {
+  nextTick(() => document.getElementById(route.hash.substring(1))?.scrollIntoView());
+}
+```
+
+新日志加载后，如果 URL 有 hash，自动滚动到目标行。
+
+### 9.2 日志分组折叠与命令高亮
+
+PipelineLog 将日志按命令分组，每组可折叠展开：
+
+**命令检测** (`PipelineLog.vue:254-271`)
+
+```typescript
+const knownCommandMatchers = computed(() => {
+  if (!pipelineConfigs.value) return [];
+  const patterns: RegExp[] = [];
+  pipelineConfigs.value.forEach((config) => {
+    const decoded = decode(config.data);               // Base64 解码 YAML
+    const matches = decoded.matchAll(commandRegex);     // 匹配 "- xxx" 模式
+    for (const match of matches) {
+      const rawCommand = match[1].trim();
+      const patternString = rawCommand
+        .replace(specialCharsRegex, '\\$&')            // 转义特殊字符
+        .replace(matrixVariableRegex, '.*');            // ${VAR} → 通配
+      patterns.push(new RegExp(`^${patternString}$`));
+    }
+  });
+  return patterns;
+});
+```
+
+分组算法 (`PipelineLog.vue:273-322`)：
+1. 解析 pipeline YAML 配置，提取所有 `- command` 行作为 `knownCommandMatchers`
+2. 遍历日志行，`rawText` 以 `+ ` 开头且匹配已知命令 → 新建 LogBlock
+3. 否则追加到当前 LogBlock
+4. 未匹配任何命令的前导日志归入 "Initialization" 块
+
+**命令行渲染** (`PipelineLog.vue:82-101`)
+
+```html
+<div v-if="group.isActualCommand" class="sticky -top-4 z-10 ..."
+     @click="toggleGroup(group.id)">
+  <Icon name="chevron-right"
+        :class="{ 'rotate-90': !collapsedCommands.has(group.id) }" />
+  <span v-html="group.command.text?.substring(2)" />
+</div>
+```
+
+- 命令行是 `sticky` 定位，滚动时固定在顶部
+- 点击切换折叠/展开
+- `substring(2)` 去掉 `+ ` 前缀
+
+### 9.3 Error / Warning 行高亮
+
+`PipelineLog.vue:110-113, 122-125, 132-135` 使用 CSS class 标记错误和警告行：
+
+```html
+:class="{
+  'bg-red-600/40 dark:bg-red-800/50': line.type === 'error',
+  'bg-yellow-600/40 dark:bg-yellow-800/50': line.type === 'warning',
+}"
+```
+
+**但当前 `type` 字段始终为 `null`**（`PipelineLog.vue:385`）：
+
+```typescript
+function writeLog(line: Partial<LogLine>) {
+  logBuffer.value.push({
+    // ...
+    type: null, // TODO: implement way to detect errors and warnings
+  });
+}
+```
+
+服务端 `LogEntry` 有 `Type` 字段（`LogEntryStdout=0, LogEntryStderr=1, LogEntryExitCode=2, ...`），
+但前端 `writeLog()` 未使用该字段来设置 `line.type`，因此 **error/warning 高亮目前未生效**。
+
+### 9.4 时间戳显示与去重
+
+**时间戳格式化** (`PipelineLog.vue:342-344`)
+
+```typescript
+function formatTime(time?: number): string {
+  return time === undefined ? '' : `${time}s`;
+}
+```
+
+时间戳以秒为单位显示在日志行右侧。
+
+**连续相同时间戳去重** (`PipelineLog.vue:414-427`)
+
+```typescript
+buffer = buffer.reduce((acc, line) => ({
+  lastTime: line.time ?? 0,
+  lines: [...acc.lines, {
+    ...line,
+    time: acc.lastTime === line.time ? undefined : line.time,  // 去重
+  }],
+}), { lastTime: -1, lines: [] as LogLine[] }).lines;
+```
+
+相邻行时间戳相同时，后续行的 `time` 设为 `undefined` → `formatTime()` 返回空字符串。
+视觉上同一秒内的多行日志只在首行显示时间戳。
+
+**注意**：这是前端渲染层的去重，不影响原始日志数据。下载日志时
+（`download()` 函数）直接从 API 获取原始 `LogEntry`，不做去重。
+
+### 9.5 ANSI 颜色与 URL 自动链接
+
+**ANSI 转换** (`PipelineLog.vue:368-375`)
+
+```typescript
+function processText(text: string): string {
+  let txt = ansiUp.value.ansi_to_html(`${decode(text)}\n`);
+  txt = txt.replace(urlRegex, (url) =>
+    `<a href="${url}" target="_blank" rel="noopener noreferrer" class="underline">${url}</a>`
+  );
+  return txt;
+}
+```
+
+- `AnsiUp` 库将 ANSI 转义序列转为 HTML `<span>` + CSS class
+- `use_classes = true` 启用 CSS 类模式而非内联样式
+- ANSI 颜色样式定义在 `web/src/style/console.css`（支持 light/dark 主题）
+- URL 正则自动将 HTTP URL 转为可点击链接
+
+**CSS 类映射** (`console.css`):
+- `.ansi-red-fg` → 红色文本（错误输出常见）
+- `.ansi-green-fg` → 绿色文本（成功标记）
+- `.ansi-yellow-fg` → 黄色文本（警告）
+- dark 模式下有独立的高对比度配色
+
+### 9.6 已完成 Step 的日志自动折叠
+
+当用户打开一个已完成的 Step 日志时，`watch(loadedLogs)` (`PipelineLog.vue:580-591`)
+触发自动折叠：
+
+```typescript
+watch(loadedLogs, async (isLoaded, wasLoaded) => {
+  if (isLoaded && !wasLoaded && userConfig.value.collapseLogGroupsByDefault) {
+    const isFinished = step.value && !['running','pending','started'].includes(step.value.state);
+    if (isFinished) {
+      await nextTick();
+      collapseAll();
+      expandLogGroupWithPageHash(route.hash);  // 保留 hash 指定的行展开
+    }
+  }
+});
+```
+
+- 仅在 `collapseLogGroupsByDefault` 用户配置为 `true` 时生效（默认 `true`，`useUserConfig.ts:15`）
+- 配置持久化在 localStorage (`woodpecker:user-config`)
+- 运行中的 Step 不自动折叠，确保实时日志可见
+- URL hash 指定的行所在分组会保持展开
+
+### 9.7 当前不支持的功能
+
+| 功能 | 状态 | 代码线索 |
+|------|------|----------|
+| 关键字搜索/过滤 | ❌ 不支持 | 无搜索输入框，`log` 数组全量渲染 |
+| 正则过滤 | ❌ 不支持 | 无相关 UI 或逻辑 |
+| 时间范围过滤 | ❌ 不支持 | 时间戳仅用于展示，无过滤交互 |
+| Error/Warning 高亮 | ⚠️ 框架已建，数据未接入 | `LogLine.type` 始终为 `null`，CSS class 已定义 |
+| 日志分页/懒加载 | ❌ 不支持 | `maxLineCount` 截断，代码中有 TODO(2653) |
+
+`maxLineCount`（默认 5000，来自 `WOODPECKER_MAX_PIPELINE_LOG_LINE_COUNT`）
+是当前唯一的"过滤"机制——超出部分直接截断，不渲染。
