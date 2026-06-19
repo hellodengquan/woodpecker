@@ -985,3 +985,560 @@ watch(loadedLogs, async (isLoaded, wasLoaded) => {
 
 `maxLineCount`（默认 5000，来自 `WOODPECKER_MAX_PIPELINE_LOG_LINE_COUNT`）
 是当前唯一的"过滤"机制——超出部分直接截断，不渲染。
+
+---
+
+## 10. 大日志量场景：内存占用与（未实现的）虚拟滚动
+
+### 10.1 当前的内存控制策略
+
+Woodpecker 前端对大日志量没有实现虚拟滚动（virtual scrolling），
+采用的是**多重阈值截断 + 批量刷新**的保守策略：
+
+**1. 服务端前置限制**（`server/api/stream.go` 的注释中未显式限制，但由 Log Mux 的背压机制兜底）
+
+Log Mux 的 `Write` 方法对慢消费者采用**丢包**策略：
+
+```go
+// server/logging/log.go:100-104
+select {
+case sub.receiver <- entries:
+default:
+    log.Info().Msgf("subscriber channel is full -- dropping logs")
+}
+```
+
+每个 subscriber 的 channel 容量固定（默认 100，`log.go:114-115`），
+填满后新日志直接丢弃，防止服务端 OOM。
+
+**2. SSE 层面的客户端缓冲限制**
+
+`LogStreamSSE` 中每客户端有 `maxQueuedBatchesPerClient = 30` 的缓冲上限
+（`server/api/stream.go:177`），SSE flush 失败时入队，超过 30 批则丢弃。
+
+**3. 前端行数硬截断**（`PipelineLog.vue:245,398-412`）
+
+```typescript
+const maxLineCount = config.maxPipelineLogLineCount; // 默认 5000
+
+// flushLogs() 中：
+let buffer = logBuffer.value.slice(-maxLineCount);     // 新日志截断
+if (buffer.length < maxLineCount && log.value) {       // 与旧日志合并后再截断
+  buffer = [...log.value.slice(-(maxLineCount - buffer.length)), ...buffer];
+}
+log.value = buffer;
+```
+
+关键行为：
+- `logBuffer` 是临时缓冲，`flushLogs()` 执行时 `slice(-maxLineCount)` 取最后 N 行
+- 与 `log.value` 合并时再次确保总长度 ≤ `maxLineCount`
+- 超出部分直接截断，**用户无法看到 5000 行之前的日志**
+- 代码中有明确 TODO：`// TODO(2653): implement lazy-loading support`
+
+**4. debounce 批量刷新**（`PipelineLog.vue:398`）
+
+```typescript
+const flushLogs = debounce((scroll: boolean) => { ... }, 500);
+```
+
+每 500ms 最多刷新一次 DOM，避免高频日志输出导致的页面卡顿。
+
+### 10.2 DOM 结构与内存开销分析
+
+当前 `PipelineLog.vue` 的模板采用 CSS Grid 三列布局：
+
+```html
+<div ref="consoleElement"
+     class="grid w-full ... grid-cols-[min-content_minmax(0,1fr)_min-content]">
+  <div v-for="group in groupedLogs" :key="group.id" class="contents">
+    <!-- 命令标题行（sticky） -->
+    <div v-if="group.isActualCommand" class="col-span-3 sticky -top-4 ...">...</div>
+    <!-- 日志内容行（三列） -->
+    <template v-if="!collapsedCommands.has(group.id)">
+      <div v-for="line in group.lines" :key="line.index" class="contents font-mono">
+        <a>行号</a>        <!-- 列 1 -->
+        <span>内容</span>  <!-- 列 2，含 v-html -->
+        <span>时间</span>  <!-- 列 3 -->
+      </div>
+    </template>
+  </div>
+</div>
+```
+
+每条日志行的 DOM 节点数：
+- 行号列：`<a>`（含文本节点）
+- 内容列：`<span>`（内部是 ANSI 转 HTML 后的多层 `<span>`）
+- 时间列：`<span>`（含文本节点）
+
+按每条日志平均 3-5 个 DOM 节点估算，5000 行日志约 1.5 万 - 2.5 万个 DOM 节点。
+配合 CSS Grid + `font-mono`，Chrome 在 M1 Mac 上可勉强保持 60fps 滚动，
+但在低端设备上会有明显卡顿。
+
+### 10.3 虚拟滚动的缺失（TODO 2653）
+
+代码中明确标注了虚拟滚动/懒加载未实现：
+
+```typescript
+// PipelineLog.vue:245
+const maxLineCount = config.maxPipelineLogLineCount; // TODO(2653): implement lazy-loading support
+```
+
+潜在的实现方向（基于现有代码结构）：
+
+1. **服务端分页接口**：`getLogs()` REST API 需支持 `offset` / `limit` / `since_line` 参数
+2. **前端 IntersectionObserver**：监听滚动容器顶部/底部哨兵元素触发加载
+3. **保留行号锚点**：`#L{lineNumber}` 需能精确跳转到虚拟滚动外的行
+4. **分组折叠兼容**：`groupedLogs` 的折叠状态与虚拟滚动索引需同步
+
+目前 **logBuffer → log → groupedLogs 三层响应式数据** 的结构意味着
+虚拟滚动需要至少改造 `groupedLogs` computed，将其从全量计算改为
+基于视口范围的增量计算。
+
+### 10.4 浏览器端内存占用的其他来源
+
+除了 DOM 节点，以下数据也常驻内存：
+
+| 数据 | 来源 | 估算（5000 行日志） |
+|------|------|---------------------|
+| `log.value` (`LogLine[]`) | `flushLogs()` 写入 | ~2-5 MB（含 ANSI 转 HTML 字符串） |
+| `logBuffer.value` | `writeLog()` 累积（flush 前） | < 1 MB |
+| `groupedLogs` computed | `log.value` 派生 | ~5-10 MB（含 LogBlock 对象） |
+| AnsiUp 实例状态 | ANSI 颜色状态机 | < 100 KB |
+| collapsedCommands Set | 用户折叠状态 | < 10 KB |
+| EventSource 缓冲 | SSE 浏览器内部缓冲 | 视浏览器而定，通常 < 1 MB |
+
+**总计约 8-16 MB / Step**，多 Step 切换时由于每次 `loadLogs()` 都会重置
+`log.value = undefined` + `logBuffer.value = []`，理论上旧 Step 的日志数据
+可被 GC 回收。但实际测试中 `groupedLogs` computed 的缓存可能延迟释放。
+
+---
+
+## 11. Build 取消 / 重跑：前后端状态同步路径
+
+### 11.1 取消 Pipeline：前端触发
+
+`PipelineWrapper.vue:201-208` 实现取消按钮逻辑：
+
+```typescript
+const { doSubmit: cancelPipeline, isLoading: isCancelingPipeline } = useAsyncAction(async () => {
+  if (!pipeline.value?.number) {
+    throw new Error('Unexpected: Pipeline number not found');
+  }
+  await apiClient.cancelPipeline(repo.value.id, pipeline.value.number);
+  notifications.notify({ title: i18n.t('repo.pipeline.actions.cancel_success'), type: 'success' });
+});
+```
+
+前端仅发送一个 `POST /api/repos/{id}/pipelines/{number}/cancel` 请求，
+**不直接修改本地 Store**，依赖服务端通过 SSE 推送状态变更来更新 UI。
+
+`apiClient.cancelPipeline()` 定义在 `web/src/lib/api/index.ts:137-139`：
+
+```typescript
+async cancelPipeline(repoId: number, pipelineNumber: number): Promise<unknown> {
+  return this._post(`/api/repos/${repoId}/pipelines/${pipelineNumber}/cancel`);
+}
+```
+
+响应为 `204 No Content`，不含任何数据。
+
+### 11.2 取消 Pipeline：服务端处理
+
+`server/api/pipeline.go:475` 的 `CancelPipeline` → `server/pipeline/cancel.go:32` 的 `Cancel()`：
+
+```
+POST /cancel
+    │
+    ▼
+CancelPipeline (api handler)
+    │
+    ├── 鉴权：用户 + repo 权限校验
+    │
+    ▼
+pipeline.Cancel()  (cancel.go)
+    │
+    ├── 前置校验：仅允许 running / pending / blocked 状态取消
+    │
+    ├── Step 1：队列批量驱逐
+    │     Scheduler.ErrorAtOnce([workflowIDs...], queue.ErrCancel)
+    │       → pending 任务直接从队列移除
+    │       → running 任务通过 Wait() 返回 ErrCancel 通知 Agent
+    │
+    ├── Step 2：DB 状态更新（两分支）
+    │     ├── pending Workflow / Step → UpdateToStatusSkipped / Canceled
+    │     └── running Workflow / Step → 不修改 DB（等 Agent 上报 cancel 信号）
+    │
+    ├── Step 3：Pipeline 终态判定
+    │     ├── 全部为 pending → canceled（被用户取消）
+    │     └── 存在 running → killed（被强制杀死，可能有副作用）
+    │
+    ├── Step 4：Forge commit status 更新
+    │     updatePipelineStatus() → GitHub/GitLab 等 commit 状态同步
+    │
+    └── Step 5：PubSub 广播
+          publishToTopic(killedPipeline, repo)
+            → EventStreamSSE → 前端 PipelineStore 更新
+```
+
+**关键状态区分**：
+
+| Pipeline 状态 | 含义 | 触发条件 |
+|---------------|------|----------|
+| `canceled` | 用户主动取消，且所有子任务尚未开始 | 全部 Workflow/Step 为 pending |
+| `killed` | 被强制终止，可能有正在运行的任务 | 存在 running 状态的 Workflow/Step |
+
+两种状态在前端 UI 上表现类似（`PipelineStatusIcon` 都用灰色图标），
+但语义不同：`canceled` 可重跑无副作用，`killed` 需用户确认残留资源。
+
+### 11.3 取消 Pipeline：Agent 侧响应
+
+服务端 `Scheduler.ErrorAtOnce()` 注入 `queue.ErrCancel` 后，
+Agent 侧通过 `Wait()` 感知到取消信号：
+
+```
+Agent poll loop:
+  Poll() 获取任务
+  Work() 执行 Step
+    ├── 内部持续调用 Wait(workflowID)
+    ├── Wait() 返回 ErrCancel → 触发终止流程
+    └── 终止所有正在执行的容器 / 进程
+  RPC.Done(workflowID, state: killed) → Server
+```
+
+Agent 上报 `RPC.Done()` 后，服务端：
+1. `RPC.Done()` 更新 DB 中的 Workflow/Step 状态为终态
+2. 调用 `logger.Close()` 关闭日志流（SSE 端收到 `event: eof`）
+3. `notify()` 推送最终 Pipeline 状态
+
+**状态同步的最终确认来自 Agent，而非 Cancel API**。前端点击取消后，
+Pipeline 状态先在服务端变为 `killed` / `canceled` 并通过 SSE 推送，
+但正在执行的 Step 状态仍为 `running`，直到 Agent 上报 `Done`。
+
+### 11.4 重跑 Pipeline：前端触发
+
+`PipelineWrapper.vue:210-219` 实现重跑按钮：
+
+```typescript
+const { doSubmit: restartPipeline, isLoading: isRestartingPipeline } = useAsyncAction(async () => {
+  const newPipeline = await apiClient.restartPipeline(repo.value.id, pipelineId.value, {
+    fork: true,
+  });
+  notifications.notify({ title: i18n.t('repo.pipeline.actions.restart_success'), type: 'success' });
+  await router.push({
+    name: 'repo-pipeline',
+    params: { pipelineId: newPipeline.number },
+  });
+});
+```
+
+**关键差异**：重跑不是修改原 Pipeline，而是**创建新 Pipeline**。
+`router.push()` 立即跳转到新 Pipeline 页面。
+
+`apiClient.restartPipeline()` (`web/src/lib/api/index.ts:149-156`)：
+
+```typescript
+async restartPipeline(repoId, pipeline, opts?: { event?; deploy_to?; fork? }) {
+  const query = encodeQueryString(opts);
+  return this._post(`/api/repos/${repoId}/pipelines/${pipeline}?${query}`);
+}
+```
+
+响应 `200 OK`，返回新 Pipeline 对象（含新的 `number`）。
+
+### 11.5 重跑 Pipeline：服务端处理
+
+`server/pipeline/restart.go:32` 的 `Restart()`：
+
+```
+POST /pipelines/{number}?fork=true
+    │
+    ▼
+Restart()  (restart.go)
+    │
+    ├── 前置校验：blocked 状态不可重跑
+    │
+    ├── Step 1：获取旧 Pipeline 的 config（YAML）
+    │     store.ConfigsForPipeline(lastPipeline.ID)
+    │     → 若有 ConfigService，重新 fetch（可能变更）
+    │
+    ├── Step 2：创建新 Pipeline 对象
+    │     createNewOutOfOld(lastPipeline)
+    │       → ID/Number 重置为 0
+    │       → Status = pending
+    │       → Started/Finished = 0
+    │       → Parent = lastPipeline.Number（父子关联）
+    │       → RerunCount++
+    │
+    ├── Step 3：持久化 + 关联 configs
+    │     store.CreatePipeline(newPipeline)
+    │     linkPipelineConfigs(configs, newPipeline.ID)
+    │
+    ├── Step 4：解析 Pipeline → 生成 Workflow/Step
+    │     createPipelineItems()
+    │
+    ├── Step 5：启动 Pipeline
+    │     publishPipeline() → Forge commit status + 通知
+    │     start() → 入队 Scheduler
+    │
+    └── 返回新 Pipeline（含新 number）
+```
+
+**新旧 Pipeline 的关联**：
+- 新 Pipeline 的 `parent` 字段指向旧 Pipeline 的 `number`
+- 旧 Pipeline 状态不变（仍为 success/failure/killed/canceled）
+- 前端跳转后旧 Pipeline 的 SSE 连接在组件卸载时由 `onBeforeUnmount` 关闭
+
+### 11.6 自动取消旧 Pipeline：`cancelPreviousPipelines`
+
+`server/pipeline/cancel.go:100-158` 的 `cancelPreviousPipelines()` 在新 Pipeline
+启动时自动取消同分支/同 ref 的旧 Pipeline：
+
+```go
+// cancel.go:109
+eventIncluded := slices.Contains(repo.CancelPreviousPipelineEvents, pipeline.Event)
+if !eventIncluded { return nil }
+
+// cancel.go:120-133
+pipelineNeedsCancel := func(active *model.Pipeline) bool {
+  if active.Event != pipeline.Event { return false }
+  switch pipeline.Event {
+  case model.EventPush:
+    return pipeline.Branch == active.Branch   // 同分支的 push 事件
+  default:
+    return pipeline.Refspec == active.Refspec  // 同 refspec 的其他事件
+  }
+}
+```
+
+这是 repo 级配置 `cancel_previous_pipeline_events` 控制的功能，
+默认包含 `push`、`pull_request` 等高频事件。被自动取消的 Pipeline
+其 `cancel_info.superseded_by` 字段指向新 Pipeline 的 `number`。
+
+### 11.7 Approve / Decline：blocked Pipeline 的状态流转
+
+`blocked` 状态 Pipeline 需要人工审核后才能执行：
+
+| 操作 | API | 状态流转 |
+|------|-----|----------|
+| Approve | `POST /pipelines/{n}/approve` | `blocked → pending → running` |
+| Decline | `POST /pipelines/{n}/decline` | `blocked → declined` |
+
+**Approve 流程** (`server/pipeline/approve.go:31`)：
+1. 校验 Pipeline 必须为 `blocked`
+2. 将 Status 设为 `pending`（这一步必须在创建 Workflow 前完成，
+   因为 Workflow 初始状态由 Pipeline Status 派生）
+3. 解析 config → 创建 Workflow/Step
+4. `UpdateToStatusPending()` 正式更新 DB
+5. `publishPipeline()` + `start()` 入队执行
+
+**Decline 流程** (`server/pipeline/decline.go:30`)：
+1. 校验 Pipeline 必须为 `blocked`
+2. `UpdateToStatusDeclined()` → DB 状态变更
+3. `updatePipelineStatus()` → Forge commit status 同步
+4. `publishToTopic()` → SSE 推送前端
+
+两种操作的前端实现与 Cancel 相同：发 POST 请求，不直接修改 Store，
+等待 SSE 推送更新。
+
+---
+
+## 12. 页面离开与连接释放：EventSource 生命周期与泄漏防护
+
+### 12.1 连接类型总览
+
+Woodpecker 前端有两类 EventSource 连接，生命周期不同：
+
+| 连接类型 | 创建位置 | 生命周期 | 释放时机 |
+|----------|----------|----------|----------|
+| 状态事件流 (`/api/stream/events`) | `useEvents.ts` 调用 `apiClient.on()` | **应用级**：`main.ts` 中 `useEvents()` 启动后常驻 | 页面刷新 / 标签关闭时浏览器自动释放 |
+| 日志流 (`/api/stream/logs/...`) | `PipelineLog.vue` 中 `loadLogs()` | **组件级**：随 PipelineLog 组件实例生命周期 | 组件卸载 / Step 切换 / Step 完成 |
+
+### 12.2 状态事件流：全局常驻，无显式释放
+
+`web/src/compositions/useEvents.ts` 的实现：
+
+```typescript
+let initialized = false;
+
+export default () => {
+  if (initialized) return;   // 单例保护，只初始化一次
+  const repoStore = useRepoStore();
+  const pipelineStore = usePipelineStore();
+
+  initialized = true;
+
+  apiClient.on((data) => {
+    repoStore.setRepo(repo);
+    pipelineStore.setPipeline(repo.id, pipeline);
+  });
+};
+```
+
+`web/src/main.ts:24` 中全局调用：
+
+```typescript
+useEvents();  // 应用启动时建立连接，永不关闭
+```
+
+**这个连接没有 `onBeforeUnmount` 或路由守卫释放**。
+理由：用户在 SPA 内任何页面都可能看到 Pipeline 状态更新（Repo 列表、侧边栏 Feed、详情页），
+因此需要持续接收事件。
+
+**潜在泄漏点**：EventSource 对象存储在 `ApiClient.on()` 的闭包中，
+外部没有引用。每次 `apiClient.on()` 调用都会**新建一个 EventSource**，
+但由于 `initialized` 单例保护，`useEvents()` 实际只调用一次 `on()`。
+如果有其他地方直接调用 `apiClient.on()` 而不做单例保护，会产生泄漏。
+
+`apiClient.on()` (`web/src/lib/api/index.ts`) 内部：
+
+```typescript
+on(callback) {
+  return this._subscribe('/api/stream/events', callback);  // 返回 EventSource
+}
+```
+
+返回值未被 `useEvents()` 保存，意味着**无法通过代码主动关闭全局状态流**。
+只能依赖浏览器 `beforeunload` 事件。
+
+### 12.3 日志流：组件级精细释放
+
+`PipelineLog.vue` 中有 **4 条释放路径**，覆盖各种场景：
+
+**路径 1：组件卸载** (`PipelineLog.vue:547-549`)
+
+```typescript
+onBeforeUnmount(() => {
+  stream.value?.close();
+});
+```
+
+用户导航离开 Pipeline 详情页（如点击 Repo 列表、关闭标签）时，
+Vue 生命周期钩子确保 EventSource 被 `close()`。
+
+**路径 2：Step 切换** (`PipelineLog.vue:481`)
+
+```typescript
+async function loadLogs() {
+  stream.value?.close();  // 建新连接前先关旧的
+  // ... 建立新连接
+}
+```
+
+`loadLogs()` 是日志加载的入口，无论触发来源如何（URL stepId 参数变化、
+Step 状态变化、初次加载），都先关闭旧连接。
+
+**路径 3：Step 状态变为终态** (`PipelineLog.vue:555-564`)
+
+```typescript
+watch(step, async (newStep, oldStep) => {
+  if (oldStep?.state !== newStep?.state) {
+    await loadLogs();  // loadLogs 内部会关闭 SSE + 切换 REST
+  }
+});
+```
+
+Step 完成（running → success/failure/killed/canceled）时，
+`loadLogs()` 检测到 `step.state !== 'running'`，走 REST 路径，
+SSE 连接被关闭。
+
+**路径 4：SSE 收到 `event: eof`**
+
+服务端在 Step 完成时调用 `logger.Close()` → Log Mux 关闭 stream →
+LogStreamSSE handler 的 `logChan` 收到 nil/关闭 → SSE 发送：
+
+```
+event: eof
+data: eof
+```
+
+前端 `ApiClient._subscribe()` 中 `reconnect: true` 模式下**不注册 onerror**，
+因此浏览器 EventSource 默认行为是尝试重连。但由于：
+
+1. 重连时服务端 `LogStreamSSE` 检测 Step 状态已非 running → 返回 `event: error`
+2. 此时 `watch(step)` 已通过状态通道收到 Step 终态 → 触发 `loadLogs()` → `stream.value?.close()`
+
+最终在路径 3 的掩护下连接会被释放。
+
+### 12.4 路由跳转的连接释放分析
+
+Vue Router 使用 `createWebHistory()` 模式，SPA 内跳转不触发页面刷新。
+Pipeline 详情页路由为 `/repos/:repoId/pipeline/:pipelineId/:stepId?`。
+
+**场景 A：在 Pipeline 详情页内切换 Step**
+- 仅 URL 的 `:stepId` 参数变化
+- `PipelineLog` 组件不卸载（相同路由匹配）
+- `watch(stepSlug)` 触发 `loadLogs()` → 路径 2 释放旧日志流
+- 全局状态流不受影响
+
+**场景 B：从 Pipeline 详情页跳转到其他页面**
+- `PipelineWrapper` → `Pipeline` → `PipelineLog` 三级组件依次卸载
+- 每个 `PipelineLog` 实例的 `onBeforeUnmount` 被调用 → 路径 1 释放日志流
+- 全局状态流保持连接（正确行为）
+
+**场景 C：刷新 / 关闭标签**
+- 浏览器 `beforeunload` 事件 → 自动关闭所有 EventSource / WebSocket
+- 服务端侧通过 HTTP 连接断开检测 LogStreamSSE handler 的 `ctx.Writer.CloseNotify()`
+  或 `<-c.Request.Context().Done()`，退出 goroutine
+
+### 12.5 服务端连接泄漏防护
+
+`server/api/stream.go` 中 SSE handler 使用 `context.Context` 做生命周期管理：
+
+```go
+// EventStreamSSE: stream.go:121-127
+pub, sub, err := s.pubsub.Subscribe(c)
+defer s.pubsub.Unsubscribe(pub, sub)   // 退出时取消订阅
+
+// LogStreamSSE: stream.go:189-193
+logger.Tail(step.ID, logChan)
+defer func() {
+  logger.CloseReceiver(step.ID, logChan)  // 退出时从 Log Mux 注销 subscriber
+}()
+```
+
+两个 SSE handler 都有双重退出信号：
+
+```go
+for {
+  select {
+  case ev := <-sub:        // PubSub 事件 / Log Mux 日志
+    // 处理并写入 SSE
+  case <-c.Request.Context().Done():  // 客户端断开（HTTP 连接关闭）
+    return                             // handler 退出，defer 清理资源
+  case <-ticker.C:         // 30s ping 保活
+    // 发送 ping
+  }
+}
+```
+
+客户端关闭 EventSource 后，TCP 连接断开，Go 的 `http.ResponseWriter` 检测到
+`context.Canceled`，`c.Request.Context().Done()` channel 被触发，
+handler goroutine 正常退出，`defer` 执行 PubSub 退订和 Log Mux 注销。
+
+### 12.6 泄漏风险评估
+
+| 场景 | 是否泄漏 | 防护机制 |
+|------|----------|----------|
+| SPA 内路由跳转 | ✅ 安全 | `onBeforeUnmount` + `loadLogs()` 前置 close |
+| 页面刷新 / 关闭标签 | ✅ 安全 | 浏览器自动释放 + 服务端 context Done |
+| Step 完成 | ✅ 安全 | `watch(step)` 触发切换 REST + SSE eof |
+| 网络异常断开 | ✅ 安全 | 浏览器 EventSource 自动重连 / 服务端 30s ping 超时 |
+| `apiClient.on()` 多次调用 | ⚠️ 风险 | `initialized` 单例保护仅覆盖 `useEvents()`，外部直接调用可能泄漏 |
+| 用户长时间停留在 running Step 页面后睡眠唤醒 | ✅ 安全 | TCP 超时 + EventSource 自动重连（Last-Event-ID 续传） |
+| PipelineFeed 侧边栏组件多次挂载卸载 | ✅ 安全 | Feed 不建立独立连接，只消费 `PipelineStore.pipelineFeed` computed |
+
+### 12.7 其他需要释放的资源
+
+除 EventSource 外，Pipeline 页面还有以下资源需要清理：
+
+| 资源 | 释放位置 | 机制 |
+|------|----------|------|
+| 日志流 `setInterval` | `useElapsedTime.ts` → `onBeforeUnmount` | 每个 `PipelineStepDuration` 实例的独立计时器 |
+| Favicon 状态 | `PipelineWrapper.vue:223-225` → `onBeforeUnmount` | `favicon.updateStatus('default')` 恢复默认图标 |
+| `log.value` 大数组 | `loadLogs()` → `log.value = undefined` | 每次重加载时显式置空，配合 GC 回收 |
+| Blob URL（下载日志） | `PipelineLog.vue:468` | `window.URL.revokeObjectURL(fileURL)` 下载完成后立即释放 |
+| scroll 监听 / hash watch | Vue 响应式自动管理 | 组件卸载时 watcher 自动注销 |
+
+**唯一的已知潜在泄漏**：全局状态事件流的 EventSource 没有显式 `close()` 方法，
+仅依赖浏览器 `beforeunload`。如果未来需要支持"登出后断开连接"等场景，
+需改造 `ApiClient` 暴露 `closeEventStream()` 方法。
