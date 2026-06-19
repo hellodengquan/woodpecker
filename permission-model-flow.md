@@ -341,6 +341,110 @@ repoBase := repo.Group("/:repo_id")
 }
 ```
 
+### 3.5.1 权限缓存层的失效与刷新策略
+
+Woodpecker 采用「两级缓存架构」：`数据库持久缓存 + 进程内内存缓存，二者通过时间驱动失效，而非主动失效。
+
+#### 缓存层总览
+
+| 缓存类型 | 存储介质 | 管理对象 | TTL | 失效策略 | 代码位置 |
+|----------|---------|----------|-----|----------|---------|
+| 仓库权限持久缓存 | 数据库 `perms` 表 | user-repo 关联 | 1 小时 | 时间驱动（Synced 字段判断 | `server/router/middleware/session/repo.go:104-166 |
+| 组织成员内存缓存 | 进程内 `ttlcache` | user-org 成员关系 | 10 分钟 | TTL 自动过期 | `server/cache/membership.go:32-70` |
+| OAuth Token 刷新去重 | 进程内 `singleflight.Group` | user token | 单次刷新期 | 刷新期内合并重复请求 | `server/forge/refresh.go:58-101` |
+
+#### 仓库权限缓存（持久缓存）
+
+**实现**：`server/router/middleware/session/repo.go:132-154` `SetPerm`
+
+```
+SetPerm 中间件执行流程：
+    │
+    ├─ 从 perms 表 SELECT WHERE user_id=? AND repo_id=?
+    │   └─ 无记录 → zero Perm(Pull=false Push=false Admin=false
+    │
+    ├─ 检查 time.Now().Unix() - perm.Synced > 3600秒（1小时）
+    │   ├─ 否：使用 DB 中权限（即使过期
+    │   └─ 是：触发刷新
+    │       ├─ 调用 Forge.Repo(ctx, user, repo.ForgeRemoteID, repo.Owner, repo.Name)
+    │       ├─ 成功 → perm = forgeRepo.Perm → PermUpsert 更新 Synced=now
+    │       └─ 失败 → 仅打 warn 日志 → 继续使用旧权限
+    │
+    └─ 叠加可见性 & 管理员权限（见 3.3）
+    └─ 注入 context → gin c.Set("perms", perm)
+```
+
+**手动刷新入口**：`POST /user/repos/refresh` (`server/api/user.go:216-233`)
+```go
+RefreshRepos(c)
+    └─ updateRepoPermissions → 全量同步（跳过 1 小时 TTL 检查 → 立即写入 DB
+```
+
+**失效策略总结**：
+- ✅ 过期触发：Synced 超过 3600 秒后首次访问时自动刷新
+- ✅ 主动刷新：用户点击刷新按钮 → 全量刷新
+- ❌ 无主动失效：Forge 权限变更不会实时推送 → 最多 1 小时窗口
+- ❌ 无分布式失效：多实例部署时各实例独立刷新
+
+#### 组织成员缓存（内存缓存）
+
+**实现**：`server/cache/membership.go:38-70`
+
+```go
+type membershipCache struct {
+    cache *ttlcache.Cache[string, *model.OrgPerm]  // jellydator/ttlcache/v3
+    ttl   time.Duration  // 默认 10 * time.Minute
+    store store.Store
+}
+```
+
+```
+MustOrgMember 执行流程：
+    │
+    ├─ key = fmt.Sprintf("%s-%s", user.ForgeRemoteID, orgName)
+    ├─ c.cache.Get(key)
+    │   ├─ 命中且 !item.IsExpired() → 返回缓存
+    │   └─ 未命中或过期 → 调用 Forge.OrgMembership()
+    │       ├─ 成功 → c.cache.Set(key, perm, c.ttl)
+    │       └─ 失败 → 分两类：
+    │           ├─ ErrNotImplemented → 返回空 OrgPerm{Member:false, Admin:false}
+    │           └─ 其他错误 → 返回错误（无权限降级
+    │
+    └─ 检查 perm.Member 或 perm.Admin
+```
+
+**缓存特性**：
+- `ttlcache.WithDisableTouchOnHit` → 读取不延长 TTL，确保 10 分钟后强制刷新
+- 单实例内存缓存 → 多实例部署时各实例独立缓存
+- 无主动失效 → Forge 成员变更最多 10 分钟窗口
+
+#### OAuth Token 刷新去重（请求级合并）
+
+**实现**：`server/forge/refresh.go:58-101`
+
+```go
+var refreshGroup singleflight.Group
+
+Refresh(ctx, forge, store, user):
+    │
+    ├─ user.Expiry - now > 1800秒（30分钟 → 不刷新
+    │
+    ├─ key = fmt.Sprintf("refresh-%d", user.ID)
+    ├─ result, err, _ = refreshGroup.Do(key, func() {
+    │   ├─ refresher.Refresh(ctx, user)
+    │   ├─ 成功且 userUpdated → store.UpdateUser(user) 持久化
+    │   └─ 返回 refreshResult{AccessToken, RefreshToken, Expiry}
+    │
+    └─ 其他并发调用共享 result → 拷贝到所有等待 goroutine 的 user 对象
+```
+
+**失效策略**：
+- 时间驱动：过期前 30 分钟首次调用自动刷新
+- 合并刷新：并发请求共享同一刷新结果，防止 refresh token 重复消费
+- 刷新失败：打日志，不中断业务，继续使用旧 token
+
+---
+
 ### 3.6 Secret 资源的三级作用域隔离
 
 Secret 采用三级作用域架构，实现全局/组织/仓库三层覆盖关系与优先级隔离。
@@ -567,6 +671,9 @@ HTTP 请求到达
 | 多Forge隔离查询 | `server/store/datastore/user.go` | `GetUserByRemoteID(forgeID,remoteID)`, `GetUserByLogin(forgeID,login)` |
 | GitLab刷新实现 | `server/forge/gitlab/gitlab.go:160-179` | `Refresh()` TokenSource自动刷新 |
 | GitHub刷新实现 | `server/forge/github/github.go:158-181` | `Refresh()` 仅RefreshToken非空时触发 |
+| 权限缓存层 | `server/router/middleware/session/repo.go` `server/cache/membership.go` `server/forge/refresh.go` | `SetPerm` Synced 字段、`membershipCache` ttlcache、`singleflight.Group` |
+| SSO账号合并 | `server/api/login.go` `server/store/datastore/user.go` | HandleAuth 查找策略 (GetUserByRemoteID → GetUserByLogin → CreateUser) |
+| Webhook鉴权 | `server/api/hook.go` `server/api/repo.go` `shared/token/token.go` | `PostHook`, `HookToken` 签发/校验, `keyFunc` 强制HS256, `getRepoFromToken` |
 
 ---
 
@@ -1064,6 +1171,184 @@ DELETE /users/:login → DeleteUser：
         └─ OrgFindByName(name, forgeID)         → forgeID 确保跨实例隔离
 ```
 
+### 10.5 SSO 多 Provider 共存时账号合并冲突处理
+
+**登录流程中的用户查找与冲突处理** (`server/api/login.go:168-187`)
+
+```
+HandleAuth 回调阶段用户查找策略：
+    │
+    ├─ Step1: 优先按稳定主键查询
+    │   GetUserByRemoteID(forgeID, ForgeRemoteID)
+    │   └─ 命中 → 使用该用户（精确匹配，无冲突
+    │
+    ├─ Step2: 若未命中，回退按名称查询
+    │   GetUserByLogin(forgeID, userFromForge.Login)
+    │   └─ 命中 → 可能是：
+    │       ├─ 场景 A：用户首次用新 ForgeRemoteID 登录（forge_id 相同
+    │       │   └─ 行为：更新现有用户的 ForgeRemoteID 到新值
+    │       │
+    │       └─ 场景 B：不同 Forge 实例同名用户（forge_id 不同？
+    │           └─ 数据库唯一索引 (forge_id, login) 天然隔离 → 不会冲突
+    │
+    └─ Step3: 仍未命中 → CreateUser（事务内创建同名 IsUser=true 的 Org
+```
+
+**多 Forge 实例隔离设计**：
+
+数据库层面三重唯一约束确保不冲突：
+- `users` 表：`(forge_id, forge_remote_id)` UNIQUE
+- `users` 表：`(forge_id, login)` UNIQUE
+- `orgs` 表：`(forge_id, name)` UNIQUE
+
+```
+冲突场景分析：
+    │
+    ├─ 场景1：同一 Forge 实例用户迁移 GitHub 账号
+    │   ├─ GitHub 账号 A (remoteID=123) → 登录创建 userA(forge_id=1, remoteID=123)
+    │   ├─ 同一用户换 GitHub 账号 B (remoteID=456) 重名登录
+    │   │   ├─ Step1: GetByRemoteID(1, 456) → 未命中
+    │   │   ├─ Step2: GetByLogin(1, "alice") → 命中 userA
+    │   │   └─ Step3: Update userA.remoteID = 456（账号迁移完成
+    │   │
+    │   └─ 权限继承：userA 现有 orgID/perms 全部保留（不重建
+    │
+    ├─ 场景2：不同 Forge 实例同名用户
+    │   ├─ forge_id=1 (GitHub)   → userA(remoteID=123, login="alice")
+    │   ├─ forge_id=2 (GitLab)   → userA(remoteID=789, login="alice")
+    │   └─ 数据库 unique(forge_id, login)  → 两个独立用户，权限完全隔离
+    │
+    └─ 场景3：同一用户同时接入多个 Forge（GitHub + GitLab
+        └─ 两个独立账号，无合并逻辑 → 各自独立的 org/perms
+```
+
+**账号迁移时组织重映射** (`server/api/login.go:221-268`)：
+
+```
+当用户 login 变更（forge 端改名）：
+    │
+    ├─ user.Login 变更 → 检测到 org.Name != user.Login
+    ├─ OrgUpdate → org.Name = user.Login
+    ├─ 现有 repos（org_id=user.OrgID）全部自动归属到新组织名
+    └─ 权限关系不变（org_id 未变，仅 name 变
+```
+
+**未实现的场景**（设计缺口）：
+- ❌ 同一自然人的多 Forge 账号自动合并
+- ❌ 手动指定用户邮箱作为合并键
+- ❌ 跨 Forge 实例的权限迁移/继承
+
+### 10.6 CI/CD Webhook 的鉴权机制与签名校验
+
+Webhook 采用「双层鉴权架构」：Woodpecker 签发的 JWT HookToken 作为核心鉴权，部分 Forge 额外提供 payload 签名校验作为补充。
+
+#### 第一层：Woodpecker HookToken JWT 鉴权
+
+**签发** (`server/api/repo.go:156-171` `PostRepo` 激活仓库时)
+
+```go
+// 每个仓库激活时生成：
+t := token.New(token.HookToken)
+t.Set("repo-forge-remote-id", string(repo.ForgeRemoteID))
+t.Set("forge-id", strconv.FormatInt(repo.ForgeID, 10))
+sig, _ := t.Sign(repo.Hash)  // 使用 repo.Hash 作为签名密钥（32字节随机值
+
+// 最终 webhook URL:
+//   https://woodpecker.example.com/api/hook?access_token=<sig>
+```
+
+**HookToken 签发时机**：
+- 仓库激活时 (`PostRepo`)
+- 仓库修复时 (`RepoRepair`)
+- 仓库迁移时 (`MoveRepo`)
+
+**校验** (`server/api/hook.go:69-99` `PostHook`)
+
+```
+POST /api/hook 处理流程：
+    │
+    ├─ Step1: 解析 token（多来源 fallback
+    │   token.ParseRequest([]Type{HookToken}, r, secretFunc)
+    │   │
+    │   ├─ 来源1: Authorization: Bearer <token>
+    │   ├─ 来源2: X-Gitlab-Token header
+    │   ├─ 来源3: ?access_token= query 参数（主要
+    │   └─ 来源4: user_sess cookie（不用于 webhook
+    │
+    ├─ Step2: JWT 签名校验（keyFunc 回调
+    │   │
+    │   └─ getRepoFromToken(t):
+    │       ├─ 从 token claims 取 repo-forge-remote-id + forge-id
+    │       ├─ GetRepoForgeID(forgeID, forgeRemoteID) 查仓库
+    │       └─ 返回 repo.Hash 作为签名密钥 → 校验 JWT 签名
+    │
+    └─ Step3: 签名校验通过 → 确定 repo 上下文
+```
+
+**JWT 校验细节** (`shared/token/token.go:160-198` `keyFunc`):
+
+```go
+func keyFunc(token *Token, fn SecretFunc) jwt.Keyfunc {
+    return func(t *jwt.Token) (any, error) {
+        // 强制 HS256 算法防混淆
+        if t.Method.Alg() != SignerAlgo { // "HS256"
+            return nil, jwt.ErrSignatureInvalid
+        }
+        // 提取 type claim 并校验 HookToken
+        tokenType, _ := claims["type"].(string)
+        token.Type = Type(tokenType)
+        // 回调 secretFunc 获取仓库 hash 作为密钥
+        secret, _ := fn(token)
+        return []byte(secret), nil
+    }
+}
+```
+
+#### 第二层：Forge 端 payload 签名校验（可选补充）
+
+各 Forge Provider 的 Hook 解析中会使用 SDK 自带的签名校验：
+
+| Forge Provider | 签名校验方式 | 代码位置 |
+|--------------|-------------|----------|
+| **GitHub** | `github.ParseWebHook()` 自动校验 `X-Hub-Signature-256` 头 | `server/forge/github/parse.go:71` |
+| **GitLab** | `gitlab.ParseWebhook()` 自动校验 `X-Gitlab-Token` | `server/forge/gitlab/gitlab.go:632` |
+| **Gitea** | gitea SDK `ParseWebhook()` 校验签名 | `server/forge/gitea/gitea.go:507` |
+| **Forgejo** | 同 Gitea | `server/forge/forgejo/forgejo.go` |
+
+**完整 Webhook 处理链路** (`server/api/hook.go:69-200`):
+
+```
+POST /api/hook:
+    │
+    ├─ [1] 解析 JWT HookToken → 确定 repo 上下文（Woodpecker 鉴权
+    │
+    ├─ [2] 通过 repo.ForgeID 获取对应 Forge Provider
+    │
+    ├─ [3] 调用 Forge.Hook(r) 解析 payload：
+    │   ├─ 使用 Forge SDK 校验 Forge 端签名/Token
+    │   └─ 返回 repoFromForge + pipelineFromForge
+    │
+    ├─ [4] ForgeRemoteID 二次校验：
+    │   repo.ForgeRemoteID == repoFromForge.ForgeRemoteID
+    │   └─ 不匹配 → 拒绝（防止 token 重放其他仓库
+    │
+    ├─ [5] 检查 repo.IsActive && repo.UserID != 0
+    │
+    ├─ [6] 检查 repo.FullName 变更 → 写入 Redirection + repo.Update
+    │
+    ├─ [7] 拉取 repo.Owner → 触发 forge.Refresh token（如需要
+    │
+    └─ [8] 审批检查 needsApproval → 创建 pipeline
+```
+
+**安全特性总结**：
+- ✅ JWT 以仓库独立 `repo.Hash` 签名 → 防跨仓库 token 重放
+- ✅ 强制 HS256 算法校验 → 防算法替换攻击
+- ✅ `repo-forge-remote-id` claim + 二次校验 → 防止 token 挪用至其他仓库
+- ✅ 可选 Forge 端签名校验 → 双层防护
+- ❌ HookToken 无过期时间（永久有效，除非仓库重新激活/修复
+- ❌ 无一次性 nonce 防重放（依赖 Forge 端去重
+
 ---
 
 ## 六、设计特点总结
@@ -1082,3 +1367,6 @@ DELETE /users/:login → DeleteUser：
 12. **稳定主键迁移容忍**：以 ForgeRemoteID 为不可变关联键，重命名/跨组织迁移通过 Redirection 表保持访问连通性
 13. **硬删除级联清理**：DeleteUser 单事务级联清理用户→组织→仓库→流水线→步骤日志五层结构，保证数据一致性
 14. **多 Forge 实例隔离**：所有查询强制带 forge_id，同名用户/组织在不同 Forge 实例完全隔离不串权
+15. **两级缓存架构**：数据库持久缓存（1小时）+ 内存缓存（10分钟）+ singleflight 去重，时间驱动失效而非主动推送
+16. **SSO 账号自动迁移**：登录时优先按 ForgeRemoteID 查找，未命中回退按 login 查找，支持同一 forge 内用户账号迁移自动合并
+17. **Webhook 双层鉴权**：Woodpecker 签发的仓库独立 HookToken JWT + Forge 端 payload 签名校验，强制 HS256 防算法混淆攻击
