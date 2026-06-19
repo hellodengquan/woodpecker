@@ -1560,7 +1560,501 @@ UI 可通过 `SupersededBy` 显示 "Pipeline #101 被 #102 替代"。
 
 ---
 
-## 十四、关键文件索引
+## 十四、构建队列资源竞争（Worker 池抢占）代码挂载点
+
+### 14.1 整体架构：队列-调度器-Agent 三层
+
+```
+┌─────────────────────────────┐
+│   Pipeline 创建（Create）    │
+│  → queuePipeline() 组装 Task │
+│  → Scheduler.PushAtOnce()    │
+└──────────────┬──────────────┘
+               │ Task (带 Labels)
+               ▼
+┌───────────────────────────────────────┐
+│     FIFO Queue (内存/持久化)            │
+│  pending:  list<List>                  │
+│  running:  map<taskID, entry>          │
+│  workers:  map<worker, struct{}>       │
+│  waitingOnDeps: list<List>             │
+│                                         │
+│  process() goroutine 每 100ms 轮询:     │
+│    1. filterWaiting() — 解依赖          │
+│    2. assignToWorker() — 标签匹配打分   │
+│    3. 发送到 worker.channel             │
+└──────────────┬─────────────────────────┘
+               │
+               │  Agent 侧 gRPC Next() 阻塞 Poll
+               ▼
+┌─────────────────────────────────────────┐
+│             Agent                         │
+│  maxWorkflows 个 Runner goroutine 池      │
+│  每个 Runner:                              │
+│    client.Next() → 拿到 Task              │
+│    runner.Run() → pipeline_runtime 执行   │
+│    client.Extend() — 每 TaskTimeout/3 续租 │
+│    client.Done() — 上报状态                │
+└───────────────────────────────────────────┘
+```
+
+### 14.2 Task 组装：标签的三层来源
+
+`queuePipeline()`（`server/pipeline/queue.go:29`）为每个 Workflow 生成一个 `model.Task`，其标签来源有三层：
+
+```go
+// server/pipeline/queue.go:29-60
+for _, item := range pipelineItems {
+    task := &model.Task{
+        ID:         fmt.Sprint(item.Workflow.ID),
+        Labels:     make(map[string]string),
+        PipelineID: activePipeline.ID,
+        RepoID:     repo.ID,
+    }
+    maps.Copy(task.Labels, item.Labels)          // 层 1: YAML 中定义的 labels
+    err := task.ApplyLabelsFromRepo(repo)         // 层 2: Repo 级标签
+    ...
+}
+```
+
+层 2 `ApplyLabelsFromRepo` 注入两个内部标签（`server/model/task.go:48`）：
+```go
+t.Labels[pipeline.LabelFilterRepo] = r.FullName   // "repo": "org/repo"
+t.Labels[pipeline.LabelFilterOrg] = fmt.Sprintf("%d", r.OrgID)  // "org-id": "123"
+```
+
+层 3：Server 在 Agent 注册时强制注入（`server/rpc/rpc.go:78-84`）：
+```go
+agentServerLabels, err := agent.GetServerLabels()
+maps.Copy(agentFilter.Labels, agentServerLabels)  // 覆盖 agent 自带标签
+```
+
+`GetServerLabels()`（`server/model/agent.go:64-74`）根据 `OrgID` 设置：
+```go
+if a.OrgID != IDNotSet {
+    filters[pipeline.LabelFilterOrg] = fmt.Sprintf("%d", a.OrgID)  // 锁定到具体 Org
+} else {
+    filters[pipeline.LabelFilterOrg] = "*"  // 全局 Agent 可接任何 Org
+}
+```
+
+> Cron 触发的 Task 与 Webhook/手动触发的 Task 在标签上**没有任何特殊区分**，都走完全相同的标签注入路径。
+
+### 14.3 Worker 抢占核心：`Poll()` + `assignToWorker()` 的双向匹配
+
+**Agent 侧**：`agent/runner.go:63` 每个 Runner goroutine 调用 `client.Next()`，底层走 gRPC `Next()`：
+
+```go
+// server/rpc/rpc.go:63-108 (RPC.Next)
+filterFn := createFilterFunc(agentFilter)
+for {
+    task, err := s.scheduler.Poll(c, agent.ID, filterFn)  // 阻塞等待
+    if task.ShouldRun() {
+        // 反序列化 Workflow 数据，返回给 Agent 执行
+        return workflow, err
+    }
+    // 依赖不满足 → 直接 Done() 跳过
+    s.Done(c, task.ID, rpc.WorkflowState{})
+}
+```
+
+**Server 侧 Queue**：`Poll()` 将 Agent 注册为等待 worker（`server/queue/fifo.go:86-111`）：
+
+```go
+// server/queue/fifo.go:87
+func (q *fifo) Poll(c context.Context, agentID int64, filter FilterFn) (*model.Task, error) {
+    ctx, stop := context.WithCancelCause(c)
+    w := &worker{
+        agentID: agentID,
+        channel: make(chan *model.Task, 1),
+        filter:  filter,
+        stop:    stop,
+    }
+    q.workers[w] = struct{}{}     // 加入等待池
+    select {
+    case <-ctx.Done():            // context 取消（gRPC 断连 / KickAgentWorkers）
+        delete(q.workers, w)
+        return nil, ctx.Err()
+    case t := <-w.channel:        // 被 process() goroutine 分配到 Task
+        return t, nil
+    }
+}
+```
+
+**`assignToWorker()`**（`server/queue/fifo.go:314-336`）是真正的抢占逻辑，遍历 `pending` 队列的所有 Task，对每个 Task 遍历所有等待的 Worker，**取 score 最高的 Worker**：
+
+```go
+// server/queue/fifo.go:314
+func (q *fifo) assignToWorker() (*list.Element, *worker) {
+    var bestWorker *worker
+    var bestScore int
+    for element := q.pending.Front(); element != nil; element = element.Next() {
+        task, _ := element.Value.(*model.Task)
+        for worker := range q.workers {
+            matched, score := worker.filter(task)   // ← FilterFn 打分
+            if matched && score > bestScore {
+                bestWorker = worker
+                bestScore = score
+            }
+        }
+        if bestWorker != nil {
+            return element, bestWorker     // 找到一对就返回
+        }
+    }
+    return nil, nil
+}
+```
+
+**关键特性**：
+- 先匹配的 Task 优先（FIFO 遍历顺序），不是高分优先
+- Cron 触发的 Task 因没有特殊标签，和 Webhook/手动触发的 Task **公平竞争**同一 Worker 池
+- 若多个 Worker 都能匹配同一 Task，选 label 精确匹配数最多的那个
+
+### 14.4 FilterFn 标签匹配与打分规则
+
+`createFilterFunc()`（`server/rpc/filter.go:27-74`）实现三层匹配：
+
+```go
+// 评分规则：
+// - 精确匹配：+10 分/标签
+// - 通配符 "*"：+1 分/标签
+// - 反向否定前缀 "!"：必须不匹配，否则整体 false
+// - 任一 Task 标签 Agent 未提供 → 整体 false
+```
+
+内部标签（前缀 `woodpecker-ci.org/`）在打分前被过滤掉：
+```go
+for k := range labels {
+    if strings.HasPrefix(k, pipeline.InternalLabelPrefix) {
+        delete(labels, k)
+    }
+}
+```
+
+这意味着 `ApplyLabelsFromRepo` 注入的 `woodpecker-ci.org/...` 标签 **不参与打分**，只作为 Task 的元数据存在。实际参与匹配打分的是：
+- `platform`（linux/amd64 等）— 由 pipeline 配置或 Agent 自带
+- `backend`（docker/kubernetes/local 等）
+- `hostname`
+- `org-id`（Agent Org 限制）
+- 用户在 YAML `labels` 中自定义的键值对
+
+### 14.5 依赖等待与过期重提
+
+`filterWaiting()`（`server/queue/fifo.go:289-312`）每个 100ms 轮询周期执行一次：
+1. 把 `waitingOnDeps` 所有任务全部塞回 `pending`
+2. 重新扫描 pending 中的任务，若 `depsInQueue()` 检查到依赖仍在 pending/running → 移回 `waitingOnDeps`
+
+`depsInQueue()`（`server/queue/fifo.go:350-367`）：
+```go
+func (q *fifo) depsInQueue(task *model.Task) bool {
+    // 遍历 pending 队列
+    for element := q.pending.Front(); element != nil; element = element.Next() {
+        possibleDep, ok := element.Value.(*model.Task)
+        for _, dep := range task.Dependencies {
+            if ok && possibleDep.ID == dep { return true }
+        }
+    }
+    // 遍历 running 队列
+    for possibleDepID := range q.running {
+        if slices.Contains(task.Dependencies, possibleDepID) { return true }
+    }
+    return false
+}
+```
+
+过期重提 `resubmitExpiredPipelines()`（`server/queue/fifo.go:338-348`）：超过 deadline（默认 1h，`constant.TaskTimeout`）的 Running Task 被塞回 pending 队头，重新分配。
+
+---
+
+## 十五、Cron 触发并发上限配置
+
+### 15.1 并发上限的三层实现
+
+Woodpecker 没有单独的 "Cron 并发上限" 配置。整体并发由三层共同控制：
+
+| 层级 | 配置项 | 位置 | 作用范围 | 对 Cron 的影响 |
+|------|-------|------|---------|---------------|
+| **Agent 层** | `WOODPECKER_MAX_WORKFLOWS` (`--max-workflows`) | `cmd/agent/core/flags.go:83` | 单个 Agent 同时执行的 Workflow 数 | Cron Task 与其他 Task 共享此池 |
+| **Repo 层** | `CancelPreviousPipelineEvents` | `server/model/repo.go:72` | 同一 Repo 内是否允许重叠 Pipeline | Cron 间若配置 `[cron]` → 同 Repo 所有 Cron 互相取消 |
+| **队列层** | 无显式配置 | — | 全局 pending/running 队列大小 | Cron Task 与所有 Task 共享队列 |
+
+### 15.2 Agent 层：Runner 池大小
+
+Agent 启动时（`cmd/agent/core/agent.go:69-270`）：
+
+```go
+maxWorkflows := c.Int("max-workflows")  // 默认 1
+if singleWorkflow && maxWorkflows > 1 {
+    log.Warn().Msgf("max-workflows forced from %d to 1 due to agent running single workflow mode.", maxWorkflows)
+    maxWorkflows = 1
+}
+
+counter.Polling = maxWorkflows  // 上报给 Server 的 Capacity
+counter.Running = 0
+
+// ...
+// 启动 maxWorkflows 个 Runner goroutine
+for i := range maxWorkflows {
+    serviceWaitingGroup.Go(func() error {
+        runner := agent.NewRunner(client, filter, hostname, counter, backendEngine)
+        // ... 每个 Runner 在循环中 client.Next() → Run()
+    })
+}
+```
+
+Agent 注册时把 `Capacity` 上报 Server（`cmd/agent/core/agent.go:189-195`）：
+```go
+agentConfig.AgentID, err = client.RegisterAgent(grpcCtx, rpc.AgentInfo{
+    Version:      version.String(),
+    Backend:      backendEngine.Name(),
+    Platform:     engInfo.Platform,
+    Capacity:     maxWorkflows,   // ← 传给 Server
+    CustomLabels: customLabels,
+})
+```
+
+Server 侧 `RPC.RegisterAgent` 接收并存入 DB（`server/rpc/rpc.go:489-491`）：
+```go
+agent.Capacity = int32(info.Capacity)
+err = s.store.AgentUpdate(agent)
+```
+
+> **注意**：Server 侧 Queue 实现（`fifo.go`）**并不检查 Agent.Capacity**，它只看有多少个 worker 在等待。真正的并发限制在 Agent 侧 —— Agent 启动多少个 Runner goroutine，就会同时发起多少个 `Poll()` 请求，Server 最多分配这么多 Task 给它。
+
+### 15.3 Repo 层：`CancelPreviousPipelineEvents` 间接限制
+
+虽然不是硬并发上限，但 `CancelPreviousPipelineEvents`（`server/model/repo.go:72`）配置了哪些事件会触发重叠取消：
+
+```go
+type Repo struct {
+    // 若包含 "cron"，则同 Repo 内新 Cron Pipeline 会取消所有活跃 Cron Pipeline
+    CancelPreviousPipelineEvents []WebhookEvent `json:"cancel_previous_pipeline_events" xorm:"json 'cancel_previous_pipeline_events'"`
+}
+```
+
+全局默认由 Server CLI 控制（`cmd/server/setup.go`，搜索 `DefaultCancelPreviousPipelineEvents`）：
+```
+--default-cancel-previous-pipeline-events value  (env: WOODPECKER_DEFAULT_CANCEL_PREVIOUS_PIPELINE_EVENTS)
+```
+
+**Cron 并发上限的唯一间接配置**：
+- 配置为 `[cron]` → 同 Repo 内同时最多 1 个 Cron Pipeline 在跑（新的会取消旧的）
+- 配置为空或不含 `cron` → 同 Repo 内 Cron 可无限并发（受 Agent 池容量限制）
+- **没有按 Cron 名称单独限制**的配置（比如 Cron "nightly" 最多 2 个并发，Cron "hourly" 最多 5 个）
+
+### 15.4 Cron 触发并发上限总结
+
+```
+Cron 触发实际并发 = min(
+    Agent 总容量 (Σ maxWorkflows 跨所有匹配 Agent),
+    Repo.CancelPreviousPipelineEvents 含 "cron" ? 1 : ∞,
+    pending 队列可用容量
+)
+```
+
+Cron 与 Webhook/手动触发在资源层面**完全平等竞争**，没有优先级差异，也没有独立的配额。
+
+---
+
+## 十六、审计记录路径
+
+### 16.1 三类审计记录
+
+Woodpecker 没有独立的 "审计表"，审计信息分散在三个路径：
+
+| 类型 | 存储位置 | 格式 | 覆盖事件 |
+|------|---------|------|---------|
+| **结构化日志** | Server/Agent 进程 stdout/stderr（zerolog） | JSON lines | Pipeline 创建/取消/过滤、Cron 调度、Agent 连接、队列操作 |
+| **Pipeline 状态行** | DB 表 `pipelines` + `workflows` + `steps` | 关系型行记录 | 所有状态跃迁（pending→running→success/failure/killed）、CancelInfo |
+| **构建日志** | `server/services/log/file/` 或其他 Log Service | JSON (per line) | Step 执行的每一行 stdout/stderr |
+
+### 16.2 结构化日志：Cron 触发相关的日志点
+
+Cron 调度循环（`server/cron/cron.go`）：
+```go
+// cron.go Run() 中：
+crons, err := store.CronListNextExecute(now.Unix(), checkItems)
+// 无 Info 级别日志，仅错误时
+if err != nil {
+    log.Error().Err(err).Msg("could not get cron list from store")
+}
+
+// runCron() 中：锁抢占成功有 Info 日志
+if !ok {
+    log.Debug().Str("cron", c.Name).Msg("cron got stale, skip execute")
+}
+```
+
+Pipeline 创建路径（`server/pipeline/create.go`）的关键日志点：
+```go
+log.Debug().Str("repo", repo.FullName).Msgf(
+    "ignoring pipeline as skip-ci was found in the commit (%s) message '%s'",
+    ref, pipeline.Message)
+
+log.Debug().Str("repo", repo.FullName).Err(configFetchErr).Msgf(
+    "cannot find config '%s' in '%s' with user: '%s'", repo.Config, pipeline.Ref, repoUser.Login)
+
+log.Warn().Str("repo", repo.FullName).Err(configFetchErr).Msgf(
+    "error while fetching config '%s' in '%s' with user: '%s', will fallback to old config",
+    ...)
+```
+
+重叠取消（`server/pipeline/start.go:33`）：
+```go
+if err := cancelPreviousPipelines(...); err != nil {
+    log.Error().Err(err).Msg("failed to cancel previous pipelines")  // 非阻断
+}
+```
+
+入队失败（`server/pipeline/start.go:39`）：
+```go
+if err := queuePipeline(...); err != nil {
+    log.Error().Err(err).Msg("queuePipeline")
+}
+```
+
+### 16.3 结构化日志：取消信号相关的日志点
+
+队列层（`server/queue/fifo.go`）：
+```go
+// 依赖等待
+log.Debug().Msgf("queue: waiting due to unmet dependencies %v", task.ID)
+
+// 分配成功
+log.Debug().Msgf("queue: assigned task: %v with deps %v to worker with score %d", ...)
+
+// 过期重提
+log.Info().Msgf("queue: resubmitting expired task %s", taskID)
+
+// 清理
+log.Debug().Msgf("queue: %s is removed from pending", taskID)
+log.Debug().Msgf("queue: %s is removed from waitingOnDeps", taskID)
+```
+
+Agent 侧（`agent/runner.go`、`cmd/agent/core/agent.go`）：
+```go
+log.Debug().Msgf("created new runner %d", i)
+
+log.Info().
+    Int("parallel workflows", maxWorkflows).
+    Msg("starting Woodpecker agent")
+```
+
+### 16.4 DB 状态行：Pipeline 级审计
+
+**Pipeline 创建时写入**（`server/store/datastore/pipeline.go CreatePipeline`）：
+```go
+type Pipeline struct {
+    ID        int64
+    Number    int64           // Repo 内自增序号
+    Parent    int64
+    Event     WebhookEvent    // cron / push / manual / pull_request ...
+    Status    StatusValue     // pending / running / success / failure / killed / skipped / error
+    Error     string
+    Created   int64           // 触发时间
+    Started   int64
+    Finished int64
+    Updated   int64
+    Deploy    string
+    Commit    string
+    Branch    string
+    Ref       string
+    Refspec   string
+    Cron      string          // ← Cron 名称，仅 Cron 触发时有值
+    Sender    string
+    Message   string
+    Title     string
+    CancelInfo *CancelInfo    // ← 取消时写入
+    ...
+}
+```
+
+**CancelInfo 写入**（`server/pipeline/cancel.go:147`）：
+```go
+type CancelInfo struct {
+    Canceled     bool   // 是否被取消
+    CanceledBy   string // 用户名（手动取消），空 = 系统自动取消
+    SupersededBy int64  // 替代它的 Pipeline 编号
+    ApprovedBy   string // 审批人
+    Reviewed     int64  // 审批时间戳
+}
+```
+
+**每次状态跃迁**时通过 `UpdatePipelineStatus`（`server/pipeline/pipeline_status.go`）写入 DB，同时：
+- `Finished`、`Started`、`Error` 字段被更新
+- 关联的 Workflow/Step 状态同步更新
+
+### 16.5 Prometheus 指标
+
+`server/rpc/rpc.go` 暴露两个 Pipeline 级指标（RPC 结构体字段）：
+
+```go
+// server/rpc/server.go:51-64
+pipelineTime := factory.NewGaugeVec(prometheus.GaugeOpts{
+    Namespace: "woodpecker",
+    Name:      "pipeline_time",
+    Help:      "Pipeline time.",
+}, []string{"repo", "branch", "status", "pipeline"})
+
+pipelineCount := factory.NewCounterVec(prometheus.CounterOpts{
+    Namespace: "woodpecker",
+    Name:      "pipeline_count",
+    Help:      "Pipeline count.",
+}, []string{"repo", "branch", "status", "pipeline"})
+```
+
+在 `RPC.Done()`（`server/rpc/rpc.go:402-405`）中 Pipeline 最终完成时累计：
+```go
+if currentPipeline.Status == model.StatusSuccess || currentPipeline.Status == model.StatusFailure {
+    s.pipelineCount.WithLabelValues(repo.FullName, currentPipeline.Branch, string(currentPipeline.Status), "total").Inc()
+    s.pipelineTime.WithLabelValues(repo.FullName, currentPipeline.Branch, string(currentPipeline.Status), "total").Set(float64(currentPipeline.Finished - currentPipeline.Started))
+}
+```
+
+> Cron 触发的 Pipeline 在 Prometheus 中没有单独 label 区分，只能通过 `repo` + `branch` + 侧查 DB 的 `cron` 字段关联。
+
+### 16.6 构建日志（Step 级）
+
+Agent 在执行 Step 时通过 `client.Log()` gRPC 流式上传到 Server，Server 侧由 `LogService` 存储。默认实现（`server/services/log/file/file.go`）写入文件系统：
+
+```go
+// server/services/log/file/file.go:54
+func (l logStore) filePath(id int64) string {
+    return filepath.Join(l.base, fmt.Sprintf("%d.json", id))  // 按 Step ID 命名
+}
+```
+
+每行日志是一个 `model.LogEntry`（时间戳 + 行号 + 类型 Stdout/Stderr/Error），以 JSON 行格式追加。
+
+### 16.7 Cron 触发审计链总结
+
+Cron 触发一次后的完整审计足迹：
+
+```
+Cron 调度
+  │
+  ├─ 结构化日志（Debug/Error级）: store.CronListNextExecute / CronGetLock 结果
+  │
+  ├─ DB pipelines 表: 新增一行，Event="cron"，Cron="nightly"，Status=pending→running
+  │    ├─ workflows 表: N 行（每个 workflow 一行）
+  │    └─ steps 表: M 行（每个 step 一行）
+  │
+  ├─ Queue fifo: pending → running，日志 "assigned task: %v to worker"
+  │
+  ├─ Agent runner: 执行每个 Step，Log() 流式上传
+  │    └─ 构建日志文件: /var/lib/woodpecker/logs/{stepID}.json
+  │
+  ├─ 完成 / 取消
+  │    ├─ DB pipelines 表: Status=success/failure/killed，CancelInfo 若有
+  │    ├─ RPC.Done() → Prometheus pipeline_count/pipeline_time +1
+  │    └─ 结构化日志: pipeline_count 指标隐式上报
+  │
+  └─ Forge Status: GitHub/GitLab commit status（若配置了）
+```
+
+---
+
+## 十七、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
@@ -1573,16 +2067,23 @@ UI 可通过 `SupersededBy` 显示 "Pipeline #101 被 #102 替代"。
 | `server/api/helper.go` | `handlePipelineErr` — API 层错误分类（ErrFiltered/ErrNotFound/ErrBadRequest） |
 | `server/pipeline/create.go` | Pipeline 创建主流程（四方汇合点），含 StatusError 落库 |
 | `server/pipeline/start.go` | start()、cancelPreviousPipelines 调用入口 |
+| `server/pipeline/queue.go` | `queuePipeline()` — Task 组装、Labels 注入、入队 |
 | `server/pipeline/cancel.go` | Cancel() 四阶段实现、cancelPreviousPipelines 匹配逻辑 |
 | `server/pipeline/pipeline_status.go` | 状态更新函数（含 UpdateToStatusKilled/UpdateToStatusError） |
 | `server/pipeline/errors.go` | `ErrFiltered` — Pipeline 被条件过滤时的错误类型 |
 | `server/pipeline/restart.go` | Restart — 重启 StatusError 的 Pipeline |
-| `server/queue/queue.go` | Queue 接口定义、ErrCancel、ErrExternal 包装 |
-| `server/queue/fifo.go` | 内存 FIFO 队列实现：ErrorAtOnce → finished() → close(done) |
+| `server/queue/queue.go` | Queue 接口定义、FilterFn、ErrCancel、ErrExternal 包装 |
+| `server/queue/fifo.go` | 内存 FIFO 队列：Poll/PushAtOnce/assignToWorker/filterWaiting/process |
+| `server/queue/persistent.go` | 持久化包装 Queue：Poll 后删除 DB 备份 |
 | `server/scheduler/proxy.go` | Scheduler proxy：Queue + PubSub 的统一门面 |
-| `server/rpc/rpc.go` | gRPC 服务：Wait() 取消信号桥接、Init/Done 状态上报 |
+| `server/rpc/rpc.go` | gRPC 服务：Next/Wait/Init/Done、标签强制注入、Prometheus 指标 |
+| `server/rpc/filter.go` | `createFilterFunc()` — 标签打分匹配（精确 +10、通配符 +1、反向否定） |
+| `server/rpc/filter_test.go` | 标签匹配打分单元测试 |
+| `server/rpc/server.go` | gRPC server 工厂、prometheus pipeline_count/pipeline_time 注册 |
 | `server/model/repo.go` | Repo 数据结构：CancelPreviousPipelineEvents 配置字段 |
 | `server/model/pipeline.go` | Pipeline 数据结构：CancelInfo、Refspec、Cron 字段 |
+| `server/model/task.go` | Task 数据结构、`ApplyLabelsFromRepo()`（org-id/repo 标签注入）、ShouldRun() |
+| `server/model/agent.go` | Agent 数据结构、Capacity、`GetServerLabels()`（Org 标签强制注入） |
 | `server/store/datastore/cron.go` | CronListNextExecute、CronGetLock（CAS 乐观锁） |
 | `server/store/datastore/cron_test.go` | CronGetLock 测试（抢锁成功/失败场景） |
 | `server/store/datastore/pipeline.go` | CreatePipeline（事务+指数退避重试）、isUniqueConstraintError、GetActivePipelineList |
@@ -1592,9 +2093,14 @@ UI 可通过 `SupersededBy` 显示 "Pipeline #101 被 #102 替代"。
 | `server/store/datastore/migration/027_add_cron_field.go` | Pipeline 增加 Cron 字段迁移 |
 | `server/model/cron.go` | Cron 数据结构 + Validate（内含 cron 表达式校验） |
 | `server/model/const.go` | WebhookEvent、StatusValue 枚举 |
+| `server/services/log/file/file.go` | LogService 默认实现：按 Step ID 存 JSON 行文件 |
+| `pipeline/const.go` | 常量：InternalLabelPrefix、LabelFilterOrg/Repo/Platform 等 |
+| `pipeline/frontend/builder/builder.go` | builder：内部标签过滤（woodpecker-ci.org 前缀用户不可用） |
+| `shared/constant/` | TaskTimeout 等全局常量 |
 | `cmd/server/server.go` | Server 启动入口，Cron 调度在 errgroup 中无条件启动 |
 | `cmd/server/setup.go` | CLI flag → DefaultCancelPreviousPipelineEvents 全局默认配置 |
-| `cmd/agent/core/agent.go` | Agent 启动：Runner Pool、健康上报、连接管理 |
+| `cmd/agent/core/agent.go` | Agent 启动：Runner Pool（maxWorkflows）、Capacity 上报、健康检查 |
+| `cmd/agent/core/flags.go` | Agent CLI flag：`--max-workflows`、`--single-workflow` |
 | `agent/runner.go` | Runner.Run：3 goroutine 模型（主执行 + Wait 监听取消 + 续租） |
 | `agent/rpc/client_grpc.go` | Agent 侧 gRPC 客户端封装 |
 | `go.mod` | `github.com/gdgvda/cron v0.7.0`、`github.com/cenkalti/backoff/v5` |
