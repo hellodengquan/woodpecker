@@ -1542,3 +1542,631 @@ handler goroutine 正常退出，`defer` 执行 PubSub 退订和 Log Mux 注销�
 **唯一的已知潜在泄漏**：全局状态事件流的 EventSource 没有显式 `close()` 方法，
 仅依赖浏览器 `beforeunload`。如果未来需要支持"登出后断开连接"等场景，
 需改造 `ApiClient` 暴露 `closeEventStream()` 方法。
+
+---
+
+## 13. i18n 多语言切换对 Build 输出文本的影响
+
+### 13.1 翻译范围：UI 文本 vs Build 数据文本
+
+Woodpecker 前端的 i18n 体系基于 `vue-i18n`，但翻译严格限定于 **UI 界面文本**。
+Build 相关的数据（日志输出、Step 名称、状态 token、commit message、分支名等）
+**一律不做翻译**，原文输出。
+
+UI 文本 vs 数据文本的分界线：
+
+| 类别 | 是否翻译 | 示例 | 代码位置 |
+|------|----------|------|----------|
+| 页面标题 | ✅ 翻译 | `repo.pipeline.log_title` → "Build log" | `PipelineLog.vue:21` |
+| 按钮文案 | ✅ 翻译 | `cancel_success` → "Pipeline canceled" | `PipelineWrapper.vue:207` |
+| 状态图标旁文本 | ✅ 翻译 | `time.not_started` → "not started yet" | `usePipeline.ts:73` |
+| 退出代码提示 | ✅ 翻译 | `repo.pipeline.exit_code` → "Exit code {exitCode}" | `PipelineLog.vue:159` |
+| 全屏/退出全屏 | ✅ 翻译 | `fullscreen` / `exit_fullscreen` | `PipelineLog.vue:27` |
+| Step 名称 | ❌ 不翻译 | 用户 `.woodpecker.yml` 中定义的 `name:` | 原样展示 |
+| Pipeline 状态值 | ❌ 不翻译 | `running` / `success` / `failure` 等 token | 仅用于图标切换 |
+| 日志内容 | ❌ 不翻译 | Step 命令执行的 stdout/stderr | 原文 Base64 解码后展示 |
+| 命令行前缀 `+` | ❌ 不翻译 | shell 执行命令（如 `+ npm run build`） | `substring(2)` 去掉前缀 |
+| Commit message | ❌ 不翻译 | Git commit 原始 message | `escapeHtml()` 后原文展示 |
+| Branch / Tag / PR 引用 | ❌ 不翻译 | `refs/heads/main` → `main`，`#123` | `prettyRef` 正则裁剪 |
+| 初始化块标题 | ❌ 不翻译 | `"Initialization"` 硬编码字符串 | `PipelineLog.vue:300` |
+| 日志行号 | ❌ 不翻译 | `1, 2, 3...` 数字 | `Intl.NumberFormat` 未应用 |
+
+### 13.2 i18n 初始化与切换流程
+
+`web/src/compositions/useI18n.ts` 实现了完整的 i18n 生命周期：
+
+**初始化（模块加载时）**：
+
+```typescript
+const userLanguage = getUserLanguage();
+// 1. navigator.language 检测浏览器语言
+// 2. localStorage 'woodpecker:locale' 覆盖
+// 3. 不在 SUPPORTED_LOCALES 列表中 → 取短码（如 zh-CN → zh）
+
+const fallbackLocale = 'en';
+export const i18n = createI18n({
+  locale: userLanguage,
+  legacy: false,        // Composition API 模式
+  globalInjection: true,  // 注入 $t 全局方法
+  fallbackLocale,       // 缺失翻译回退英语
+});
+
+// 预加载 fallback 和用户语言
+loadLocaleMessages(fallbackLocale).catch(console.error);
+loadLocaleMessages(userLanguage).catch(console.error);
+```
+
+**动态切换**（`setI18nLanguage()`）：
+
+```typescript
+export const setI18nLanguage = async (lang: string): Promise<void> => {
+  if (!i18n.global.availableLocales.includes(lang)) {
+    await loadLocaleMessages(lang);   // 懒加载：动态 import JSON
+  }
+  i18n.global.locale.value = lang;   // 切换 locale，触发响应式重渲染
+  await setDateLocale(lang);         // 同步切换日期/时间格式化 locale
+};
+```
+
+关键点：`loadLocaleMessages()` 使用 `await import(\`~/assets/locales/\${locale}.json\`)`
+做代码分割，非默认语言的 JSON 按需加载。
+
+### 13.3 语言切换对 Build 页面的实时影响
+
+由于 `vue-i18n` 的 `locale` 是响应式 ref，切换语言后：
+
+1. **所有 `$t()` / `t()` 调用自动重算** — 按钮、标题、提示文案实时刷新
+2. **`useDate.currentLocale` 同步更新** — `timeAgo()`、`prettyDuration()`、`toLocaleString()`
+   下次调用使用新 locale
+3. **`PipelineLog` 的 `Initialization` 字符串不刷新** — 因为它是在 `groupedLogs`
+   computed 生成时硬编码的：
+   ```typescript
+   // PipelineLog.vue:298-301
+   if (currentBlock === null || currentBlock.command !== null) {
+     currentBlock = {
+       command: { text: 'Initialization', ... },  // 非 $t 翻译
+       ...
+     };
+   }
+   ```
+   这是一个**小缺陷**：`Initialization` 分组标题没有走 `$t()`，语言切换后不更新。
+
+### 13.4 Pipeline 状态值：Token 不翻译，只有图标变化
+
+`PipelineStatus`（`running`、`success`、`failure` 等）是前后端通用的枚举 token，
+**不在任何地方做翻译映射**。前端通过状态值驱动：
+
+- **图标选择**：`PipelineStatusIcon` 组件根据 `status` 选择对应 SVG（check-circle /
+  x-circle / spinner 等）
+- **CSS 颜色**：Tailwind 的 `text-green-500` / `text-red-500` 等通过状态 token 判断
+- **工具提示**：`title` 属性同样使用英文 token 或图标替代，没有 `$t('status.' + status)`
+  映射表
+
+用户感知状态的主要方式是**图标 + 颜色**，而非文本标签。
+
+### 13.5 日期/时间格式化：i18n 联动但本地化
+
+`useDate.ts` 维护独立的 `currentLocale` 变量，随 `setI18nLanguage()` 同步：
+
+```typescript
+let currentLocale = 'en';
+
+function toLocaleString(date: Date, tz?: string) {
+  return date.toLocaleString(currentLocale, { dateStyle: 'short', timeStyle: 'short', timeZone: tz });
+}
+
+function prettyDuration(durationMs: number) {
+  return Intl.NumberFormat(currentLocale, { style: 'unit', unit: 'hour', unitDisplay: 'long' })
+    .format(Math.round(t.totalHours));
+}
+
+function timeAgo(date: number) {
+  const formatter = new Intl.RelativeTimeFormat(currentLocale);
+  return formatter.format(-Math.round(interval), 'day'); // 等
+}
+```
+
+**注意时区**：`toLocaleString()` 接受可选的 `tz` 参数，但 `usePipeline.ts` 调用时
+未传入时区，使用浏览器本地时区。Pipeline 的 `created/started/finished` 是 Unix 秒级
+UTC 时间戳，`new Date(start * 1000)` 转为本地时间后用 `toLocaleString()` 格式化，
+因此用户看到的是**其浏览器本地时区**的时间，而非服务器时区。
+
+### 13.6 静态 token 的翻译覆盖验证
+
+翻译文件路径：`web/src/assets/locales/{locale}.json`（20+ 种语言），
+关键 Build 相关 key 组织：
+
+```
+repo.pipeline.log_title        // 日志面板标题
+repo.pipeline.exit_code        // 退出代码提示
+repo.pipeline.actions.cancel_success
+repo.pipeline.actions.restart_success
+repo.pipeline.actions.approve_success
+repo.pipeline.actions.decline_success
+time.not_started               // 未开始
+time.just_now                  // 刚刚
+cancel / fullscreen / exit_fullscreen  // 通用按钮
+```
+
+**未覆盖/未翻译的硬编码英文**（搜索代码发现）：
+
+| 硬编码文本 | 位置 | 影响 |
+|------------|------|------|
+| `"Initialization"` | `PipelineLog.vue:300` | 日志初始化块标题 |
+| `"-"` (not started) | `usePipeline.ts:33` | 注释中原本计划用 `t('time.not_started')` 改为硬编码 `-` |
+| `LogEntry.Type` 未接入 | `PipelineLog.vue:385` | `type: null` TODO，error/warning 行无法区分 |
+
+---
+
+## 14. 深色 / 浅色主题：日志高亮切换路径与样式注入
+
+### 14.1 主题切换核心机制：CSS 类切换 + CSS 变量
+
+Woodpecker 使用 **`@vueuse/core` 的 `useColorMode()`** 做主题状态管理，
+配合 **Tailwind `dark:` 变体** + **CSS 自定义属性** 实现样式切换：
+
+```typescript
+// useTheme.ts:4-10
+const {
+  store: storeTheme,       // 用户手动选择：light / dark / auto
+  state: resolvedTheme,    // 解析后结果：light 或 dark
+  system: systemTheme,     // 系统 prefers-color-scheme
+} = useColorMode({
+  storageKey: 'woodpecker:theme',  // localStorage key
+});
+```
+
+**应用主题** (`useTheme.ts:12-24`)：
+
+```typescript
+function updateTheme() {
+  if (resolvedTheme.value === 'dark') {
+    document.documentElement.classList.remove('light');
+    document.documentElement.classList.add('dark');
+    document.documentElement.setAttribute('data-theme', 'dark');
+    document.querySelector('meta[name=theme-color]')?.setAttribute('content', '#2A2E3A');
+  } else {
+    document.documentElement.classList.remove('dark');
+    document.documentElement.classList.add('light');
+    document.documentElement.setAttribute('data-theme', 'light');
+    document.querySelector('meta[name=theme-color]')?.setAttribute('content', '#369943');
+  }
+}
+```
+
+**三层联动**：
+1. **`.dark` / `.light` CSS class** — 供 Tailwind `@custom-variant dark` 使用
+2. **`[data-theme=dark]` / `[data-theme=light]` 属性选择器** — 供 CSS 变量切换使用
+3. **`<meta name=theme-color>`** — 移动端浏览器地址栏颜色
+
+### 14.2 Tailwind dark 变体的编译机制
+
+`web/src/tailwind.css:7`：
+
+```css
+@custom-variant dark (&:is(.dark *));
+```
+
+这是 Tailwind v4 的自定义 variant 语法：**任何带 `dark:` 前缀的 class
+只有在祖先元素有 `.dark` class 时才生效**。编译后：
+
+```css
+/* 源码：class="text-gray-700 dark:text-gray-200" */
+.text-gray-700 { color: #374151; }
+.dark .text-gray-200 { color: #e5e7eb; }   /* &:is(.dark *) 展开后 */
+```
+
+Pipeline 页面随处可见这种用法：
+- `PipelineLog.vue:110`：`bg-red-600/40 dark:bg-red-800/50`
+- `PipelineLog.vue:84`：`bg-blue-900`（选中行背景，dark 模式直接用深蓝色）
+- 日志容器：`bg-wp-code-300 text-wp-code-text-100`（依赖 CSS 变量）
+
+### 14.3 CSS 自定义属性（CSS Variables）：两套配色方案
+
+`web/src/style.css:3-114` 定义了 `--wp-*` 系列 CSS 变量，通过
+`[data-theme=light]` 和 `[data-theme=dark]` 属性选择器提供两套值：
+
+```css
+:root,
+:root[data-theme='light'] {
+  --wp-background-100: var(--color-white);
+  --wp-text-200: var(--color-gray-700);
+  --wp-code-100: var(--color-int-wp-secondary-300);   /* 命令行背景：深蓝灰 */
+  --wp-code-300: var(--color-int-wp-secondary-600);   /* 日志容器背景：#2a2e3a */
+  --wp-code-text-100: var(--color-gray-200);
+  --wp-code-text-alt-100: var(--color-gray-300);
+  --wp-link-100: var(--color-blue-600);
+}
+
+:root[data-theme='dark'] {
+  --wp-background-100: var(--color-int-wp-secondary-200);
+  --wp-text-200: var(--color-gray-200);
+  --wp-code-100: var(--color-int-wp-secondary-700);   /* #222631 */
+  --wp-code-300: var(--color-int-wp-secondary-800);   /* #1B1F28 */
+  --wp-code-text-100: var(--color-gray-200);
+  --wp-code-text-alt-100: var(--color-gray-400);
+  --wp-link-100: var(--color-blue-400);
+}
+```
+
+**关键观察**：代码块背景色在 light 模式下也使用深灰（`--wp-code-300: #2a2e3a`），
+这是 Woodpecker 的设计选择——**日志面板永远使用深色背景**，无论全局主题如何。
+因此 `PipelineLog` 容器本身的背景在两种主题下差异不大（只是深浅的区别）。
+
+Tailwind class `bg-wp-code-300` 不是实际的 Tailwind 颜色，而是通过
+`@source './**/*.css'` 扫描 CSS 变量中的 `--wp-code-300` 自动映射为 utility class：
+
+```css
+.bg-wp-code-300 {
+  background-color: var(--wp-code-300);
+}
+```
+
+### 14.4 ANSI 日志高亮：`.dark` 选择器覆盖两套颜色
+
+`web/src/style/console.css` 是 ANSI 颜色专用样式表，在 `PipelineLog.vue:166`
+通过模块级 `import '~/style/console.css'` 引入。它包含 **16 种前景色 + 16 种背景色**
+的两套配色：
+
+```css
+/* ===== Light 模式默认配色 ===== */
+.ansi-red-fg      { color: #cc0000; }    /* 标准红：较深 */
+.ansi-green-fg    { color: #4e9a06; }    /* 标准绿 */
+.ansi-yellow-fg   { color: #c4a000; }    /* 标准黄：棕黄色 */
+/* ... 8 种标准色 + 8 种亮色 ... */
+
+/* ===== Dark 模式覆盖配色 ===== */
+.dark .ansi-red-fg      { color: #ff7070; }    /* 标准红：浅红，在深色背景可读 */
+.dark .ansi-green-fg    { color: #b0f986; }    /* 标准绿：荧光绿 */
+.dark .ansi-yellow-fg   { color: #c6c502; }    /* 标准黄：高饱和度 */
+/* ... 同样 16 种，均提升亮度和饱和度以适应深色背景 ... */
+```
+
+**AnsiUp 库的配合**：
+
+```typescript
+// PipelineLog.vue:239-240
+const ansiUp = ref(new AnsiUp());
+ansiUp.value.use_classes = true;   // 关键：使用 CSS class 模式，而非内联 style
+```
+
+`use_classes = true` 使得 AnsiUp 在解析 ANSI 转义序列时输出：
+```html
+<span class="ansi-red-fg">error: something failed</span>
+```
+而非
+```html
+<span style="color: rgb(204, 0, 0);">error: something failed</span>
+```
+
+这样主题切换时，浏览器**自动重新匹配 `.dark .ansi-red-fg` 选择器**，
+无需重新渲染日志行，**零成本切换 ANSI 配色**。
+
+### 14.5 主题切换的样式注入时序
+
+**首次加载**：
+
+```
+1. index.html <link> 加载 style.css + tailwind.css
+   → 所有 --wp-* 变量、.ansi-*-fg/bg 基础样式、dark 变体 class 注册
+2. main.ts 执行 useTheme() 的 module 级初始化
+   → useColorMode() 读取 localStorage 'woodpecker:theme'
+   → updateTheme() → document.documentElement 加上 .dark / .light
+   → 浏览器立即重绘：dark 变体 class 和 .dark .ansi-* 生效
+3. PipelineLog 组件挂载时 import '~/style/console.css'
+   → 因为是在 <script setup> 顶层 import，构建时已合并到主 CSS
+   → 实际无额外网络请求
+```
+
+**运行时切换**：
+
+```
+用户点击主题切换按钮
+  → storeTheme.value = 'dark' (写入 localStorage)
+  → watch([storeTheme, systemTheme], updateTheme) 触发
+  → updateTheme():
+    1. document.documentElement.classList.toggle('dark')
+    2. setAttribute('data-theme', 'dark')
+    3. 更新 meta[theme-color]
+  → 浏览器 Recalculate Style：
+    - 所有 .dark :is(*) 变体重新匹配
+    - [data-theme=dark] 的 --wp-* 变量重新赋值
+    - .dark .ansi-*-fg/bg 选择器命中
+  → 无需重新执行 JavaScript：
+    - 不触发 Vue 组件重渲染
+    - 不重新遍历日志行
+    - 纯 CSS 级样式切换，性能零开销
+```
+
+### 14.6 URL 自动链接的主题适配
+
+`PipelineLog.vue:370-374` 中 URL 自动转换使用了 Tailwind class `underline`，
+而链接颜色通过 CSS 变量 `--wp-link-100` 间接适配主题：
+
+```css
+/* style.css */
+:root[data-theme='light'] { --wp-link-100: var(--color-blue-600); }  /* 深蓝 */
+:root[data-theme='dark']  { --wp-link-100: var(--color-blue-400); }  /* 浅蓝 */
+```
+
+Vue Router 的 `<router-link>` 也使用相同机制。由于全局链接样式通过 Tailwind 预设
+和 CSS 变量处理，日志内的普通 `<a href>` 标签自动继承主题色。
+
+### 14.7 选中行高亮：主题不感知的问题
+
+`PipelineLog.vue:110`：
+
+```html
+:class="{ 'bg-blue-600/30': isSelected(line) }"
+```
+
+选中行使用 `bg-blue-600/30`（`rgba(37, 99, 235, 0.3)`），**未加 dark: 变体**。
+在 light 模式和 dark 模式下都使用相同的蓝色半透明背景。由于日志面板背景在
+两种主题下都是深色调，这基本合理，但 dark 模式下对比度略低。
+
+### 14.8 样式注入总览
+
+| 样式层 | 注入方式 | 主题切换机制 |
+|--------|----------|--------------|
+| Tailwind utilities (bg/text/border) | `@import 'tailwindcss'` + `@custom-variant dark` | `.dark` class → CSS cascade 选择器重匹配 |
+| `--wp-*` 语义色变量 | `style.css` 中 `:root[data-theme=...]` | `data-theme` 属性切换 → CSS 变量重计算 |
+| ANSI 颜色 (`.ansi-*-fg/bg`) | `console.css` 基础 + `.dark .ansi-*` 覆盖 | `.dark` class → 选择器级联覆盖（16 fg × 2 + 16 bg × 2 = 64 规则） |
+| Error/Warning 行背景 | `bg-red-600/40 dark:bg-red-800/50` | Tailwind dark 变体 |
+| URL 链接颜色 | `--wp-link-100` 变量 | data-theme 属性切换 |
+| 命令行 sticky 背景 | `bg-wp-code-100` 变量 | data-theme 属性切换 |
+
+---
+
+## 15. Build 时间戳与服务端时钟漂移对账机制
+
+### 15.1 时间戳来源分层：Agent / Server / Browser 三台机器
+
+Woodpecker 是分布式系统，涉及**三种独立时钟源**的时间戳：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Agent 端（执行流水线的机器）                                     │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  • LineWriter.startTime = time.Now().UTC()               │   │
+│  │    → LogEntry.Time = int64(time.Since(startTime).Seconds)│   │
+│  │    相对秒数，Step 级起点                                  │   │
+│  │                                                          │   │
+│  │  • StepState.Started = time.Now().Unix()                 │   │
+│  │  • StepState.Finished = time.Now().Unix()                │   │
+│  │    Unix 秒级 UTC 绝对时间戳                                │   │
+│  │                                                          │   │
+│  │  • WorkflowState.Started / Finished                      │   │
+│  │    = state.Workflow.Started / Finished                   │   │
+│  │    (Runtime 端 startTime 通过 traceStep 传递)             │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                         ↕ gRPC                                   │
+│  Server 端（Woodpecker Server 进程）                             │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  • Pipeline.Created = time.Now().Unix() (接收 webhook)   │   │
+│  │  • Pipeline.Updated = 每次 Status 更新时 time.Now()      │   │
+│  │  • Agent 上报的 Started/Finished 不转换，直接入库        │   │
+│  │  • 兜底：若 Agent 上报的 Started=0 → 用 Server time.Now()│   │
+│  │    兜底：若 Agent 上报的 Finished=0 → 用 Server time.Now()│   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                         ↕ HTTP / SSE                             │
+│  Browser 端（用户浏览器）                                        │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  • since / duration: Date.now() - start * 1000           │   │
+│  │    (running Pipeline 的实时计时器)                        │   │
+│  │  • toLocaleString(): new Date(ts * 1000) + 本地时区       │   │
+│  │  • timeAgo: Date.now() 做相对时间                         │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 15.2 日志行时间戳：Step 级相对秒数，非绝对时间
+
+这是最容易误解的地方：**`LogEntry.Time` 不是 Unix 时间戳，而是从 Step 开始起算的
+相对秒数**。
+
+**Agent 端生成**（`agent/log/line_writer.go:41-70`）：
+
+```go
+func NewLineWriter(...) io.Writer {
+    return &LineWriter{
+        startTime: time.Now().UTC(),    // Step 启动时刻（Agent 本地时钟）
+        // ...
+    }
+}
+
+func (w *LineWriter) Write(p []byte) (n int, err error) {
+    line := &rpc.LogEntry{
+        Time: int64(time.Since(w.startTime).Seconds()),  // 0, 1, 2, ... 秒
+        Line: w.num,
+        Data: []byte(data),
+    }
+    w.num++
+    w.peer.EnqueueLog(line)
+}
+```
+
+**前端展示**（`PipelineLog.vue:342-344`）：
+
+```typescript
+function formatTime(time?: number): string {
+  return time === undefined ? '' : `${time}s`;   // 直接显示 "5s"、"120s"
+}
+```
+
+这带来的特性：
+- **日志行时间戳不受 Agent 与 Server 时钟差异影响** — 它本质是 stopwatch 测量值
+- **同一 Step 内的日志时间间隔精确** — `time.Since()` 单调递增
+- **跨 Step 日志时间不可直接比较** — 每个 Step 有独立的 startTime 基点
+- **时钟漂移不在此处发生** — 唯一的风险是 `time.Now()` 被 NTP 校时回拨，
+  可能导致后续 `LogEntry.Time` 小于前面的（出现负数）
+
+### 15.3 Step/Workflow/Pipeline 级绝对时间戳：Agent 主导，Server 兜底
+
+绝对时间戳使用 Unix 秒级 UTC，遵循以下优先级：
+
+#### Step 时间戳（`server/pipeline/step_status.go`）：
+
+```go
+// Agent 上报的 state.Started 优先
+step.Started = state.Started
+
+// Agent 上报为 0 时（setup 错误未进入 running 等情况），Server 本地兜底
+if step.Started == 0 {
+    step.Started = time.Now().Unix()
+}
+
+// Finished 同理
+step.Finished = state.Finished
+if step.Finished == 0 {
+    step.Finished = time.Now().Unix()
+}
+```
+
+#### Workflow 时间戳（`server/pipeline/workflow_status.go`）：
+
+```go
+// UpdateWorkflowStatusToRunning:
+workflow.Started = state.Started    // 直接用 Agent 上报值
+
+// UpdateWorkflowStatusToDone:
+workflow.Finished = state.Finished  // 直接用 Agent 上报值
+if state.Started == 0 {
+    workflow.State = Skipped        // Started=0 视为从未执行 → skipped
+}
+```
+
+#### Pipeline 时间戳（`server/pipeline/pipeline_status.go:28` 的 `PipelineStatus`
+中不直接修改 Started/Finished，看 `UpdateStatusToDone`）：
+
+```go
+// UpdateToStatusRunning:
+pipeline.Started = startedAt        // 来自首个 Workflow 的 Init RPC
+
+// UpdateStatusToDone:
+pipeline.Finished = finishedAt      // 来自最后完成的 Workflow Done RPC
+pipeline.Updated = time.Now().Unix() // Server 本地时间，记录本次更新时间
+```
+
+#### 接收 webhook 时：
+
+```go
+// Pipeline.Created = time.Now().Unix()    // Server 接收到 webhook 的时刻
+// Pipeline.Timestamp = forge webhook 上报的 commit 时间（来自 Git forge）
+```
+
+### 15.4 跨节点时钟漂移的实际影响
+
+| 指标 | 影响评估 | 说明 |
+|------|----------|------|
+| Step 持续时长计算 | ✅ 精确 | `finished - started`，两个值都来自同一 Agent 时钟，漂移抵消 |
+| Workflow 持续时长 | ✅ 精确 | 同上，两个值都来自同一 Agent |
+| Pipeline 持续时长 | ⚠️ 轻微偏差 | `Started` 来自首个 Workflow Agent，`Finished` 来自最后一个 Workflow Agent，若在不同机器上，可能有毫秒级误差 |
+| Pipeline.Created 到 Started 的等待时间 | ⚠️ 偏差明显 | `Created` 用 Server 时钟，`Started` 用 Agent 时钟，两台机器 NTP 不同步可能有 ±5s 误差 |
+| 前端 since 显示 (timeAgo) | ⚠️ 三重偏差 | `Date.now()` (Browser) - `Created * 1000` (Server) + 浏览器时区转换，最大误差来源 |
+| Cron 定时触发精度 | ⚠️ Server 时钟依赖 | Cron ticker 用 Server 本地 `time.Now()` 与 Cron 表达式匹配 |
+| Forge commit status 超时判定 | ⚠️ 平台间依赖 | GitHub/GitLab 用自己的时钟，与 Server 偏差过大可能显示 outdated |
+
+### 15.5 前端 duration 计算：已完成用差值，运行中用 Browser Date.now()
+
+`usePipeline.ts:44-77` 的 `durationRaw` computed 是关键对账点：
+
+```typescript
+const durationRaw = computed(() => {
+  const start = pipeline.value.started || 0;
+  const end   = pipeline.value.finished || pipeline.value.updated || 0;
+
+  if (start === 0 || end === 0) { return 0; }
+
+  if (pipeline.value.status === 'running') {
+    // 运行中：Browser 时钟做终点（实时更新）
+    return Date.now() - start * 1000;
+  }
+  // 已完成：Server/Agent 提供的终点（差值恒定）
+  return (end - start) * 1000;
+});
+```
+
+**运行中 Pipeline 的时钟漂移暴露**：假设 Server 比 Browser 慢 10s，
+`start * 1000` (Server) 比 Browser 的对应时刻小 10000ms，
+`Date.now() - start * 1000` 就会**多出 10 秒**。用户看到的 Pipeline 持续时间
+比实际多 10 秒。但由于 Step 级 duration 用 Agent 时钟差值，两者可能不匹配：
+
+```
+Pipeline 总时长（Browser 计时）：3m 10s
+  ├── Step A 耗时（Agent 差值）：1m 00s
+  └── Step B 耗时（Agent 差值）：2m 00s
+合计应是 3m 00s，但 Pipeline 显示 3m 10s
+```
+
+这种 10-20s 级别的不一致是**正常现象**，用户一般不会察觉。
+
+### 15.6 无 NTP 对账：Woodpecker 的设计假设
+
+代码中**完全没有**以下机制：
+
+| 对账机制 | 是否存在 | 说明 |
+|----------|----------|------|
+| Agent 注册时上报时钟偏移 | ❌ 不存在 | 没有 `timeOffset` 字段或 NTP 协商 |
+| Server 向 Agent 校时 | ❌ 不存在 | gRPC 协议没有 `GetCurrentTime` / `AdjustClock` 方法 |
+| 前端接收 Server 时间同步 | ❌ 不存在 | 没有 `X-Server-Time` HTTP 头或 `/api/time` 端点 |
+| `Pipeline.Updated` 与 Agent 时钟差值检测 | ❌ 不存在 | 不检查 `Agent - Server` 时间差是否超过阈值 |
+| Monotonic clock 使用 | ⚠️ 部分 | Go 中 `time.Since()` 自动使用 monotonic clock（Go 1.9+），防 NTP 回拨；但 JS 端 `Date.now()` 不是单调的 |
+
+**设计假设**：运维环境中 Server 和所有 Agent 通过 NTP 保持时钟同步（±1s 内），
+这是分布式 CI 系统的通用前置条件。Woodpecker 通过以下方式降低漂移影响：
+1. **日志时间戳用相对秒数**（Section 15.2）— 与绝对时钟无关
+2. **持续时长用差值**（`finished - started`）— 同节点时钟漂移抵消
+3. **Server 端兜底** — Agent 未上报时用 Server 本地时间填充
+4. **前端显示容忍** — `timeAgo` 显示的是模糊相对时间（"5 分钟前"），
+   漂移 ±1 分钟不改变显示文本
+
+### 15.7 `Timestamp` 字段的特殊地位
+
+`Pipeline.Timestamp`（`model/pipeline.go:46`）是来自 Git Forge（GitHub/GitLab 等）
+的 **commit 本身的时间戳**，与 Server/Agent 时钟无关。它通常用于：
+- 按"提交实际时间"排序 Pipeline（而非创建时间）
+- Cron 场景下对比 commit 新旧
+
+这个字段完全不参与 drift 对账，因为它是 Git 自带的权威时间。
+
+### 15.8 状态图：多节点时间戳如何协作完成一次 Build
+
+```
+T0 (Server):  收到 webhook → Pipeline.Created = Server time.Now().Unix()
+              入队等待...
+
+T1 (Agent):   Poll 获取任务 → Runtime.started = Agent time.Now().Unix()
+              traceStep(start) → StepState.Started = T1
+                                  WorkflowState.Started = T1
+              gRPC Init() → Server: pipeline.Started = T1   （Agent 时间入库）
+                                 UpdateWorkflowStatusToRunning: workflow.Started = T1
+
+T1 + Δt (Agent): LineWriter 建立 → startTime = Agent time.Now().UTC()
+                 命令执行 → LogEntry.Time = 0, 1, 2, ... （相对秒）
+
+T2 (Agent):   Step 完成 → StepState.Finished = Agent time.Now().Unix()
+              gRPC Update(step_state) → Server
+                 step.Finished = T2   (差值 T2-T1 = Step 持续时长，精确)
+
+T3 (Agent):   Workflow 完成 → WorkflowState.Finished = T3
+              gRPC Done() → Server
+                 workflow.Finished = T3
+                 pipeline.Finished = T3   (若这是最后一个 Workflow)
+                 pipeline.Updated = Server time.Now()   (记录本次更新时间)
+
+前端显示（Browser 本地时钟 TB）：
+  since (Created 距今):       TB - T0
+  duration (running):         TB - T1
+  duration (finished):        T3 - T1
+  单 Step 耗时:               T2 - T1 (差值，无漂移)
+  日志行时间戳:               Δ (相对秒，无漂移)
+  创建时间本地化:             new Date(T0 * 1000) → toLocaleString()
+```
+
+**最容易出现用户感知不一致的场景**：
+- Server 时区与用户浏览器不同 → `toLocaleString()` 显示的时间戳带不同时区
+  （代码未强制 UTC 显示）
+- 用户手动修改本地时钟 → running 计时器跳变
+- Agent 与 Server 严重不同步（> 30s）→ `since` (T0:Server) 与 `duration` (T1:Agent)
+  的基准不一致，可能出现"等待了 2 分钟，执行 1 分钟，但 since 显示 1 分钟"
+  的反直觉现象
